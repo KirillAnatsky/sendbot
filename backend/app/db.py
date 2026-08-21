@@ -8,7 +8,20 @@ class Base(DeclarativeBase):
     pass
 
 
-engine = create_async_engine(settings.database_url, echo=False)
+def _engine_kwargs() -> dict:
+    """Пул соединений: аналитика раскладывает независимые запросы параллельно,
+    каждому нужна своя коннекция. Для SQLite пул не настраивается."""
+    if settings.database_url.startswith("sqlite"):
+        return {}
+    return {
+        "pool_size": 20,
+        "max_overflow": 20,
+        "pool_pre_ping": True,   # база на другом сервере — проверяем живость
+        "pool_recycle": 1800,
+    }
+
+
+engine = create_async_engine(settings.database_url, echo=False, **_engine_kwargs())
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
 

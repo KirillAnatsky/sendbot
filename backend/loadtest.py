@@ -193,9 +193,11 @@ async def run_benchmarks(session, bots, tags, funnel, n_subs):
         return len((await session.execute(q)).scalars().all())
 
     async def dashboard_30d():
+        an.invalidate_analytics_cache()  # меряем реальный запрос, а не кэш
         return await an.build_analytics(session, days=30)
 
     async def dashboard_365d():
+        an.invalidate_analytics_cache()
         return await an.build_analytics(session, days=365)
 
     async def funnel_steps():
