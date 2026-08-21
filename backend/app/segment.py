@@ -109,9 +109,15 @@ def _cond(c):
     raise SegmentError(f"Неизвестное поле фильтра: {field}")
 
 
-def build_query(bot_id: int | None, filt: dict):
-    """Возвращает select(Subscriber) с применённым сегментом."""
+def build_query(bot_id: int | None, filt: dict, allowed_bot_ids: list[int] | None = None):
+    """Возвращает select(Subscriber) с применённым сегментом.
+
+    allowed_bot_ids — жёсткое ограничение по правам пользователя: даже если
+    в запросе просят другого бота, чужие подписчики не попадут в выборку.
+    """
     q = select(Subscriber)
+    if allowed_bot_ids is not None:
+        q = q.where(Subscriber.bot_id.in_([int(x) for x in allowed_bot_ids] or [-1]))
     if bot_id:
         q = q.where(Subscriber.bot_id == bot_id)
     if not filt:

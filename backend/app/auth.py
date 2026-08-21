@@ -45,10 +45,17 @@ FEATURES = [
      "hint": "смотреть расход токенов · изменять: собирать воронки по ТЗ"},
     {"key": "logs", "label": "Логи",
      "hint": "системный журнал", "view_only": True},
+    # особое право: без него нельзя удалить ничего, даже там, где есть «изменять»
+    {"key": "delete", "label": "🗑 Удаление",
+     "hint": "разрешить удалять подписчиков, воронки, теги, рассылки и ботов "
+             "(в тех разделах, где есть право «изменять»)",
+     "toggle": True},
 ]
 FEATURE_KEYS = [f["key"] for f in FEATURES]
 FEATURE_LABEL = {f["key"]: f["label"] for f in FEATURES}
 VIEW_ONLY = {f["key"] for f in FEATURES if f.get("view_only")}
+
+TOGGLE_FEATURES = {f["key"] for f in FEATURES if f.get("toggle")}
 
 LEVELS = ["none", "view", "edit"]
 _LEVEL_RANK = {"none": 0, "view": 1, "edit": 2}
@@ -64,6 +71,8 @@ def normalize_permissions(perms: dict | None) -> dict:
             continue
         if key in VIEW_ONLY and level == "edit":
             level = "view"
+        if key in TOGGLE_FEATURES and level == "view":
+            level = "edit"   # у галки только два состояния: нет / разрешено
         if level != "none":
             out[key] = level
     return out
@@ -180,9 +189,51 @@ def user_can_bot(user, bot_id: int) -> bool:
     return int(bot_id) in [int(x) for x in user.bot_ids]
 
 
+async def allowed_bot_ids(user, session) -> list[int] | None:
+    """Список id ботов, которые пользователю можно видеть.
+
+    None = ограничений нет (владелец или доступ ко всем ботам). Возвращать
+    именно None важно: пустой список означал бы «ни одного бота».
+    """
+    if getattr(user, "role", "") == "owner" or not getattr(user, "bot_ids", None):
+        return None
+    return [int(x) for x in user.bot_ids]
+
+
+def user_funnel_ids(user) -> list[int] | None:
+    """Разрешённые воронки. None = все (в пределах доступных ботов)."""
+    if getattr(user, "role", "") == "owner":
+        return None
+    ids = getattr(user, "funnel_ids", None)
+    return [int(x) for x in ids] if ids else None
+
+
+def user_can_funnel(user, funnel_id: int) -> bool:
+    ids = user_funnel_ids(user)
+    return ids is None or int(funnel_id) in ids
+
+
+def can_delete(user) -> bool:
+    """Отдельное право на удаление — общее для всех разделов."""
+    return has_perm(user, "delete", "edit")
+
+
+async def require_delete(user=Depends(current_user)):
+    if not can_delete(user):
+        raise HTTPException(
+            403, "Нет права на удаление. Его выдаёт владелец отдельной галкой "
+                 "«Удаление» в разделе «Команда».")
+    return user
+
+
 async def ensure_bot_access(user, bot_id: int):
     if not user_can_bot(user, bot_id):
         raise HTTPException(403, "Нет доступа к этому боту")
+
+
+async def ensure_funnel_access(user, funnel_id: int):
+    if not user_can_funnel(user, funnel_id):
+        raise HTTPException(403, "Нет доступа к этой воронке")
 
 
 # ---------- первичная настройка ----------
@@ -207,6 +258,7 @@ async def ensure_owner_exists():
             role="owner",
             is_active=True,
             bot_ids=[],
+            funnel_ids=[],
             permissions={},
         )
         session.add(user)

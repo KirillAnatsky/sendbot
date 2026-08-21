@@ -18,8 +18,10 @@ from .models import (
 )
 
 
-def _sub_conditions(bot_id, language, source, tag_id):
+def _sub_conditions(bot_id, language, source, tag_id, allowed_bots=None):
     conds = []
+    if allowed_bots is not None:
+        conds.append(Subscriber.bot_id.in_([int(x) for x in allowed_bots] or [-1]))
     if bot_id:
         conds.append(Subscriber.bot_id == bot_id)
     if language:
@@ -113,13 +115,16 @@ async def build_analytics(
     language: str | None = None,
     source: str | None = None,
     tag_id: int | None = None,
+    allowed_bots: list[int] | None = None,
 ) -> dict:
-    key = (days, bot_id, language, source, tag_id)
+    key = (days, bot_id, language, source, tag_id,
+           tuple(sorted(allowed_bots)) if allowed_bots is not None else None)
     hit = _CACHE.get(key)
     if hit and (time.monotonic() - hit[0]) < _CACHE_TTL:
         return hit[1]
 
-    data = await _build_analytics(session, days, bot_id, language, source, tag_id)
+    data = await _build_analytics(session, days, bot_id, language, source, tag_id,
+                                  allowed_bots)
 
     if len(_CACHE) > 64:
         _CACHE.clear()
@@ -134,11 +139,12 @@ async def _build_analytics(
     language: str | None,
     source: str | None,
     tag_id: int | None,
+    allowed_bots: list[int] | None = None,
 ) -> dict:
     days = max(2, min(days, 365))
     day_list = _day_range(days)
     start_dt = datetime.combine(day_list[0], datetime.min.time())
-    conds = _sub_conditions(bot_id, language, source, tag_id)
+    conds = _sub_conditions(bot_id, language, source, tag_id, allowed_bots)
     now = datetime.utcnow()
     week_ago = now - timedelta(days=7)
     lt = _lifetime_days_expr(session, now)
@@ -216,6 +222,8 @@ async def _build_analytics(
         .group_by(Bot.id)
         .order_by(func.count(Subscriber.id).desc())
     )
+    if allowed_bots is not None:
+        bots_q = bots_q.where(Bot.id.in_([int(x) for x in allowed_bots] or [-1]))
 
     (agg_rows, med_rows, daily_rows, msg_rows, click_rows,
      langs_rows, sources_rows, bots_rows) = await _run_all(
@@ -283,7 +291,7 @@ async def _build_analytics(
 
 # ---------- анализ воронок (в стиле Amplitude) ----------
 
-def _step_query(step: dict, start_dt, bot_id=None):
+def _step_query(step: dict, start_dt, bot_id=None, allowed_bots=None):
     """SELECT (subscriber_id, момент события) для одного шага воронки.
 
     Возвращается именно запрос, а не строки: дальше шаги склеиваются в один
@@ -295,6 +303,8 @@ def _step_query(step: dict, start_dt, bot_id=None):
         q = select(
             Subscriber.id.label("sid"), Subscriber.created_at.label("ts")
         ).where(Subscriber.created_at >= start_dt)
+        if allowed_bots is not None:
+            q = q.where(Subscriber.bot_id.in_([int(x) for x in allowed_bots] or [-1]))
         if bot_id:
             q = q.where(Subscriber.bot_id == bot_id)
         return q
@@ -339,16 +349,19 @@ def _step_query(step: dict, start_dt, bot_id=None):
         q = select(
             Message.subscriber_id.label("sid"), Message.created_at.label("ts")
         ).where(Message.direction == "in", Message.created_at >= start_dt)
-        if bot_id:
-            q = q.join(Subscriber, Subscriber.id == Message.subscriber_id).where(
-                Subscriber.bot_id == bot_id
-            )
+        if bot_id or allowed_bots is not None:
+            q = q.join(Subscriber, Subscriber.id == Message.subscriber_id)
+            if allowed_bots is not None:
+                q = q.where(Subscriber.bot_id.in_([int(x) for x in allowed_bots] or [-1]))
+            if bot_id:
+                q = q.where(Subscriber.bot_id == bot_id)
         return q
 
     return None
 
 
-async def funnel_analysis(session, steps: list, days: int = 30, bot_id=None) -> dict:
+async def funnel_analysis(session, steps: list, days: int = 30, bot_id=None,
+                          allowed_bots: list[int] | None = None) -> dict:
     """Последовательная воронка: на каждом шаге остаются только те, кто сделал
     событие ПОСЛЕ своего события предыдущего шага (как в Amplitude).
 
@@ -362,7 +375,7 @@ async def funnel_analysis(session, steps: list, days: int = 30, bot_id=None) -> 
     ctes: list = []          # None на месте нераспознанного шага
     prev = None
     for i, step in enumerate(steps[:10]):
-        base = _step_query(step, start_dt, bot_id)
+        base = _step_query(step, start_dt, bot_id, allowed_bots)
         if base is None:
             ctes.append(None)
             prev = None

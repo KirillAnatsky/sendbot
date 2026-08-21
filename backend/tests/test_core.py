@@ -420,7 +420,8 @@ async def test_broadcast_detail(session):
     ])
     await session.commit()
 
-    d = await broadcast_detail(bc.id, session)
+    owner = _user("owner")
+    d = await broadcast_detail(bc.id, owner, session)
     assert d["text"] == "Привет!"
     assert len(d["media"]) == 2
     assert d["bot"] == "Мой бот"
@@ -449,7 +450,7 @@ async def test_broadcast_detail_tag_filters(session):
     session.add(bc)
     await session.commit()
 
-    d = await broadcast_detail(bc.id, session)
+    d = await broadcast_detail(bc.id, _user("owner"), session)
     assert d["audience_kind"] == "Теги"
     assert "есть тег: лиды" in d["audience"]
     assert "нет тега: отписка" in d["audience"]
@@ -569,3 +570,148 @@ async def test_login_response_includes_permissions(session):
     assert res["user"] == me, "состав /auth/login и /auth/me разошёлся"
     assert res["user"]["permissions"] == {"bots": "view", "funnels": "edit"}
     assert res["user"]["bot_ids"] == [1]
+
+
+# ---------- изоляция по ботам и воронкам ----------
+
+@pytest_asyncio.fixture
+async def two_bots(session):
+    """Два бота, у каждого свой подписчик и своя воронка."""
+    from app.models import Bot, Funnel, FunnelBot, Subscriber
+
+    b1 = Bot(name="Мой", token="t1")
+    b2 = Bot(name="Чужой", token="t2")
+    session.add_all([b1, b2])
+    await session.flush()
+
+    s1 = Subscriber(bot_id=b1.id, tg_id=11, first_name="Свой")
+    s2 = Subscriber(bot_id=b2.id, tg_id=22, first_name="Чужой")
+    f1 = Funnel(name="Воронка 1", trigger_type="start", graph={}, graph_ui={})
+    f2 = Funnel(name="Воронка 2", trigger_type="start", graph={}, graph_ui={})
+    session.add_all([s1, s2, f1, f2])
+    await session.flush()
+    session.add_all([FunnelBot(funnel_id=f1.id, bot_id=b1.id),
+                     FunnelBot(funnel_id=f2.id, bot_id=b2.id)])
+    await session.commit()
+    return {"b1": b1, "b2": b2, "s1": s1, "s2": s2, "f1": f1, "f2": f2}
+
+
+@pytest.mark.asyncio
+async def test_subscribers_limited_to_own_bots(session, two_bots):
+    """Сотрудник с доступом к одному боту не видит чужих подписчиков."""
+    from app.api import list_subscribers, subscribers_search, SegmentSearchIn
+
+    staff = _user(perms={"subscribers": "view"})
+    staff.bot_ids = [two_bots["b1"].id]
+
+    rows = await list_subscribers(user=staff, session=session)
+    assert [r["first_name"] for r in rows] == ["Свой"]
+
+    res = await subscribers_search(SegmentSearchIn(filter={}), user=staff, session=session)
+    assert res["total"] == 1
+    assert res["subscribers"][0]["first_name"] == "Свой"
+
+    # владелец видит обоих
+    owner_rows = await list_subscribers(user=_user("owner"), session=session)
+    assert len(owner_rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_cannot_open_foreign_subscriber(session, two_bots):
+    """Прямой запрос чужого подписчика по id — 403, а не выдача данных."""
+    from fastapi import HTTPException
+    from app.api import get_subscriber, get_messages
+
+    staff = _user(perms={"subscribers": "view", "chat": "view"})
+    staff.bot_ids = [two_bots["b1"].id]
+
+    ok = await get_subscriber(two_bots["s1"].id, user=staff, session=session)
+    assert ok["id"] == two_bots["s1"].id
+
+    for fn in (get_subscriber, get_messages):
+        with pytest.raises(HTTPException) as e:
+            await fn(two_bots["s2"].id, user=staff, session=session)
+        assert e.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_funnels_limited_by_bots_and_explicit_list(session, two_bots):
+    """Воронки фильтруются и по доступным ботам, и по явному списку."""
+    from fastapi import HTTPException
+    from app.api import get_funnel, list_funnels
+
+    staff = _user(perms={"funnels": "view"})
+    staff.bot_ids = [two_bots["b1"].id]
+
+    got = await list_funnels(user=staff, session=session)
+    assert [f["name"] for f in got] == ["Воронка 1"]
+
+    with pytest.raises(HTTPException) as e:
+        await get_funnel(two_bots["f2"].id, user=staff, session=session)
+    assert e.value.status_code == 403
+
+    # явный список воронок сужает ещё сильнее
+    staff2 = _user(perms={"funnels": "view"})
+    staff2.funnel_ids = [two_bots["f2"].id]      # доступ ко всем ботам, но одна воронка
+    got2 = await list_funnels(user=staff2, session=session)
+    assert [f["name"] for f in got2] == ["Воронка 2"]
+
+
+@pytest.mark.asyncio
+async def test_broadcasts_limited_to_own_bots(session, two_bots):
+    from fastapi import HTTPException
+    from app.api import broadcast_detail, list_broadcasts
+    from app.models import Broadcast
+
+    bc1 = Broadcast(bot_id=two_bots["b1"].id, name="Своя", text="a", filters={})
+    bc2 = Broadcast(bot_id=two_bots["b2"].id, name="Чужая", text="b", filters={})
+    session.add_all([bc1, bc2])
+    await session.commit()
+
+    staff = _user(perms={"broadcasts": "view"})
+    staff.bot_ids = [two_bots["b1"].id]
+
+    got = await list_broadcasts(user=staff, session=session)
+    assert [b["name"] for b in got] == ["Своя"]
+
+    with pytest.raises(HTTPException) as e:
+        await broadcast_detail(bc2.id, staff, session)
+    assert e.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_analytics_counts_only_own_bots(session, two_bots):
+    from app import analytics as an
+    from app.auth import allowed_bot_ids
+
+    staff = _user(perms={"analytics": "view"})
+    staff.bot_ids = [two_bots["b1"].id]
+
+    an.invalidate_analytics_cache()
+    mine = await an.build_analytics(
+        session, days=30, allowed_bots=await allowed_bot_ids(staff, session))
+    assert mine["totals"]["subscribers"] == 1
+
+    an.invalidate_analytics_cache()
+    all_ = await an.build_analytics(session, days=30, allowed_bots=None)
+    assert all_["totals"]["subscribers"] == 2
+
+
+@pytest.mark.asyncio
+async def test_delete_needs_separate_permission():
+    """Права «изменять» мало — на удаление нужна отдельная галка."""
+    from fastapi import HTTPException
+    from app.auth import can_delete, require_delete
+
+    editor = _user(perms={"subscribers": "edit", "funnels": "edit"})
+    assert not can_delete(editor)
+    with pytest.raises(HTTPException) as e:
+        await require_delete(user=editor)
+    assert e.value.status_code == 403
+    assert "Удаление" in e.value.detail
+
+    with_delete = _user(perms={"subscribers": "edit", "delete": "edit"})
+    assert can_delete(with_delete)
+    assert await require_delete(user=with_delete) is with_delete
+
+    assert can_delete(_user("owner"))

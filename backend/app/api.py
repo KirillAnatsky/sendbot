@@ -6,9 +6,10 @@ from sqlalchemy import case, delete, func, select
 
 from . import ai, segment
 from .auth import (
-    FEATURES, current_user, ensure_bot_access, hash_password, make_token,
-    normalize_permissions, parse_token, require, require_auth, require_owner,
-    user_permissions, verify_password,
+    FEATURES, allowed_bot_ids, can_delete, current_user, ensure_bot_access,
+    ensure_funnel_access, hash_password, make_token, normalize_permissions,
+    parse_token, require, require_auth, require_delete, require_owner,
+    user_can_bot, user_funnel_ids, user_permissions, verify_password,
 )
 from .db import SessionLocal
 from .graph import GraphError, compile_graph
@@ -162,6 +163,53 @@ class LoginIn(BaseModel):
     password: str
 
 
+async def _limit_to_my_bots(user, session, column):
+    """Условие «только мои боты» для любого запроса, или None если ограничений нет."""
+    ids = await allowed_bot_ids(user, session)
+    return None if ids is None else column.in_(ids or [-1])
+
+
+async def _visible_funnel_ids(user, session) -> list[int] | None:
+    """Какие воронки пользователь вправе видеть: пересечение «его ботов»
+    и явно выданного списка воронок. None = все."""
+    bots = await allowed_bot_ids(user, session)
+    by_bot = None
+    if bots is not None:
+        rows = (await session.execute(
+            select(FunnelBot.funnel_id).where(FunnelBot.bot_id.in_(bots or [-1]))
+        )).all()
+        by_bot = {r[0] for r in rows}
+    explicit = user_funnel_ids(user)
+    if by_bot is None and explicit is None:
+        return None
+    if by_bot is None:
+        return list(explicit)
+    if explicit is None:
+        return list(by_bot)
+    return list(by_bot & set(explicit))
+
+
+async def _my_funnel(user, session, funnel_id: int):
+    """Воронка с проверкой доступа."""
+    f = await session.get(Funnel, funnel_id)
+    if f is None:
+        raise HTTPException(404, "Воронка не найдена")
+    ids = await _visible_funnel_ids(user, session)
+    if ids is not None and funnel_id not in ids:
+        raise HTTPException(403, "Нет доступа к этой воронке")
+    return f
+
+
+async def _my_subscriber(user, session, sub_id: int):
+    """Подписчик с проверкой, что он принадлежит доступному боту."""
+    sub = await session.get(Subscriber, sub_id)
+    if sub is None:
+        raise HTTPException(404, "Подписчик не найден")
+    if not user_can_bot(user, sub.bot_id):
+        raise HTTPException(403, "Нет доступа к этому подписчику")
+    return sub
+
+
 def _user_public(user) -> dict:
     """Данные о себе для интерфейса: и при входе, и при обновлении страницы."""
     return {
@@ -170,6 +218,7 @@ def _user_public(user) -> dict:
         "name": user.name,
         "role": user.role,
         "bot_ids": user.bot_ids or [],
+        "funnel_ids": (user.funnel_ids or []) if user.role != "owner" else [],
         "permissions": user_permissions(user),
     }
 
@@ -226,6 +275,7 @@ class UserIn(BaseModel):
     password: str | None = None
     role: str = "staff"
     bot_ids: list[int] = []          # пусто = все боты
+    funnel_ids: list[int] = []       # пусто = все воронки доступных ботов
     permissions: dict = {}           # {"funnels": "edit", ...}; у владельца не важно
     is_active: bool = True
 
@@ -236,6 +286,7 @@ async def list_users(session=Depends(get_session)):
     return [
         {"id": u.id, "login": u.login, "name": u.name, "role": u.role,
          "is_active": u.is_active, "bot_ids": u.bot_ids or [],
+         "funnel_ids": u.funnel_ids or [],
          "permissions": user_permissions(u),
          "last_login_at": u.last_login_at.isoformat() if u.last_login_at else None}
         for u in users
@@ -253,7 +304,8 @@ async def create_user(body: UserIn, session=Depends(get_session)):
     u = User(login=login, name=body.name or login,
              password_hash=hash_password(body.password),
              role="owner" if body.role == "owner" else "staff",
-             bot_ids=body.bot_ids or [], is_active=body.is_active,
+             bot_ids=body.bot_ids or [], funnel_ids=body.funnel_ids or [],
+             is_active=body.is_active,
              permissions=normalize_permissions(body.permissions))
     session.add(u)
     await session.flush()
@@ -269,6 +321,7 @@ async def update_user(user_id: int, body: UserIn, session=Depends(get_session)):
     u.name = body.name or u.name
     u.role = "owner" if body.role == "owner" else "staff"
     u.bot_ids = body.bot_ids or []
+    u.funnel_ids = body.funnel_ids or []
     u.is_active = body.is_active
     u.permissions = normalize_permissions(body.permissions)
     if body.password:
@@ -487,7 +540,7 @@ async def check_bot(bot_id: int, session=Depends(get_session)):
     return result
 
 
-@router.delete("/bots/{bot_id}", dependencies=[Depends(require("bots", "edit"))])
+@router.delete("/bots/{bot_id}", dependencies=[Depends(require("bots", "edit")), Depends(require_delete)])
 async def delete_bot(bot_id: int, session=Depends(get_session)):
     from .bot.runner import manager
 
@@ -501,15 +554,27 @@ async def delete_bot(bot_id: int, session=Depends(get_session)):
 # ---------- stats ----------
 
 @router.get("/stats", dependencies=[Depends(require("analytics", "view"))])
-async def stats(session=Depends(get_session)):
-    bots_n = (await session.execute(select(func.count(Bot.id)))).scalar()
-    subs = (await session.execute(select(func.count(Subscriber.id)))).scalar()
-    active = (
-        await session.execute(
-            select(func.count(Subscriber.id)).where(Subscriber.is_active == True)  # noqa: E712
-        )
-    ).scalar()
-    funnels = (await session.execute(select(func.count(Funnel.id)))).scalar()
+async def stats(user=Depends(current_user), session=Depends(get_session)):
+    mine = await _limit_to_my_bots(user, session, Subscriber.bot_id)
+    visible = await _visible_funnel_ids(user, session)
+
+    def sub_q(*extra):
+        q = select(func.count(Subscriber.id))
+        if mine is not None:
+            q = q.where(mine)
+        return q.where(*extra) if extra else q
+
+    bots_q = select(func.count(Bot.id))
+    my_bots = await allowed_bot_ids(user, session)
+    if my_bots is not None:
+        bots_q = bots_q.where(Bot.id.in_(my_bots or [-1]))
+    bots_n = (await session.execute(bots_q)).scalar()
+    subs = (await session.execute(sub_q())).scalar()
+    active = (await session.execute(sub_q(Subscriber.is_active == True))).scalar()  # noqa: E712
+    fq = select(func.count(Funnel.id))
+    if visible is not None:
+        fq = fq.where(Funnel.id.in_(visible or [-1]))
+    funnels = (await session.execute(fq)).scalar()
     runs = (await session.execute(select(func.count(FunnelRun.id)))).scalar()
     clicks = (await session.execute(select(func.count(ButtonClick.id)))).scalar()
     return {
@@ -531,11 +596,17 @@ async def analytics(
     language: str | None = None,
     source: str | None = None,
     tag_id: int | None = None,
+    user=Depends(current_user),
     session=Depends(get_session),
 ):
     from . import analytics as an
 
-    return await an.build_analytics(session, days, bot_id, language, source, tag_id)
+    if bot_id:
+        await ensure_bot_access(user, bot_id)
+    return await an.build_analytics(
+        session, days, bot_id, language, source, tag_id,
+        allowed_bots=await allowed_bot_ids(user, session),
+    )
 
 
 # ---------- анализ воронок ----------
@@ -557,9 +628,13 @@ def _node_label(ntype: str, data: dict) -> str:
 
 
 @router.get("/analysis/options", dependencies=[Depends(require("analytics", "view"))])
-async def analysis_options(session=Depends(get_session)):
+async def analysis_options(user=Depends(current_user), session=Depends(get_session)):
     """Справочник для конструктора анализа: воронки с узлами, рассылки."""
-    funnels = (await session.execute(select(Funnel).order_by(Funnel.name))).scalars().all()
+    fq = select(Funnel).order_by(Funnel.name)
+    visible = await _visible_funnel_ids(user, session)
+    if visible is not None:
+        fq = fq.where(Funnel.id.in_(visible or [-1]))
+    funnels = (await session.execute(fq)).scalars().all()
     fl = []
     for f in funnels:
         nodes = []
@@ -588,13 +663,24 @@ class AnalysisIn(BaseModel):
 
 
 @router.post("/analysis/funnel", dependencies=[Depends(require("analytics", "view"))])
-async def analysis_funnel(body: AnalysisIn, session=Depends(get_session)):
+async def analysis_funnel(body: AnalysisIn, user=Depends(current_user),
+                          session=Depends(get_session)):
     from . import analytics as an
 
     if not body.steps:
         raise HTTPException(400, "Добавьте хотя бы один шаг")
+    if body.bot_id:
+        await ensure_bot_access(user, body.bot_id)
+    visible = await _visible_funnel_ids(user, session)
+    for st in body.steps:
+        fid = st.get("funnel_id")
+        if fid and visible is not None and int(fid) not in visible:
+            raise HTTPException(403, "В шагах есть воронка, к которой нет доступа")
     try:
-        return await an.funnel_analysis(session, body.steps, body.days, body.bot_id)
+        return await an.funnel_analysis(
+            session, body.steps, body.days, body.bot_id,
+            allowed_bots=await allowed_bot_ids(user, session),
+        )
     except (KeyError, ValueError, TypeError) as e:
         raise HTTPException(400, f"Некорректный шаг: {e}")
 
@@ -634,7 +720,7 @@ async def create_tag(body: TagIn, session=Depends(get_session)):
     return {"id": tag.id, "name": tag.name}
 
 
-@router.delete("/tags/{tag_id}", dependencies=[Depends(require("tags", "edit"))])
+@router.delete("/tags/{tag_id}", dependencies=[Depends(require("tags", "edit")), Depends(require_delete)])
 async def delete_tag(tag_id: int, session=Depends(get_session)):
     await session.execute(delete(SubscriberTag).where(SubscriberTag.tag_id == tag_id))
     await session.execute(delete(Tag).where(Tag.id == tag_id))
@@ -648,10 +734,15 @@ async def list_subscribers(
     search: str = "",
     tag_id: int | None = None,
     bot_id: int | None = None,
+    user=Depends(current_user),
     session=Depends(get_session),
 ):
     q = select(Subscriber).order_by(Subscriber.created_at.desc())
+    mine = await _limit_to_my_bots(user, session, Subscriber.bot_id)
+    if mine is not None:
+        q = q.where(mine)
     if bot_id:
+        await ensure_bot_access(user, bot_id)
         q = q.where(Subscriber.bot_id == bot_id)
     if search:
         like = f"%{search}%"
@@ -700,7 +791,9 @@ class SubTagIn(BaseModel):
 
 
 @router.post("/subscribers/{sub_id}/tags", dependencies=[Depends(require("subscribers", "edit"))])
-async def add_sub_tag(sub_id: int, body: SubTagIn, session=Depends(get_session)):
+async def add_sub_tag(sub_id: int, body: SubTagIn, user=Depends(current_user),
+                      session=Depends(get_session)):
+    await _my_subscriber(user, session, sub_id)
     sub = await session.get(Subscriber, sub_id)
     if sub is None:
         raise HTTPException(404, "Подписчик не найден")
@@ -722,7 +815,9 @@ async def add_sub_tag(sub_id: int, body: SubTagIn, session=Depends(get_session))
 
 
 @router.delete("/subscribers/{sub_id}/tags/{tag_id}", dependencies=[Depends(require("subscribers", "edit"))])
-async def remove_sub_tag(sub_id: int, tag_id: int, session=Depends(get_session)):
+async def remove_sub_tag(sub_id: int, tag_id: int, user=Depends(current_user),
+                         session=Depends(get_session)):
+    await _my_subscriber(user, session, sub_id)
     await session.execute(
         delete(SubscriberTag).where(
             SubscriberTag.subscriber_id == sub_id, SubscriberTag.tag_id == tag_id
@@ -734,7 +829,9 @@ async def remove_sub_tag(sub_id: int, tag_id: int, session=Depends(get_session))
 # ---------- живой чат ----------
 
 @router.get("/subscribers/{sub_id}", dependencies=[Depends(require("subscribers", "view"))])
-async def get_subscriber(sub_id: int, session=Depends(get_session)):
+async def get_subscriber(sub_id: int, user=Depends(current_user),
+                         session=Depends(get_session)):
+    await _my_subscriber(user, session, sub_id)
     from .bot.runner import manager
 
     s = await session.get(Subscriber, sub_id)
@@ -764,7 +861,9 @@ async def get_subscriber(sub_id: int, session=Depends(get_session)):
 
 
 @router.get("/subscribers/{sub_id}/messages", dependencies=[Depends(require("chat", "view"))])
-async def get_messages(sub_id: int, session=Depends(get_session)):
+async def get_messages(sub_id: int, user=Depends(current_user),
+                       session=Depends(get_session)):
+    await _my_subscriber(user, session, sub_id)
     msgs = (
         await session.execute(
             select(Message).where(Message.subscriber_id == sub_id).order_by(Message.created_at)
@@ -785,7 +884,9 @@ class SendMsgIn(BaseModel):
 
 
 @router.post("/subscribers/{sub_id}/send", dependencies=[Depends(require("chat", "edit"))])
-async def operator_send(sub_id: int, body: SendMsgIn, session=Depends(get_session)):
+async def operator_send(sub_id: int, body: SendMsgIn, user=Depends(current_user),
+                        session=Depends(get_session)):
+    await _my_subscriber(user, session, sub_id)
     from .bot.runner import manager
     from .bot.sender import send_message_content
 
@@ -810,7 +911,9 @@ class PauseIn(BaseModel):
 
 
 @router.post("/subscribers/{sub_id}/pause", dependencies=[Depends(require("chat", "edit"))])
-async def pause_automation(sub_id: int, body: PauseIn, session=Depends(get_session)):
+async def pause_automation(sub_id: int, body: PauseIn, user=Depends(current_user),
+                           session=Depends(get_session)):
+    await _my_subscriber(user, session, sub_id)
     sub = await session.get(Subscriber, sub_id)
     if sub is None:
         raise HTTPException(404, "Подписчик не найден")
@@ -826,7 +929,10 @@ class StartFlowIn(BaseModel):
 
 
 @router.post("/subscribers/{sub_id}/start_flow", dependencies=[Depends(require("chat", "edit"))])
-async def start_flow(sub_id: int, body: StartFlowIn, session=Depends(get_session)):
+async def start_flow(sub_id: int, body: StartFlowIn, user=Depends(current_user),
+                     session=Depends(get_session)):
+    await _my_subscriber(user, session, sub_id)
+    await ensure_funnel_access(user, body.funnel_id)
     from .bot import engine as fx
     from .bot.runner import manager
 
@@ -870,9 +976,13 @@ class SegmentSearchIn(BaseModel):
 
 
 @router.post("/subscribers/search", dependencies=[Depends(require("subscribers", "view"))])
-async def subscribers_search(body: SegmentSearchIn, session=Depends(get_session)):
+async def subscribers_search(body: SegmentSearchIn, user=Depends(current_user),
+                             session=Depends(get_session)):
+    if body.bot_id:
+        await ensure_bot_access(user, body.bot_id)
     try:
-        q = segment.build_query(body.bot_id, body.filter)
+        q = segment.build_query(body.bot_id, body.filter,
+                                await allowed_bot_ids(user, session))
     except segment.SegmentError as e:
         raise HTTPException(400, str(e))
     total = (await session.execute(
@@ -927,8 +1037,10 @@ async def _delete_subscribers(session, sub_ids: list[int]) -> int:
     return res.rowcount or 0
 
 
-@router.delete("/subscribers/{sub_id}", dependencies=[Depends(require("subscribers", "edit"))])
-async def delete_subscriber(sub_id: int, session=Depends(get_session)):
+@router.delete("/subscribers/{sub_id}", dependencies=[Depends(require("subscribers", "edit")), Depends(require_delete)])
+async def delete_subscriber(sub_id: int, user=Depends(current_user),
+                            session=Depends(get_session)):
+    await _my_subscriber(user, session, sub_id)
     sub = (await session.execute(
         select(Subscriber).where(Subscriber.id == sub_id)
     )).scalar_one_or_none()
@@ -948,10 +1060,16 @@ class BulkActionIn(BaseModel):
 
 
 @router.post("/subscribers/bulk", dependencies=[Depends(require("subscribers", "edit"))])
-async def subscribers_bulk(body: BulkActionIn, session=Depends(get_session)):
+async def subscribers_bulk(body: BulkActionIn, user=Depends(current_user),
+                           session=Depends(get_session)):
     """Массовое действие над аудиторией, собранной конструктором сегментов."""
+    if body.bot_id:
+        await ensure_bot_access(user, body.bot_id)
+    if body.action == "delete" and not can_delete(user):
+        raise HTTPException(403, "Нет права на удаление")
     try:
-        q = segment.build_query(body.bot_id, body.filter)
+        q = segment.build_query(body.bot_id, body.filter,
+                                await allowed_bot_ids(user, session))
     except segment.SegmentError as e:
         raise HTTPException(400, str(e))
 
@@ -1024,9 +1142,14 @@ async def _set_funnel_bots(session, funnel_id: int, bot_ids: list[int]):
 
 
 @router.get("/funnels", dependencies=[Depends(require("funnels", "view"))])
-async def list_funnels(bot_id: int | None = None, session=Depends(get_session)):
+async def list_funnels(bot_id: int | None = None, user=Depends(current_user),
+                       session=Depends(get_session)):
     q = select(Funnel).order_by(Funnel.created_at.desc())
+    visible = await _visible_funnel_ids(user, session)
+    if visible is not None:
+        q = q.where(Funnel.id.in_(visible or [-1]))
     if bot_id:
+        await ensure_bot_access(user, bot_id)
         q = q.join(FunnelBot, FunnelBot.funnel_id == Funnel.id).where(FunnelBot.bot_id == bot_id)
     funnels = (await session.execute(q)).scalars().all()
     run_counts = dict(
@@ -1063,7 +1186,10 @@ async def list_funnels(bot_id: int | None = None, session=Depends(get_session)):
 
 
 @router.post("/funnels", dependencies=[Depends(require("funnels", "edit"))])
-async def create_funnel(body: FunnelIn, session=Depends(get_session)):
+async def create_funnel(body: FunnelIn, user=Depends(current_user),
+                        session=Depends(get_session)):
+    for bid in body.bot_ids:
+        await ensure_bot_access(user, bid)
     funnel = Funnel(
         name=body.name or "Новая воронка",
         trigger_type=body.trigger_type,
@@ -1079,7 +1205,9 @@ async def create_funnel(body: FunnelIn, session=Depends(get_session)):
 
 
 @router.get("/funnels/{funnel_id}", dependencies=[Depends(require("funnels", "view"))])
-async def get_funnel(funnel_id: int, session=Depends(get_session)):
+async def get_funnel(funnel_id: int, user=Depends(current_user),
+                     session=Depends(get_session)):
+    await _my_funnel(user, session, funnel_id)
     f = await session.get(Funnel, funnel_id)
     if f is None:
         raise HTTPException(404, "Воронка не найдена")
@@ -1095,7 +1223,11 @@ async def get_funnel(funnel_id: int, session=Depends(get_session)):
 
 
 @router.put("/funnels/{funnel_id}", dependencies=[Depends(require("funnels", "edit"))])
-async def update_funnel(funnel_id: int, body: FunnelIn, session=Depends(get_session)):
+async def update_funnel(funnel_id: int, body: FunnelIn, user=Depends(current_user),
+                        session=Depends(get_session)):
+    await _my_funnel(user, session, funnel_id)
+    for bid in body.bot_ids:
+        await ensure_bot_access(user, bid)
     f = await session.get(Funnel, funnel_id)
     if f is None:
         raise HTTPException(404, "Воронка не найдена")
@@ -1114,7 +1246,9 @@ async def update_funnel(funnel_id: int, body: FunnelIn, session=Depends(get_sess
 
 
 @router.post("/funnels/{funnel_id}/toggle", dependencies=[Depends(require("funnels", "edit"))])
-async def toggle_funnel(funnel_id: int, session=Depends(get_session)):
+async def toggle_funnel(funnel_id: int, user=Depends(current_user),
+                        session=Depends(get_session)):
+    await _my_funnel(user, session, funnel_id)
     f = await session.get(Funnel, funnel_id)
     if f is None:
         raise HTTPException(404, "Воронка не найдена")
@@ -1128,14 +1262,18 @@ async def toggle_funnel(funnel_id: int, session=Depends(get_session)):
     return {"is_active": f.is_active}
 
 
-@router.delete("/funnels/{funnel_id}", dependencies=[Depends(require("funnels", "edit"))])
-async def delete_funnel(funnel_id: int, session=Depends(get_session)):
+@router.delete("/funnels/{funnel_id}", dependencies=[Depends(require("funnels", "edit")), Depends(require_delete)])
+async def delete_funnel(funnel_id: int, user=Depends(current_user),
+                        session=Depends(get_session)):
+    await _my_funnel(user, session, funnel_id)
     await session.execute(delete(Funnel).where(Funnel.id == funnel_id))
     return {"ok": True}
 
 
 @router.get("/funnels/{funnel_id}/stats", dependencies=[Depends(require("funnels", "view"))])
-async def funnel_stats(funnel_id: int, session=Depends(get_session)):
+async def funnel_stats(funnel_id: int, user=Depends(current_user),
+                       session=Depends(get_session)):
+    await _my_funnel(user, session, funnel_id)
     from .models import NodeVisit
 
     total = (
@@ -1482,9 +1620,14 @@ class BroadcastIn(BaseModel):
 
 
 @router.get("/broadcasts", dependencies=[Depends(require("broadcasts", "view"))])
-async def list_broadcasts(bot_id: int | None = None, session=Depends(get_session)):
+async def list_broadcasts(bot_id: int | None = None, user=Depends(current_user),
+                          session=Depends(get_session)):
     q = select(Broadcast).order_by(Broadcast.created_at.desc())
+    mine = await _limit_to_my_bots(user, session, Broadcast.bot_id)
+    if mine is not None:
+        q = q.where(mine)
     if bot_id:
+        await ensure_bot_access(user, bot_id)
         q = q.where(Broadcast.bot_id == bot_id)
     bcs = (await session.execute(q)).scalars().all()
     bot_names = dict((await session.execute(select(Bot.id, Bot.name))).all())
@@ -1505,11 +1648,13 @@ async def list_broadcasts(bot_id: int | None = None, session=Depends(get_session
 
 
 @router.get("/broadcasts/{bc_id}", dependencies=[Depends(require("broadcasts", "view"))])
-async def broadcast_detail(bc_id: int, session=Depends(get_session)):
+async def broadcast_detail(bc_id: int, user=Depends(current_user),
+                           session=Depends(get_session)):
     """Карточка рассылки: что отправляли, кому и с каким результатом."""
     bc = await session.get(Broadcast, bc_id)
     if not bc:
         raise HTTPException(404, "Рассылка не найдена")
+    await ensure_bot_access(user, bc.bot_id)
 
     bot = await session.get(Bot, bc.bot_id)
 
@@ -1582,7 +1727,9 @@ async def broadcast_detail(bc_id: int, session=Depends(get_session)):
 
 
 @router.post("/broadcasts", dependencies=[Depends(require("broadcasts", "edit"))])
-async def create_broadcast(body: BroadcastIn, session=Depends(get_session)):
+async def create_broadcast(body: BroadcastIn, user=Depends(current_user),
+                           session=Depends(get_session)):
+    await ensure_bot_access(user, body.bot_id)
     if not body.text.strip() and not body.media:
         raise HTTPException(400, "Добавьте текст или вложение")
     if not await session.get(Bot, body.bot_id):

@@ -67,6 +67,9 @@ function can(feature, level = 'view') {
   return LEVEL_RANK[have] >= LEVEL_RANK[level];
 }
 
+// отдельное право на удаление — общее для всех разделов
+function canDelete() { return can('delete', 'edit'); }
+
 // разделы меню и то, какое право им нужно
 const PAGE_PERM = {
   dashboard: 'analytics', analysis: 'analytics', bots: 'bots',
@@ -170,7 +173,8 @@ async function loadBots() {
       <td>
         <button class="btn primary" onclick="openBot(${b.id})">Открыть</button>
         ${can('bots', 'edit') ? `
-        <button class="btn" onclick="toggleBot(${b.id})">${b.is_active ? 'Выключить' : 'Включить'}</button>
+        <button class="btn" onclick="toggleBot(${b.id})">${b.is_active ? 'Выключить' : 'Включить'}</button>` : ''}
+        ${can('bots', 'edit') && canDelete() ? `
         <button class="btn danger" onclick="deleteBot(${b.id})">Удалить</button>` : ''}
       </td>
     </tr>`).join('')}
@@ -301,10 +305,11 @@ let EDIT_USER_ID = null;
 let PERM_FEATURES = [];
 
 async function loadUsers() {
-  const [users, bots, feats] = await Promise.all([
-    api('/users'), api('/bots'), api('/permissions/features'),
+  const [users, bots, feats, funnels] = await Promise.all([
+    api('/users'), api('/bots'), api('/permissions/features'), api('/funnels'),
   ]);
   window._allBots = bots;
+  window._allFunnels = funnels;
   PERM_FEATURES = feats;
   document.getElementById('users-list').innerHTML = `<table>
     <tr><th>Логин</th><th>Имя</th><th>Роль</th><th>Боты</th><th>Доступ к разделам</th><th>Статус</th><th>Последний вход</th><th></th></tr>
@@ -331,8 +336,9 @@ function permSummary(u) {
   const p = u.permissions || {};
   const on = PERM_FEATURES.filter(f => p[f.key] && p[f.key] !== 'none');
   if (!on.length) return '<span style="color:#d33;font-size:12px">нет доступа</span>';
-  return on.map(f =>
-    `<span class="pill ${p[f.key] === 'edit' ? '' : 'gray'}" title="${p[f.key] === 'edit' ? 'может изменять' : 'только смотреть'}">${esc(f.label)}${p[f.key] === 'edit' ? '' : ' 👁'}</span>`
+  return on.map(f => f.toggle
+    ? `<span class="pill danger-pill" title="может удалять">${esc(f.label)}</span>`
+    : `<span class="pill ${p[f.key] === 'edit' ? '' : 'gray'}" title="${p[f.key] === 'edit' ? 'может изменять' : 'только смотреть'}">${esc(f.label)}${p[f.key] === 'edit' ? '' : ' 👁'}</span>`
   ).join('');
 }
 
@@ -344,6 +350,7 @@ function showUserForm() {
   document.getElementById('u-pass').value = '';
   document.getElementById('u-role').value = 'staff';
   renderUserBots([]);
+  renderUserFunnels([]);
   renderPermMatrix({});
   updateRoleHint();
   document.getElementById('user-form').classList.remove('hidden');
@@ -355,9 +362,11 @@ function renderPermMatrix(perms) {
   if (!box) return;
   box.innerHTML = PERM_FEATURES.map(f => {
     const cur = perms[f.key] || 'none';
-    const levels = f.view_only
-      ? [['none', 'нет'], ['view', 'смотреть']]
-      : [['none', 'нет'], ['view', 'смотреть'], ['edit', 'изменять']];
+    const levels = f.toggle
+      ? [['none', 'запрещено'], ['edit', 'разрешено']]
+      : f.view_only
+        ? [['none', 'нет'], ['view', 'смотреть']]
+        : [['none', 'нет'], ['view', 'смотреть'], ['edit', 'изменять']];
     return `<div class="perm-row">
       <div class="perm-name"><b>${esc(f.label)}</b><span>${esc(f.hint || '')}</span></div>
       <div class="perm-levels" data-key="${f.key}">
@@ -386,6 +395,7 @@ function updateRoleHint() {
   const isOwner = document.getElementById('u-role').value === 'owner';
   document.getElementById('u-perms-wrap').classList.toggle('hidden', isOwner);
   document.getElementById('u-bots-wrap').classList.toggle('hidden', isOwner);
+  document.getElementById('u-funnels-wrap').classList.toggle('hidden', isOwner);
   const hint = document.getElementById('u-owner-hint');
   if (hint) hint.classList.toggle('hidden', !isOwner);
 }
@@ -394,6 +404,7 @@ function permPreset(kind) {
   const p = {};
   PERM_FEATURES.forEach(f => {
     if (kind === 'none') return;
+    if (f.toggle) { if (kind === 'all') p[f.key] = 'edit'; return; }  // удаление — только вручную
     if (kind === 'view') p[f.key] = 'view';
     if (kind === 'all') p[f.key] = f.view_only ? 'view' : 'edit';
     if (kind === 'marketer') {
@@ -408,6 +419,15 @@ function permPreset(kind) {
   renderPermMatrix(p);
 }
 function hideUserForm() { document.getElementById('user-form').classList.add('hidden'); }
+
+function renderUserFunnels(selected) {
+  const box = document.getElementById('u-funnels');
+  if (!box) return;
+  const list = window._allFunnels || [];
+  box.innerHTML = list.length
+    ? list.map(f => `<span class="pill gray ${selected.includes(f.id) ? 'on' : ''}" data-id="${f.id}" onclick="this.classList.toggle('on')">${esc(f.name)}</span>`).join('')
+    : '<span style="color:#99a;font-size:12px">воронок пока нет</span>';
+}
 
 function renderUserBots(selected) {
   const bots = window._allBots || [];
@@ -425,6 +445,7 @@ function editUser(u) {
   document.getElementById('u-pass').placeholder = 'оставь пустым, чтобы не менять';
   document.getElementById('u-role').value = u.role;
   renderUserBots(u.bot_ids || []);
+  renderUserFunnels(u.funnel_ids || []);
   renderPermMatrix(u.role === 'owner' ? {} : (u.permissions || {}));
   updateRoleHint();
   document.getElementById('user-form').classList.remove('hidden');
@@ -437,6 +458,7 @@ async function saveUser() {
     password: document.getElementById('u-pass').value || null,
     role: document.getElementById('u-role').value,
     bot_ids: [...document.querySelectorAll('#u-bots .pill.on')].map(p => +p.dataset.id),
+    funnel_ids: [...document.querySelectorAll('#u-funnels .pill.on')].map(p => +p.dataset.id),
     permissions: collectPerms(),
     is_active: true,
   };
@@ -463,7 +485,7 @@ async function loadTagsPage() {
   document.getElementById('tags-list').innerHTML = `<table>
     <tr><th>Тег</th><th>Подписчиков</th><th></th></tr>
     ${TAGS.map(t => `<tr><td>${esc(t.name)}</td><td>${t.count}</td>
-      <td><button class="btn danger" onclick="deleteTag(${t.id})">Удалить</button></td></tr>`).join('')}
+      <td>${can('tags', 'edit') && canDelete() ? `<button class="btn danger" onclick="deleteTag(${t.id})">Удалить</button>` : ''}</td></tr>`).join('')}
   </table>`;
 }
 async function createTag() {
@@ -518,7 +540,7 @@ async function loadSubscribers() {
         </select>
         <button class="btn" onclick="bulkAction('add_tag')">+ тег</button>
         <button class="btn" onclick="bulkAction('remove_tag')">− тег</button>
-        <button class="btn danger" onclick="bulkAction('delete')">🗑 Удалить</button>
+        ${canDelete() ? `<button class="btn danger" onclick="bulkAction('delete')">🗑 Удалить</button>` : ''}
       </span>` : ''}
     </div>
     <table>
@@ -623,8 +645,8 @@ async function loadFunnels() {
       <td>${f.is_active ? '<span class="status-active">включена</span>' : '<span class="status-off">выключена</span>'}</td>
       <td>${f.runs}</td>
       <td>
-        <button class="btn" onclick="toggleFunnel(${f.id})">${f.is_active ? 'Выключить' : 'Включить'}</button>
-        <button class="btn danger" onclick="deleteFunnel(${f.id})">Удалить</button>
+        ${can('funnels', 'edit') ? `<button class="btn" onclick="toggleFunnel(${f.id})">${f.is_active ? 'Выключить' : 'Включить'}</button>` : ''}
+        ${can('funnels', 'edit') && canDelete() ? `<button class="btn danger" onclick="deleteFunnel(${f.id})">Удалить</button>` : ''}
       </td>
     </tr>`).join('')}
   </table>` : '<div class="panel">Пока нет воронок — создайте первую.</div>';
@@ -886,7 +908,8 @@ async function openChat(subId) {
   const rw = can('chat', 'edit');
   document.querySelector('.chat-compose')?.classList.toggle('hidden', !rw);
   document.querySelector('.chat-actions')?.classList.toggle('hidden', !rw);
-  document.getElementById('chat-delete-btn')?.classList.toggle('hidden', !can('subscribers', 'edit'));
+  document.getElementById('chat-delete-btn')?.classList.toggle('hidden',
+    !(can('subscribers', 'edit') && canDelete()));
   await refreshChatInfo();
   await refreshChatMessages();
   clearInterval(CHAT_TIMER);
