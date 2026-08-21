@@ -346,6 +346,7 @@ async def broadcast_loop(mgr: BotManager):
                     continue
                 bc.status = "running"
                 await session.commit()
+                log.info("Старт рассылки «%s» (id=%s)", bc.name, bc.id)
                 await _process_broadcast(session, bot, bc)
                 await session.commit()
         except Exception:  # noqa: BLE001
@@ -420,6 +421,8 @@ async def _process_broadcast(session, bot, bc: Broadcast):
         await session.commit()
         await asyncio.sleep(delay)
     bc.status = "done"
+    log.info("Рассылка «%s» завершена: отправлено %s, не доставлено %s (всего %s)",
+             bc.name, bc.sent, bc.failed, bc.total)
 
 
 # ---------- запуск из FastAPI ----------

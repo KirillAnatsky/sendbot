@@ -26,6 +26,10 @@ from .models import (
     User,
 )
 
+from .logging_setup import event_logger
+
+log = event_logger()
+
 router = APIRouter(prefix="/api")
 
 
@@ -56,6 +60,93 @@ async def health():
     }
 
 
+# ---------- логи (только владелец) ----------
+
+@router.get("/logs", dependencies=[Depends(require_owner)])
+async def get_logs(lines: int = 200, only_errors: bool = False, q: str = ""):
+    """Последние строки лога — чтобы смотреть из админки, а не по SSH."""
+    from pathlib import Path
+
+    from .config import settings
+
+    fname = "sendbot-error.log" if only_errors else "sendbot.log"
+    path = Path(settings.log_dir) / fname
+    if not path.exists():
+        return {"lines": [], "file": str(path), "size_kb": 0,
+                "note": "Файл ещё не создан — логи появятся после первых событий"}
+
+    lines = max(10, min(lines, 2000))
+    # читаем хвост файла, не загружая его целиком
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        chunk = min(size, 512 * 1024)
+        f.seek(size - chunk)
+        text = f.read().decode("utf-8", errors="replace")
+    rows = [r for r in text.splitlines() if r.strip()]
+    if q:
+        needle = q.lower()
+        rows = [r for r in rows if needle in r.lower()]
+    return {
+        "lines": rows[-lines:],
+        "file": str(path),
+        "size_kb": round(size / 1024, 1),
+        "files": sorted(p.name for p in Path(settings.log_dir).glob("sendbot*.log*")),
+    }
+
+
+@router.websocket("/logs/ws")
+async def logs_ws(ws):
+    """Стриминг логов по сокету: сразу отдаём хвост файла, дальше — только
+    новые строки по мере появления. Никакого периодического опроса."""
+    import asyncio
+    from pathlib import Path
+
+    from .auth import parse_token
+    from .config import settings
+
+    await ws.accept()
+    # токен передаём параметром: браузер не умеет слать заголовки в WebSocket
+    data = parse_token(ws.query_params.get("token", ""))
+    if not data or data.get("role") != "owner":
+        await ws.send_json({"error": "Доступно только владельцу"})
+        await ws.close()
+        return
+
+    only_errors = ws.query_params.get("only_errors") == "true"
+    path = Path(settings.log_dir) / ("sendbot-error.log" if only_errors else "sendbot.log")
+    try:
+        while not path.exists():          # файл появится с первым событием
+            await asyncio.sleep(1)
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 64 * 1024))
+            tail = f.read().splitlines()[-200:]
+            if tail:
+                await ws.send_json({"lines": tail, "initial": True})
+            inode = path.stat().st_ino
+            while True:
+                line = f.readline()
+                if line:
+                    await ws.send_json({"lines": [line.rstrip()]})
+                    continue
+                await asyncio.sleep(0.4)
+                # файл мог смениться при ротации — переоткрываем
+                try:
+                    if path.stat().st_ino != inode:
+                        break
+                except FileNotFoundError:
+                    break
+    except Exception:  # noqa: BLE001 — клиент отключился
+        pass
+    finally:
+        try:
+            await ws.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 # ---------- auth ----------
 
 class LoginIn(BaseModel):
@@ -68,8 +159,10 @@ async def login(body: LoginIn, session=Depends(get_session)):
     res = await session.execute(select(User).where(User.login == body.login.strip()))
     user = res.scalar_one_or_none()
     if user is None or not user.is_active or not verify_password(body.password, user.password_hash):
+        log.warning("Неудачный вход: логин «%s»", body.login.strip())
         raise HTTPException(401, "Неверный логин или пароль")
     user.last_login_at = datetime.utcnow()
+    log.info("Вход в админку: %s (%s)", user.login, user.role)
     return {
         "token": make_token(user),
         "user": {"id": user.id, "login": user.login, "name": user.name,
@@ -135,6 +228,7 @@ async def create_user(body: UserIn, session=Depends(get_session)):
              bot_ids=body.bot_ids or [], is_active=body.is_active)
     session.add(u)
     await session.flush()
+    log.info("Создан пользователь: %s (роль %s, боты %s)", u.login, u.role, u.bot_ids or "все")
     return {"id": u.id}
 
 
@@ -163,6 +257,7 @@ async def delete_user(user_id: int, user=Depends(current_user), session=Depends(
     if target and target.role == "owner" and owners <= 1:
         raise HTTPException(400, "Это последний владелец — удалить нельзя")
     await session.execute(delete(User).where(User.id == user_id))
+    log.warning("Удалён пользователь id=%s", user_id)
     return {"ok": True}
 
 
@@ -222,6 +317,7 @@ async def create_bot(body: BotIn, session=Depends(get_session)):
     b = Bot(name=body.name or "Новый бот", token=body.token.strip(), is_active=False)
     session.add(b)
     await session.flush()
+    log.info("Добавлен бот «%s» (id=%s)", b.name, b.id)
     return {"id": b.id}
 
 
@@ -258,7 +354,9 @@ async def toggle_bot(bot_id: int, session=Depends(get_session)):
         await manager.stop_bot(bot_id)
     # перечитать возможную ошибку старта
     await session.refresh(b)
+    log.info("Бот «%s» (id=%s): %s", b.name, bot_id, "включён" if b.is_active else "выключен")
     if b.is_active and manager.get(bot_id) is None:
+        log.error("Бот «%s» не запустился: %s", b.name, b.last_error)
         raise HTTPException(400, f"Бот не запустился: {b.last_error or 'проверьте токен'}")
     return {"is_active": b.is_active, "running": manager.get(bot_id) is not None}
 
@@ -366,6 +464,7 @@ async def delete_bot(bot_id: int, session=Depends(get_session)):
     await manager.stop_bot(bot_id)
     await session.execute(delete(FunnelBot).where(FunnelBot.bot_id == bot_id))
     await session.execute(delete(Bot).where(Bot.id == bot_id))
+    log.warning("Удалён бот id=%s", bot_id)
     return {"ok": True}
 
 
@@ -905,6 +1004,8 @@ async def toggle_funnel(funnel_id: int, session=Depends(get_session)):
     if not f.is_active and not await _bot_ids_for_funnel(session, funnel_id):
         raise HTTPException(400, "Назначьте воронке хотя бы одного бота")
     f.is_active = not f.is_active
+    log.info("Воронка «%s» (id=%s): %s", f.name, funnel_id,
+             "включена" if f.is_active else "выключена")
     return {"is_active": f.is_active}
 
 
@@ -1296,4 +1397,6 @@ async def create_broadcast(body: BroadcastIn, session=Depends(get_session)):
     )
     session.add(bc)
     await session.flush()
+    log.info("Создана рассылка «%s» (id=%s, бот %s, вложений %s)",
+             bc.name, bc.id, bc.bot_id, len(bc.media or []))
     return {"id": bc.id}

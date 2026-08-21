@@ -87,9 +87,11 @@ const loaders = {
   broadcasts: () => loadBroadcasts(),
   analysis: () => loadAnalysisPage(),
   team: () => loadUsers(),
+  logs: () => loadLogs(),
   ai: () => loadAIPage(),
 };
 function go(page) {
+  if (page !== 'logs' && typeof closeLogs === 'function') closeLogs();
   document.querySelectorAll('.page').forEach(p => p.classList.add('hidden'));
   document.getElementById('page-' + page).classList.remove('hidden');
   document.querySelectorAll('.nav-item').forEach(n =>
@@ -175,6 +177,70 @@ async function loadBotFilter() {
   sel.innerHTML = '<option value="">Все боты</option>' +
     bots.map(b => `<option value="${b.id}">${esc(b.name)}</option>`).join('');
   sel.value = cur;
+}
+
+// ---------- логи (стрим по сокету) ----------
+let LOG_WS = null;
+let LOG_BUFFER = [];
+let _logsTimer = null;
+
+function logsDebounce() {          // фильтр применяем локально, без запросов
+  clearTimeout(_logsTimer);
+  _logsTimer = setTimeout(renderLogs, 200);
+}
+
+function loadLogs() {
+  connectLogs();
+}
+
+function connectLogs() {
+  closeLogs();
+  LOG_BUFFER = [];
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const onlyErrors = document.getElementById('log-errors').checked;
+  const url = `${proto}://${location.host}/api/logs/ws?token=${encodeURIComponent(TOKEN)}&only_errors=${onlyErrors}`;
+  const view = document.getElementById('log-view');
+  view.textContent = 'подключение…';
+
+  const ws = new WebSocket(url);
+  LOG_WS = ws;
+  ws.onmessage = ev => {
+    const msg = JSON.parse(ev.data);
+    if (msg.error) { view.textContent = msg.error; return; }
+    LOG_BUFFER.push(...msg.lines);
+    if (LOG_BUFFER.length > 5000) LOG_BUFFER = LOG_BUFFER.slice(-5000);
+    renderLogs();
+  };
+  ws.onclose = () => {
+    // переподключаемся, пока раздел открыт
+    if (LOG_WS === ws && !document.getElementById('page-logs').classList.contains('hidden')) {
+      setTimeout(connectLogs, 3000);
+    }
+  };
+}
+
+function closeLogs() {
+  if (LOG_WS) { const w = LOG_WS; LOG_WS = null; try { w.close(); } catch (e) {} }
+}
+
+function renderLogs() {
+  const view = document.getElementById('log-view');
+  const q = document.getElementById('log-search').value.trim().toLowerCase();
+  const limit = +document.getElementById('log-lines').value;
+  let rows = LOG_BUFFER;
+  if (q) rows = rows.filter(l => l.toLowerCase().includes(q));
+  rows = rows.slice(-limit);
+  const atBottom = view.scrollTop + view.clientHeight >= view.scrollHeight - 60;
+  view.innerHTML = rows.length
+    ? rows.map(l => {
+        const cls = /\| ERROR|\| CRITICAL|Traceback/.test(l) ? 'log-err'
+          : /\| WARNING/.test(l) ? 'log-warn' : '';
+        return `<span class="${cls}">${esc(l)}</span>`;
+      }).join('\n')
+    : 'пока пусто — новые события появятся здесь автоматически';
+  document.getElementById('log-meta').textContent =
+    `${rows.length} строк · живой поток${LOG_WS && LOG_WS.readyState === 1 ? ' 🟢' : ' 🔴'}`;
+  if (atBottom) view.scrollTop = view.scrollHeight;
 }
 
 // ---------- команда ----------

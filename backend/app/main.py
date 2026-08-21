@@ -21,7 +21,9 @@ from .api import router
 from .bot.runner import manager, start_bot_and_workers
 from .db import init_db
 
-logging.basicConfig(level=logging.INFO)
+from .logging_setup import setup_logging
+
+setup_logging()
 
 
 @asynccontextmanager

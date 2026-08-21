@@ -2,8 +2,18 @@
 # автозапуск после перезагрузки сервера, ежедневные бэкапы базы.
 #
 # Запуск:  docker compose -f docker-compose.prod.yml up -d --build
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"     # лог контейнера не больше 20 МБ…
+    max-file: "5"       # …и не больше 5 файлов
+
 services:
+  # Локальная БД — только для быстрого старта/разработки.
+  # На проде базу выносим на отдельный сервер: см. DATABASE_URL в .env
   db:
+    profiles: ["local-db"]
+    logging: *default-logging
     image: postgres:16-alpine
     restart: always
     environment:
@@ -19,21 +29,22 @@ services:
       retries: 10
 
   app:
+    logging: *default-logging
     build: ./backend
     restart: always
     env_file: .env
     environment:
-      DATABASE_URL: postgresql+asyncpg://sendbot:${DB_PASSWORD:-sendbot}@db:5432/sendbot
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://sendbot:${DB_PASSWORD:-sendbot}@db:5432/sendbot}
       MEDIA_DIR: /app/media
+      LOG_DIR: /app/logs
       HISTORY_RETENTION_DAYS: ${HISTORY_RETENTION_DAYS:-0}
     volumes:
       - media:/app/media
-    depends_on:
-      db:
-        condition: service_healthy
+      - ./logs:/app/logs
 
   # Caddy сам получает и продлевает бесплатный SSL-сертификат Let's Encrypt
   caddy:
+    logging: *default-logging
     image: caddy:2-alpine
     restart: always
     ports:
@@ -50,20 +61,19 @@ services:
 
   # Ежедневный бэкап базы в 03:00, хранится 14 последних копий
   backup:
+    logging: *default-logging
     image: postgres:16-alpine
     restart: always
     environment:
       PGPASSWORD: ${DB_PASSWORD:-sendbot}
+      PGHOST: ${DB_HOST:-db}
     volumes:
       - ./backups:/backups
-    depends_on:
-      db:
-        condition: service_healthy
     entrypoint: >
       sh -c 'while true; do
         sleep $$(( ( $$(date -d "tomorrow 03:00" +%s) - $$(date +%s) ) % 86400 ));
         f=/backups/sendbot-$$(date +%Y%m%d-%H%M).sql.gz;
-        pg_dump -h db -U sendbot sendbot | gzip > $$f && echo "backup: $$f";
+        pg_dump -h $$PGHOST -U sendbot sendbot | gzip > $$f && echo "backup: $$f";
         ls -1t /backups/*.sql.gz | tail -n +15 | xargs -r rm --;
       done'
 

@@ -12,6 +12,8 @@ class Settings:
     broadcast_rate: float = float(os.getenv("BROADCAST_RATE", "20"))
     # папка с картинками (из .docx и своими)
     media_dir: str = os.getenv("MEDIA_DIR", "./media")
+    # папка с лог-файлами (ротация настроена в logging_setup)
+    log_dir: str = os.getenv("LOG_DIR", "./logs")
     # автоочистка истории переписки и получателей рассылок старше N дней
     # (0 = хранить вечно). На больших базах помогает держать БД компактной.
     history_retention_days: int = int(os.getenv("HISTORY_RETENTION_DAYS", "0"))

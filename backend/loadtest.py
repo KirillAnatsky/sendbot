@@ -13,6 +13,10 @@
     --target N        целевой объём для экстраполяции (400000)
     --keep            не удалять тестовые данные после прогона
     --skip-seed       не создавать данные (замерить на уже существующей базе)
+    --cleanup-only    только стереть тестовые данные и выйти
+    --database-url    адрес тестовой БД (чтобы не трогать боевую)
+
+Тест НЕ гоняем на боевом сервере: см. НАГРУЗОЧНЫЙ-ТЕСТ.md
 
 ВНИМАНИЕ: создаёт тестовых ботов/подписчиков с пометкой [LOADTEST] и по
 умолчанию удаляет их в конце. Лучше гонять на копии базы.
@@ -324,7 +328,15 @@ async def main():
     ap.add_argument("--target", type=int, default=400000)
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--skip-seed", action="store_true")
+    ap.add_argument("--cleanup-only", action="store_true",
+                    help="только удалить тестовые данные и выйти")
+    ap.add_argument("--database-url", default=None,
+                    help="адрес тестовой БД, если гоняем не на этом сервере")
     args = ap.parse_args()
+
+    if args.database_url:
+        import os
+        os.environ["DATABASE_URL"] = args.database_url
 
     from app.db import SessionLocal, init_db
     from app.config import settings
@@ -337,6 +349,11 @@ async def main():
 
     await init_db()
     async with SessionLocal() as session:
+        if args.cleanup_only:
+            print("\n  ОЧИСТКА ТЕСТОВЫХ ДАННЫХ")
+            await cleanup(session)
+            print("\n" + "=" * 72)
+            return
         if args.skip_seed:
             from sqlalchemy import select
             from app.models import Bot, Funnel, Tag

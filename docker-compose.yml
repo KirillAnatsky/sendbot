@@ -19,9 +19,11 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://sendbot:sendbot@db:5432/sendbot
       MEDIA_DIR: /app/media
+      LOG_DIR: /app/logs
       HISTORY_RETENTION_DAYS: ${HISTORY_RETENTION_DAYS:-0}
     volumes:
       - media:/app/media
+      - ./logs:/app/logs
     ports:
       - "8000:8000"
     depends_on:
