@@ -27,7 +27,10 @@ function showLogin() {
 function showApp() {
   document.getElementById('login-screen').classList.add('hidden');
   document.getElementById('app').classList.remove('hidden');
-  go('dashboard');
+  const page = firstAllowedPage();
+  if (page) go(page);
+  else document.getElementById('app').innerHTML =
+    '<div class="panel" style="margin:40px">Вам пока не выдали доступ ни к одному разделу. Обратитесь к владельцу аккаунта.</div>';
 }
 let ME = null;  // текущий пользователь
 
@@ -52,12 +55,55 @@ async function doLogin() {
   }
 }
 
-// прячем от сотрудника то, что доступно только владельцу
+// ---------- права текущего пользователя ----------
+const LEVEL_RANK = { none: 0, view: 1, edit: 2 };
+
+// can('funnels')          — доступен ли раздел хотя бы на просмотр
+// can('funnels', 'edit')  — можно ли изменять
+function can(feature, level = 'view') {
+  if (!ME) return false;
+  if (ME.role === 'owner') return true;
+  const have = (ME.permissions || {})[feature] || 'none';
+  return LEVEL_RANK[have] >= LEVEL_RANK[level];
+}
+
+// разделы меню и то, какое право им нужно
+const PAGE_PERM = {
+  dashboard: 'analytics', analysis: 'analytics', bots: 'bots',
+  funnels: 'funnels', subscribers: 'subscribers', tags: 'tags',
+  broadcasts: 'broadcasts', ai: 'ai', logs: 'logs',
+};
+
+// прячем разделы и кнопки, на которые нет прав
 function applyRoleUI() {
   const owner = ME && ME.role === 'owner';
   document.querySelectorAll('.owner-only').forEach(el => el.classList.toggle('hidden', !owner));
+
+  // пункты меню
+  document.querySelectorAll('.nav-item[data-page]').forEach(el => {
+    const page = el.dataset.page;
+    if (page === 'team') { el.classList.toggle('hidden', !owner); return; }
+    const feature = PAGE_PERM[page];
+    el.classList.toggle('hidden', feature ? !can(feature) : false);
+  });
+
+  // элементы, помеченные правом: data-perm="funnels" [data-perm-level="edit"]
+  document.querySelectorAll('[data-perm]').forEach(el => {
+    const lvl = el.dataset.permLevel || 'view';
+    el.classList.toggle('hidden', !can(el.dataset.perm, lvl));
+  });
+
   document.getElementById('side-user-name').textContent =
     ME ? `${ME.name || ME.login}${owner ? ' · владелец' : ''}` : '';
+}
+
+// первая доступная страница — на неё уводим, если на дашборд прав нет
+function firstAllowedPage() {
+  if (can('analytics')) return 'dashboard';
+  for (const [page, feature] of Object.entries(PAGE_PERM)) {
+    if (can(feature)) return page;
+  }
+  return ME && ME.role === 'owner' ? 'team' : null;
 }
 
 async function changeMyPassword() {
@@ -91,6 +137,12 @@ const loaders = {
   ai: () => loadAIPage(),
 };
 function go(page) {
+  const feature = PAGE_PERM[page];
+  if (feature && !can(feature)) {
+    alert('У вас нет доступа к этому разделу. Права выдаёт владелец аккаунта.');
+    return;
+  }
+  if (page === 'team' && !(ME && ME.role === 'owner')) return;
   if (page !== 'logs' && typeof closeLogs === 'function') closeLogs();
   document.querySelectorAll('.page').forEach(p => p.classList.add('hidden'));
   document.getElementById('page-' + page).classList.remove('hidden');
@@ -117,7 +169,7 @@ async function loadBots() {
       <td>${b.funnels}</td>
       <td>
         <button class="btn primary" onclick="openBot(${b.id})">Открыть</button>
-        ${ME && ME.role === 'owner' ? `
+        ${can('bots', 'edit') ? `
         <button class="btn" onclick="toggleBot(${b.id})">${b.is_active ? 'Выключить' : 'Включить'}</button>
         <button class="btn danger" onclick="deleteBot(${b.id})">Удалить</button>` : ''}
       </td>
@@ -246,11 +298,16 @@ function renderLogs() {
 // ---------- команда ----------
 let EDIT_USER_ID = null;
 
+let PERM_FEATURES = [];
+
 async function loadUsers() {
-  const [users, bots] = await Promise.all([api('/users'), api('/bots')]);
+  const [users, bots, feats] = await Promise.all([
+    api('/users'), api('/bots'), api('/permissions/features'),
+  ]);
   window._allBots = bots;
+  PERM_FEATURES = feats;
   document.getElementById('users-list').innerHTML = `<table>
-    <tr><th>Логин</th><th>Имя</th><th>Роль</th><th>Боты</th><th>Статус</th><th>Последний вход</th><th></th></tr>
+    <tr><th>Логин</th><th>Имя</th><th>Роль</th><th>Боты</th><th>Доступ к разделам</th><th>Статус</th><th>Последний вход</th><th></th></tr>
     ${users.map(u => `<tr>
       <td><b>${esc(u.login)}</b></td>
       <td>${esc(u.name || '—')}</td>
@@ -258,6 +315,7 @@ async function loadUsers() {
       <td>${(u.bot_ids && u.bot_ids.length)
         ? u.bot_ids.map(id => { const b = bots.find(x => x.id === id); return `<span class="pill">${esc(b ? b.name : id)}</span>`; }).join('')
         : '<span style="color:#7a8499;font-size:12px">все</span>'}</td>
+      <td>${permSummary(u)}</td>
       <td>${u.is_active ? '<span class="status-active">активен</span>' : '<span class="status-off">отключён</span>'}</td>
       <td>${u.last_login_at ? new Date(u.last_login_at + 'Z').toLocaleString('ru') : '—'}</td>
       <td>
@@ -268,6 +326,16 @@ async function loadUsers() {
   </table>`;
 }
 
+function permSummary(u) {
+  if (u.role === 'owner') return '<span class="pill">всё</span>';
+  const p = u.permissions || {};
+  const on = PERM_FEATURES.filter(f => p[f.key] && p[f.key] !== 'none');
+  if (!on.length) return '<span style="color:#d33;font-size:12px">нет доступа</span>';
+  return on.map(f =>
+    `<span class="pill ${p[f.key] === 'edit' ? '' : 'gray'}" title="${p[f.key] === 'edit' ? 'может изменять' : 'только смотреть'}">${esc(f.label)}${p[f.key] === 'edit' ? '' : ' 👁'}</span>`
+  ).join('');
+}
+
 function showUserForm() {
   EDIT_USER_ID = null;
   document.getElementById('u-login').value = '';
@@ -276,7 +344,68 @@ function showUserForm() {
   document.getElementById('u-pass').value = '';
   document.getElementById('u-role').value = 'staff';
   renderUserBots([]);
+  renderPermMatrix({});
+  updateRoleHint();
   document.getElementById('user-form').classList.remove('hidden');
+}
+
+// матрица «раздел × уровень»
+function renderPermMatrix(perms) {
+  const box = document.getElementById('u-perms');
+  if (!box) return;
+  box.innerHTML = PERM_FEATURES.map(f => {
+    const cur = perms[f.key] || 'none';
+    const levels = f.view_only
+      ? [['none', 'нет'], ['view', 'смотреть']]
+      : [['none', 'нет'], ['view', 'смотреть'], ['edit', 'изменять']];
+    return `<div class="perm-row">
+      <div class="perm-name"><b>${esc(f.label)}</b><span>${esc(f.hint || '')}</span></div>
+      <div class="perm-levels" data-key="${f.key}">
+        ${levels.map(([v, l]) =>
+          `<label class="perm-opt${cur === v ? ' on' : ''}">
+             <input type="radio" name="perm-${f.key}" value="${v}"${cur === v ? ' checked' : ''}
+               onchange="this.closest('.perm-levels').querySelectorAll('.perm-opt').forEach(o=>o.classList.remove('on'));this.closest('.perm-opt').classList.add('on')">
+             ${l}
+           </label>`).join('')}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function collectPerms() {
+  const out = {};
+  document.querySelectorAll('#u-perms .perm-levels').forEach(row => {
+    const checked = row.querySelector('input:checked');
+    if (checked && checked.value !== 'none') out[row.dataset.key] = checked.value;
+  });
+  return out;
+}
+
+// у владельца прав не спрашиваем — ему доступно всё
+function updateRoleHint() {
+  const isOwner = document.getElementById('u-role').value === 'owner';
+  document.getElementById('u-perms-wrap').classList.toggle('hidden', isOwner);
+  document.getElementById('u-bots-wrap').classList.toggle('hidden', isOwner);
+  const hint = document.getElementById('u-owner-hint');
+  if (hint) hint.classList.toggle('hidden', !isOwner);
+}
+
+function permPreset(kind) {
+  const p = {};
+  PERM_FEATURES.forEach(f => {
+    if (kind === 'none') return;
+    if (kind === 'view') p[f.key] = 'view';
+    if (kind === 'all') p[f.key] = f.view_only ? 'view' : 'edit';
+    if (kind === 'marketer') {
+      if (['funnels', 'broadcasts', 'tags', 'subscribers', 'chat'].includes(f.key)) p[f.key] = 'edit';
+      else if (['analytics', 'bots'].includes(f.key)) p[f.key] = 'view';
+    }
+    if (kind === 'support') {
+      if (['chat', 'subscribers'].includes(f.key)) p[f.key] = 'edit';
+      else if (f.key === 'tags') p[f.key] = 'view';
+    }
+  });
+  renderPermMatrix(p);
 }
 function hideUserForm() { document.getElementById('user-form').classList.add('hidden'); }
 
@@ -296,6 +425,8 @@ function editUser(u) {
   document.getElementById('u-pass').placeholder = 'оставь пустым, чтобы не менять';
   document.getElementById('u-role').value = u.role;
   renderUserBots(u.bot_ids || []);
+  renderPermMatrix(u.role === 'owner' ? {} : (u.permissions || {}));
+  updateRoleHint();
   document.getElementById('user-form').classList.remove('hidden');
 }
 
@@ -306,8 +437,11 @@ async function saveUser() {
     password: document.getElementById('u-pass').value || null,
     role: document.getElementById('u-role').value,
     bot_ids: [...document.querySelectorAll('#u-bots .pill.on')].map(p => +p.dataset.id),
+    permissions: collectPerms(),
     is_active: true,
   };
+  if (body.role !== 'owner' && !Object.keys(body.permissions).length &&
+      !confirm('Ни один раздел не отмечен — человек не сможет ничего открыть. Сохранить всё равно?')) return;
   if (EDIT_USER_ID) await api('/users/' + EDIT_USER_ID, { method: 'PUT', body });
   else await api('/users', { method: 'POST', body });
   hideUserForm();
@@ -376,7 +510,7 @@ async function loadSubscribers() {
   document.getElementById('subscribers-list').innerHTML = `
     <div class="list-meta">
       Найдено: <b>${res.total}</b>${res.total > subs.length ? ` (показаны первые ${subs.length})` : ''}
-      ${res.total ? `
+      ${res.total && can('subscribers', 'edit') ? `
       <span class="bulk-actions">
         С этой аудиторией (${res.total}):
         <select id="bulk-tag-select">
@@ -395,11 +529,12 @@ async function loadSubscribers() {
       <td>${esc(s.language_code || '—')}</td>
       <td>${s.last_active_at ? new Date(s.last_active_at + 'Z').toLocaleDateString('ru') : '—'}</td>
       <td>${s.is_active ? '<span class="status-active">активен</span>' : '<span class="status-off">блок</span>'}</td>
-      <td>${s.tags.map(t => `<span class="pill">${esc(t.name)}<span class="x" onclick="removeSubTag(${s.id},${t.id})">✕</span></span>`).join('')}</td>
-      <td><select onchange="addSubTag(${s.id}, this.value); this.value=''">
+      <td>${s.tags.map(t => `<span class="pill">${esc(t.name)}${can('subscribers', 'edit')
+        ? `<span class="x" onclick="removeSubTag(${s.id},${t.id})">✕</span>` : ''}</span>`).join('')}</td>
+      <td>${can('subscribers', 'edit') ? `<select onchange="addSubTag(${s.id}, this.value); this.value=''">
         <option value="">+ тег</option>
         ${TAGS.map(t => `<option value="${t.id}">${esc(t.name)}</option>`).join('')}
-      </select></td>
+      </select>` : ''}</td>
     </tr>`).join('')}
   </table>`;
 }
@@ -554,7 +689,7 @@ async function loadBroadcasts() {
     ${bcs.map(b => {
       const pct = b.total ? Math.round(100 * (b.sent + b.failed) / b.total) : 0;
       return `<tr>
-        <td><b>${esc(b.name)}</b><br><span style="color:#7a8499;font-size:12px">${esc(b.text.slice(0, 60))}…</span></td>
+        <td><a href="#" onclick="openBroadcast(${b.id});return false"><b>${esc(b.name)}</b></a><br><span style="color:#7a8499;font-size:12px">${esc(b.text.slice(0, 60))}${b.text.length > 60 ? '…' : ''}</span></td>
         <td>${esc(b.bot || '—')}</td>
         <td>${BC_STATUS[b.status] || b.status}</td>
         <td>${b.sent}/${b.total}${b.failed ? ` (не дошло: ${b.failed})` : ''}
@@ -570,6 +705,75 @@ async function loadBroadcasts() {
       if (!document.getElementById('page-broadcasts').classList.contains('hidden')) loadBroadcasts();
     }, 3000);
   }
+}
+
+// ---------- карточка рассылки ----------
+async function openBroadcast(id) {
+  let b;
+  try { b = await api('/broadcasts/' + id); } catch (e) { return; }
+
+  const media = (b.media || []).length
+    ? b.media
+    : (b.photo_url ? [{ type: 'photo', path: b.photo_url, name: '' }] : []);
+
+  const pct = b.total ? Math.round(100 * (b.sent + b.failed) / b.total) : 0;
+  const rec = b.recipients || [];
+
+  document.getElementById('bc-detail-body').innerHTML = `
+    <div class="bc-grid">
+      <div class="bc-col">
+        <div class="bc-section-title">Что отправляли</div>
+        <div class="bc-preview">
+          ${media.length ? `<div class="bc-media">${media.map(m => `
+            <div class="bc-media-item" title="${esc(m.name || m.path)}">
+              ${mediaThumbHtml(m)}
+              <span>${esc(m.name || m.path.split('/').pop())}</span>
+            </div>`).join('')}</div>` : ''}
+          <div class="bc-text">${b.text ? esc(b.text).replace(/\n/g, '<br>') : '<i style="color:#99a">без текста</i>'}</div>
+        </div>
+        ${media.length > 1 ? '<div class="bc-hint">Несколько фото/видео уходят одним альбомом.</div>' : ''}
+      </div>
+
+      <div class="bc-col">
+        <div class="bc-section-title">Результат</div>
+        <div class="bc-stats">
+          <div class="bc-stat"><span>${b.sent}</span><label>отправлено</label></div>
+          <div class="bc-stat ${b.failed ? 'bad' : ''}"><span>${b.failed}</span><label>не дошло</label></div>
+          <div class="bc-stat"><span>${b.total}</span><label>в аудитории</label></div>
+          <div class="bc-stat"><span>${b.total ? Math.round(100 * b.sent / b.total) : 0}%</span><label>доставляемость</label></div>
+        </div>
+        <div class="progress" style="margin:10px 0"><i style="width:${pct}%"></i></div>
+
+        <div class="bc-section-title">Кому</div>
+        <div class="chat-info-row"><span>Бот</span><b>${esc(b.bot)}</b></div>
+        <div class="chat-info-row"><span>Отбор</span><b>${esc(b.audience_kind)}</b></div>
+        ${b.audience.map(a => `<div class="bc-cond">${esc(a)}</div>`).join('')}
+        <div class="chat-info-row" style="margin-top:8px"><span>Статус</span><b>${BC_STATUS[b.status] || b.status}</b></div>
+        <div class="chat-info-row"><span>Создана</span><b>${new Date(b.created_at + 'Z').toLocaleString('ru')}</b></div>
+      </div>
+    </div>
+
+    <div class="bc-section-title" style="margin-top:16px">
+      Получатели${rec.length ? ` <span style="font-weight:400;color:#7a8499">— показаны ${rec.length}${b.total > rec.length ? ` из ${b.total}` : ''}</span>` : ''}
+    </div>
+    ${rec.length ? `<table>
+      <tr><th>Имя</th><th>Username</th><th>Доставлено</th><th>Время</th></tr>
+      ${rec.map(r => `<tr>
+        <td><a href="#" onclick="closeBroadcast();openChat(${r.id});return false">${esc(r.name)}</a></td>
+        <td>${r.username ? '@' + esc(r.username) : '—'}</td>
+        <td>${r.delivered ? '<span class="status-active">да</span>' : '<span class="status-off">нет</span>'}</td>
+        <td>${new Date(r.at + 'Z').toLocaleString('ru')}</td>
+      </tr>`).join('')}
+    </table>` : '<div class="panel">Пока никому не отправлено.</div>'}`;
+
+  document.getElementById('bc-detail-title').textContent = b.name;
+  document.getElementById('bc-overlay').classList.remove('hidden');
+  document.getElementById('bc-detail').classList.remove('hidden');
+}
+
+function closeBroadcast() {
+  document.getElementById('bc-detail').classList.add('hidden');
+  document.getElementById('bc-overlay').classList.add('hidden');
 }
 
 // ---------- AI ----------
@@ -678,6 +882,11 @@ async function openChat(subId) {
   if (!TAGS.length) await loadTags();
   document.getElementById('chat-overlay').classList.remove('hidden');
   document.getElementById('chat-drawer').classList.remove('hidden');
+  // без права «изменять» переписку можно только читать
+  const rw = can('chat', 'edit');
+  document.querySelector('.chat-compose')?.classList.toggle('hidden', !rw);
+  document.querySelector('.chat-actions')?.classList.toggle('hidden', !rw);
+  document.getElementById('chat-delete-btn')?.classList.toggle('hidden', !can('subscribers', 'edit'));
   await refreshChatInfo();
   await refreshChatMessages();
   clearInterval(CHAT_TIMER);

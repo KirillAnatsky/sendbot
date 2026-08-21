@@ -98,7 +98,6 @@ async function loadDashboard() {
     [t.retention_7d + '%', 'Активны за 7 дней', null],
     [t.lifetime_avg_days + ' дн', 'Средний срок жизни', null],
     [t.lifetime_median_days + ' дн', 'Медианный срок', null],
-    ['—', 'LTV в деньгах · скоро', null],
   ].map(([n, l, page]) =>
     `<div class="card${page ? ' clickable' : ''}"${page ? ` onclick="go('${page}')"` : ''}>
       <div class="num">${n}</div><div class="lbl">${l}</div></div>`).join('');

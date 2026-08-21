@@ -2,12 +2,13 @@ from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile
 from pydantic import BaseModel
-from sqlalchemy import delete, func, select
+from sqlalchemy import case, delete, func, select
 
 from . import ai, segment
 from .auth import (
-    current_user, ensure_bot_access, hash_password, make_token,
-    require_auth, require_owner, verify_password,
+    FEATURES, current_user, ensure_bot_access, hash_password, make_token,
+    normalize_permissions, parse_token, require, require_auth, require_owner,
+    user_permissions, verify_password,
 )
 from .db import SessionLocal
 from .graph import GraphError, compile_graph
@@ -65,7 +66,7 @@ async def health():
 
 # ---------- логи (только владелец) ----------
 
-@router.get("/logs", dependencies=[Depends(require_owner)])
+@router.get("/logs", dependencies=[Depends(require("logs", "view"))])
 async def get_logs(lines: int = 200, only_errors: bool = False, q: str = ""):
     """Последние строки лога — чтобы смотреть из админки, а не по SSH."""
     from pathlib import Path
@@ -105,14 +106,18 @@ async def logs_ws(ws):
     import asyncio
     from pathlib import Path
 
-    from .auth import parse_token
+    from .auth import has_perm
     from .config import settings
 
     await ws.accept()
     # токен передаём параметром: браузер не умеет слать заголовки в WebSocket
     data = parse_token(ws.query_params.get("token", ""))
-    if not data or data.get("role") != "owner":
-        await ws.send_json({"error": "Доступно только владельцу"})
+    ws_user = None
+    if data:
+        async with SessionLocal() as s_:
+            ws_user = await s_.get(User, data["uid"])
+    if not ws_user or not ws_user.is_active or not has_perm(ws_user, "logs", "view"):
+        await ws.send_json({"error": "Нет прав на просмотр логов"})
         await ws.close()
         return
 
@@ -176,7 +181,14 @@ async def login(body: LoginIn, session=Depends(get_session)):
 @router.get("/auth/me", dependencies=[Depends(require_auth)])
 async def auth_me(user=Depends(current_user)):
     return {"id": user.id, "login": user.login, "name": user.name,
-            "role": user.role, "bot_ids": user.bot_ids or []}
+            "role": user.role, "bot_ids": user.bot_ids or [],
+            "permissions": user_permissions(user)}
+
+
+@router.get("/permissions/features", dependencies=[Depends(require_owner)])
+async def permission_features():
+    """Справочник разделов для экрана «Команда»."""
+    return FEATURES
 
 
 class ChangePwIn(BaseModel):
@@ -202,7 +214,8 @@ class UserIn(BaseModel):
     name: str = ""
     password: str | None = None
     role: str = "staff"
-    bot_ids: list[int] = []
+    bot_ids: list[int] = []          # пусто = все боты
+    permissions: dict = {}           # {"funnels": "edit", ...}; у владельца не важно
     is_active: bool = True
 
 
@@ -212,6 +225,7 @@ async def list_users(session=Depends(get_session)):
     return [
         {"id": u.id, "login": u.login, "name": u.name, "role": u.role,
          "is_active": u.is_active, "bot_ids": u.bot_ids or [],
+         "permissions": user_permissions(u),
          "last_login_at": u.last_login_at.isoformat() if u.last_login_at else None}
         for u in users
     ]
@@ -228,7 +242,8 @@ async def create_user(body: UserIn, session=Depends(get_session)):
     u = User(login=login, name=body.name or login,
              password_hash=hash_password(body.password),
              role="owner" if body.role == "owner" else "staff",
-             bot_ids=body.bot_ids or [], is_active=body.is_active)
+             bot_ids=body.bot_ids or [], is_active=body.is_active,
+             permissions=normalize_permissions(body.permissions))
     session.add(u)
     await session.flush()
     log.info("Создан пользователь: %s (роль %s, боты %s)", u.login, u.role, u.bot_ids or "все")
@@ -244,6 +259,7 @@ async def update_user(user_id: int, body: UserIn, session=Depends(get_session)):
     u.role = "owner" if body.role == "owner" else "staff"
     u.bot_ids = body.bot_ids or []
     u.is_active = body.is_active
+    u.permissions = normalize_permissions(body.permissions)
     if body.password:
         if len(body.password) < 6:
             raise HTTPException(400, "Пароль слишком короткий")
@@ -313,7 +329,7 @@ async def list_bots(user=Depends(current_user), session=Depends(get_session)):
     ]
 
 
-@router.post("/bots", dependencies=[Depends(require_owner)])
+@router.post("/bots", dependencies=[Depends(require("bots", "edit"))])
 async def create_bot(body: BotIn, session=Depends(get_session)):
     if not body.token or not body.token.strip():
         raise HTTPException(400, "Нужен токен бота от @BotFather")
@@ -324,7 +340,7 @@ async def create_bot(body: BotIn, session=Depends(get_session)):
     return {"id": b.id}
 
 
-@router.put("/bots/{bot_id}", dependencies=[Depends(require_owner)])
+@router.put("/bots/{bot_id}", dependencies=[Depends(require("bots", "edit"))])
 async def update_bot(bot_id: int, body: BotIn, session=Depends(get_session)):
     from .bot.runner import manager
 
@@ -342,7 +358,7 @@ async def update_bot(bot_id: int, body: BotIn, session=Depends(get_session)):
     return {"ok": True}
 
 
-@router.post("/bots/{bot_id}/toggle", dependencies=[Depends(require_auth)])
+@router.post("/bots/{bot_id}/toggle", dependencies=[Depends(require("bots", "edit"))])
 async def toggle_bot(bot_id: int, session=Depends(get_session)):
     from .bot.runner import manager
 
@@ -364,7 +380,7 @@ async def toggle_bot(bot_id: int, session=Depends(get_session)):
     return {"is_active": b.is_active, "running": manager.get(bot_id) is not None}
 
 
-@router.get("/bots/{bot_id}/overview", dependencies=[Depends(require_auth)])
+@router.get("/bots/{bot_id}/overview", dependencies=[Depends(require("bots", "view"))])
 async def bot_overview(bot_id: int, user=Depends(current_user), session=Depends(get_session)):
     """Сводка для главного экрана бота."""
     from datetime import timedelta
@@ -424,7 +440,7 @@ async def bot_overview(bot_id: int, user=Depends(current_user), session=Depends(
     }
 
 
-@router.get("/bots/{bot_id}/check", dependencies=[Depends(require_owner)])
+@router.get("/bots/{bot_id}/check", dependencies=[Depends(require("bots", "view"))])
 async def check_bot(bot_id: int, session=Depends(get_session)):
     """Живая диагностика через Telegram API: getMe + getWebhookInfo."""
     from .bot.runner import manager
@@ -460,7 +476,7 @@ async def check_bot(bot_id: int, session=Depends(get_session)):
     return result
 
 
-@router.delete("/bots/{bot_id}", dependencies=[Depends(require_owner)])
+@router.delete("/bots/{bot_id}", dependencies=[Depends(require("bots", "edit"))])
 async def delete_bot(bot_id: int, session=Depends(get_session)):
     from .bot.runner import manager
 
@@ -473,7 +489,7 @@ async def delete_bot(bot_id: int, session=Depends(get_session)):
 
 # ---------- stats ----------
 
-@router.get("/stats", dependencies=[Depends(require_auth)])
+@router.get("/stats", dependencies=[Depends(require("analytics", "view"))])
 async def stats(session=Depends(get_session)):
     bots_n = (await session.execute(select(func.count(Bot.id)))).scalar()
     subs = (await session.execute(select(func.count(Subscriber.id)))).scalar()
@@ -497,7 +513,7 @@ async def stats(session=Depends(get_session)):
 
 # ---------- аналитика ----------
 
-@router.get("/analytics", dependencies=[Depends(require_auth)])
+@router.get("/analytics", dependencies=[Depends(require("analytics", "view"))])
 async def analytics(
     days: int = 30,
     bot_id: int | None = None,
@@ -529,7 +545,7 @@ def _node_label(ntype: str, data: dict) -> str:
     return ntype
 
 
-@router.get("/analysis/options", dependencies=[Depends(require_auth)])
+@router.get("/analysis/options", dependencies=[Depends(require("analytics", "view"))])
 async def analysis_options(session=Depends(get_session)):
     """Справочник для конструктора анализа: воронки с узлами, рассылки."""
     funnels = (await session.execute(select(Funnel).order_by(Funnel.name))).scalars().all()
@@ -560,7 +576,7 @@ class AnalysisIn(BaseModel):
     bot_id: int | None = None
 
 
-@router.post("/analysis/funnel", dependencies=[Depends(require_auth)])
+@router.post("/analysis/funnel", dependencies=[Depends(require("analytics", "view"))])
 async def analysis_funnel(body: AnalysisIn, session=Depends(get_session)):
     from . import analytics as an
 
@@ -578,7 +594,7 @@ class TagIn(BaseModel):
     name: str
 
 
-@router.get("/tags", dependencies=[Depends(require_auth)])
+@router.get("/tags", dependencies=[Depends(require("tags", "view"))])
 async def list_tags(session=Depends(get_session)):
     tags = (await session.execute(select(Tag).order_by(Tag.name))).scalars().all()
     counts = dict(
@@ -593,7 +609,7 @@ async def list_tags(session=Depends(get_session)):
     return [{"id": t.id, "name": t.name, "count": counts.get(t.id, 0)} for t in tags]
 
 
-@router.post("/tags", dependencies=[Depends(require_auth)])
+@router.post("/tags", dependencies=[Depends(require("tags", "edit"))])
 async def create_tag(body: TagIn, session=Depends(get_session)):
     name = body.name.strip()
     if not name:
@@ -607,7 +623,7 @@ async def create_tag(body: TagIn, session=Depends(get_session)):
     return {"id": tag.id, "name": tag.name}
 
 
-@router.delete("/tags/{tag_id}", dependencies=[Depends(require_auth)])
+@router.delete("/tags/{tag_id}", dependencies=[Depends(require("tags", "edit"))])
 async def delete_tag(tag_id: int, session=Depends(get_session)):
     await session.execute(delete(SubscriberTag).where(SubscriberTag.tag_id == tag_id))
     await session.execute(delete(Tag).where(Tag.id == tag_id))
@@ -616,7 +632,7 @@ async def delete_tag(tag_id: int, session=Depends(get_session)):
 
 # ---------- subscribers ----------
 
-@router.get("/subscribers", dependencies=[Depends(require_auth)])
+@router.get("/subscribers", dependencies=[Depends(require("subscribers", "view"))])
 async def list_subscribers(
     search: str = "",
     tag_id: int | None = None,
@@ -672,7 +688,7 @@ class SubTagIn(BaseModel):
     tag_id: int
 
 
-@router.post("/subscribers/{sub_id}/tags", dependencies=[Depends(require_auth)])
+@router.post("/subscribers/{sub_id}/tags", dependencies=[Depends(require("subscribers", "edit"))])
 async def add_sub_tag(sub_id: int, body: SubTagIn, session=Depends(get_session)):
     sub = await session.get(Subscriber, sub_id)
     if sub is None:
@@ -694,7 +710,7 @@ async def add_sub_tag(sub_id: int, body: SubTagIn, session=Depends(get_session))
     return {"ok": True}
 
 
-@router.delete("/subscribers/{sub_id}/tags/{tag_id}", dependencies=[Depends(require_auth)])
+@router.delete("/subscribers/{sub_id}/tags/{tag_id}", dependencies=[Depends(require("subscribers", "edit"))])
 async def remove_sub_tag(sub_id: int, tag_id: int, session=Depends(get_session)):
     await session.execute(
         delete(SubscriberTag).where(
@@ -706,7 +722,7 @@ async def remove_sub_tag(sub_id: int, tag_id: int, session=Depends(get_session))
 
 # ---------- живой чат ----------
 
-@router.get("/subscribers/{sub_id}", dependencies=[Depends(require_auth)])
+@router.get("/subscribers/{sub_id}", dependencies=[Depends(require("subscribers", "view"))])
 async def get_subscriber(sub_id: int, session=Depends(get_session)):
     from .bot.runner import manager
 
@@ -736,7 +752,7 @@ async def get_subscriber(sub_id: int, session=Depends(get_session)):
     }
 
 
-@router.get("/subscribers/{sub_id}/messages", dependencies=[Depends(require_auth)])
+@router.get("/subscribers/{sub_id}/messages", dependencies=[Depends(require("chat", "view"))])
 async def get_messages(sub_id: int, session=Depends(get_session)):
     msgs = (
         await session.execute(
@@ -757,7 +773,7 @@ class SendMsgIn(BaseModel):
     media: list = []  # [{type, path, name}] — вложения, как в блоке «Сообщение»
 
 
-@router.post("/subscribers/{sub_id}/send", dependencies=[Depends(require_auth)])
+@router.post("/subscribers/{sub_id}/send", dependencies=[Depends(require("chat", "edit"))])
 async def operator_send(sub_id: int, body: SendMsgIn, session=Depends(get_session)):
     from .bot.runner import manager
     from .bot.sender import send_message_content
@@ -782,7 +798,7 @@ class PauseIn(BaseModel):
     minutes: int = 60
 
 
-@router.post("/subscribers/{sub_id}/pause", dependencies=[Depends(require_auth)])
+@router.post("/subscribers/{sub_id}/pause", dependencies=[Depends(require("chat", "edit"))])
 async def pause_automation(sub_id: int, body: PauseIn, session=Depends(get_session)):
     sub = await session.get(Subscriber, sub_id)
     if sub is None:
@@ -798,7 +814,7 @@ class StartFlowIn(BaseModel):
     funnel_id: int
 
 
-@router.post("/subscribers/{sub_id}/start_flow", dependencies=[Depends(require_auth)])
+@router.post("/subscribers/{sub_id}/start_flow", dependencies=[Depends(require("chat", "edit"))])
 async def start_flow(sub_id: int, body: StartFlowIn, session=Depends(get_session)):
     from .bot import engine as fx
     from .bot.runner import manager
@@ -818,7 +834,7 @@ async def start_flow(sub_id: int, body: StartFlowIn, session=Depends(get_session
 
 # ---------- segments ----------
 
-@router.get("/segment/fields", dependencies=[Depends(require_auth)])
+@router.get("/segment/fields", dependencies=[Depends(require("subscribers", "view"))])
 async def segment_fields(session=Depends(get_session)):
     tags = [
         {"v": t.id, "l": t.name}
@@ -842,7 +858,7 @@ class SegmentSearchIn(BaseModel):
     count_only: bool = False
 
 
-@router.post("/subscribers/search", dependencies=[Depends(require_auth)])
+@router.post("/subscribers/search", dependencies=[Depends(require("subscribers", "view"))])
 async def subscribers_search(body: SegmentSearchIn, session=Depends(get_session)):
     try:
         q = segment.build_query(body.bot_id, body.filter)
@@ -900,7 +916,7 @@ async def _delete_subscribers(session, sub_ids: list[int]) -> int:
     return res.rowcount or 0
 
 
-@router.delete("/subscribers/{sub_id}", dependencies=[Depends(require_auth)])
+@router.delete("/subscribers/{sub_id}", dependencies=[Depends(require("subscribers", "edit"))])
 async def delete_subscriber(sub_id: int, session=Depends(get_session)):
     sub = (await session.execute(
         select(Subscriber).where(Subscriber.id == sub_id)
@@ -920,7 +936,7 @@ class BulkActionIn(BaseModel):
     expected_total: int | None = None  # защита: сколько человек видел пользователь
 
 
-@router.post("/subscribers/bulk", dependencies=[Depends(require_auth)])
+@router.post("/subscribers/bulk", dependencies=[Depends(require("subscribers", "edit"))])
 async def subscribers_bulk(body: BulkActionIn, session=Depends(get_session)):
     """Массовое действие над аудиторией, собранной конструктором сегментов."""
     try:
@@ -996,7 +1012,7 @@ async def _set_funnel_bots(session, funnel_id: int, bot_ids: list[int]):
         session.add(FunnelBot(funnel_id=funnel_id, bot_id=bid))
 
 
-@router.get("/funnels", dependencies=[Depends(require_auth)])
+@router.get("/funnels", dependencies=[Depends(require("funnels", "view"))])
 async def list_funnels(bot_id: int | None = None, session=Depends(get_session)):
     q = select(Funnel).order_by(Funnel.created_at.desc())
     if bot_id:
@@ -1035,7 +1051,7 @@ async def list_funnels(bot_id: int | None = None, session=Depends(get_session)):
     ]
 
 
-@router.post("/funnels", dependencies=[Depends(require_auth)])
+@router.post("/funnels", dependencies=[Depends(require("funnels", "edit"))])
 async def create_funnel(body: FunnelIn, session=Depends(get_session)):
     funnel = Funnel(
         name=body.name or "Новая воронка",
@@ -1051,7 +1067,7 @@ async def create_funnel(body: FunnelIn, session=Depends(get_session)):
     return {"id": funnel.id}
 
 
-@router.get("/funnels/{funnel_id}", dependencies=[Depends(require_auth)])
+@router.get("/funnels/{funnel_id}", dependencies=[Depends(require("funnels", "view"))])
 async def get_funnel(funnel_id: int, session=Depends(get_session)):
     f = await session.get(Funnel, funnel_id)
     if f is None:
@@ -1067,7 +1083,7 @@ async def get_funnel(funnel_id: int, session=Depends(get_session)):
     }
 
 
-@router.put("/funnels/{funnel_id}", dependencies=[Depends(require_auth)])
+@router.put("/funnels/{funnel_id}", dependencies=[Depends(require("funnels", "edit"))])
 async def update_funnel(funnel_id: int, body: FunnelIn, session=Depends(get_session)):
     f = await session.get(Funnel, funnel_id)
     if f is None:
@@ -1086,7 +1102,7 @@ async def update_funnel(funnel_id: int, body: FunnelIn, session=Depends(get_sess
     return {"ok": True}
 
 
-@router.post("/funnels/{funnel_id}/toggle", dependencies=[Depends(require_auth)])
+@router.post("/funnels/{funnel_id}/toggle", dependencies=[Depends(require("funnels", "edit"))])
 async def toggle_funnel(funnel_id: int, session=Depends(get_session)):
     f = await session.get(Funnel, funnel_id)
     if f is None:
@@ -1101,13 +1117,13 @@ async def toggle_funnel(funnel_id: int, session=Depends(get_session)):
     return {"is_active": f.is_active}
 
 
-@router.delete("/funnels/{funnel_id}", dependencies=[Depends(require_auth)])
+@router.delete("/funnels/{funnel_id}", dependencies=[Depends(require("funnels", "edit"))])
 async def delete_funnel(funnel_id: int, session=Depends(get_session)):
     await session.execute(delete(Funnel).where(Funnel.id == funnel_id))
     return {"ok": True}
 
 
-@router.get("/funnels/{funnel_id}/stats", dependencies=[Depends(require_auth)])
+@router.get("/funnels/{funnel_id}/stats", dependencies=[Depends(require("funnels", "view"))])
 async def funnel_stats(funnel_id: int, session=Depends(get_session)):
     from .models import NodeVisit
 
@@ -1167,7 +1183,7 @@ class AISettingsIn(BaseModel):
     api_key: str | None = None  # None = не менять
 
 
-@router.get("/ai/settings", dependencies=[Depends(require_auth)])
+@router.get("/ai/settings", dependencies=[Depends(require("ai", "view"))])
 async def ai_settings(session=Depends(get_session)):
     s = await ai.get_ai_settings(session)
     key = s.get("api_key") or ""
@@ -1192,7 +1208,7 @@ async def ai_settings_save(body: AISettingsIn, session=Depends(get_session)):
     return {"ok": True}
 
 
-@router.get("/ai/usage", dependencies=[Depends(require_auth)])
+@router.get("/ai/usage", dependencies=[Depends(require("ai", "view"))])
 async def ai_usage(session=Depends(get_session)):
     rows = (
         (await session.execute(select(AIRequest).order_by(AIRequest.created_at.desc()).limit(20)))
@@ -1236,7 +1252,15 @@ def _guess_kind(content_type: str, ext: str) -> str:
     return "document"
 
 
-@router.post("/media/upload", dependencies=[Depends(require_auth)])
+async def require_any_editor(user=Depends(current_user)):
+    """Загрузка файлов: нужна хотя бы одна возможность что-то редактировать."""
+    from .auth import has_perm
+    if any(has_perm(user, f, "edit") for f in ("funnels", "broadcasts", "chat")):
+        return user
+    raise HTTPException(403, "Нет прав на загрузку файлов")
+
+
+@router.post("/media/upload", dependencies=[Depends(require_any_editor)])
 async def upload_media(file: UploadFile):
     """Загрузка любого вложения для блока «Сообщение».
     Возвращает {path, kind, name}. kind — предполагаемый тип (пользователь может сменить)."""
@@ -1258,7 +1282,7 @@ async def upload_media(file: UploadFile):
     return {"path": f"media/{fname}", "kind": kind, "name": orig}
 
 
-@router.post("/ai/extract_docx", dependencies=[Depends(require_auth)])
+@router.post("/ai/extract_docx", dependencies=[Depends(require("ai", "edit"))])
 async def extract_docx(file: UploadFile):
     if not (file.filename or "").lower().endswith(".docx"):
         raise HTTPException(400, "Нужен файл .docx")
@@ -1333,7 +1357,7 @@ class GenerateIn(BaseModel):
     spec_text: str
 
 
-@router.post("/ai/generate", dependencies=[Depends(require_auth)])
+@router.post("/ai/generate", dependencies=[Depends(require("ai", "edit"))])
 async def ai_generate(body: GenerateIn, session=Depends(get_session)):
     if not body.spec_text.strip():
         raise HTTPException(400, "Пустое ТЗ")
@@ -1376,7 +1400,7 @@ class AIEditIn(BaseModel):
     messages: list  # [{role: user|assistant, content: str}]
 
 
-@router.post("/ai/edit", dependencies=[Depends(require_auth)])
+@router.post("/ai/edit", dependencies=[Depends(require("ai", "edit"))])
 async def ai_edit(body: AIEditIn, session=Depends(get_session)):
     s = await ai.get_ai_settings(session)
     if not s.get("api_key"):
@@ -1446,7 +1470,7 @@ class BroadcastIn(BaseModel):
     segment: dict | None = None  # если задан — используется вместо include/exclude
 
 
-@router.get("/broadcasts", dependencies=[Depends(require_auth)])
+@router.get("/broadcasts", dependencies=[Depends(require("broadcasts", "view"))])
 async def list_broadcasts(bot_id: int | None = None, session=Depends(get_session)):
     q = select(Broadcast).order_by(Broadcast.created_at.desc())
     if bot_id:
@@ -1469,7 +1493,84 @@ async def list_broadcasts(bot_id: int | None = None, session=Depends(get_session
     ]
 
 
-@router.post("/broadcasts", dependencies=[Depends(require_auth)])
+@router.get("/broadcasts/{bc_id}", dependencies=[Depends(require("broadcasts", "view"))])
+async def broadcast_detail(bc_id: int, session=Depends(get_session)):
+    """Карточка рассылки: что отправляли, кому и с каким результатом."""
+    bc = await session.get(Broadcast, bc_id)
+    if not bc:
+        raise HTTPException(404, "Рассылка не найдена")
+
+    bot = await session.get(Bot, bc.bot_id)
+
+    # справочники для расшифровки условий сегмента
+    tag_names = dict((await session.execute(select(Tag.id, Tag.name))).all())
+    funnel_names = dict((await session.execute(select(Funnel.id, Funnel.name))).all())
+    bc_names = dict((await session.execute(select(Broadcast.id, Broadcast.name))).all())
+
+    f = bc.filters or {}
+    if "segment" in f:
+        audience = segment.describe(f.get("segment") or {}, tag_names, funnel_names, bc_names)
+        audience_kind = "Сегмент"
+    else:
+        audience_kind = "Теги"
+        audience = []
+        inc = [tag_names.get(t, f"#{t}") for t in (f.get("include_tags") or [])]
+        exc = [tag_names.get(t, f"#{t}") for t in (f.get("exclude_tags") or [])]
+        if inc:
+            audience.append("есть тег: " + ", ".join(inc))
+        if exc:
+            audience.append("нет тега: " + ", ".join(exc))
+    if not audience:
+        audience = ["вся база бота"]
+
+    # фактическая доставка
+    delivered, not_delivered = (await session.execute(
+        select(
+            func.sum(case((BroadcastRecipient.delivered == True, 1), else_=0)),  # noqa: E712
+            func.sum(case((BroadcastRecipient.delivered == False, 1), else_=0)),  # noqa: E712
+        ).where(BroadcastRecipient.broadcast_id == bc_id)
+    )).one()
+
+    # первые 100 получателей — чтобы можно было глазами проверить, кому ушло
+    rows = (await session.execute(
+        select(Subscriber, BroadcastRecipient.delivered, BroadcastRecipient.created_at)
+        .join(BroadcastRecipient, BroadcastRecipient.subscriber_id == Subscriber.id)
+        .where(BroadcastRecipient.broadcast_id == bc_id)
+        .order_by(BroadcastRecipient.created_at.desc())
+        .limit(100)
+    )).all()
+
+    return {
+        "id": bc.id,
+        "name": bc.name,
+        "text": bc.text,
+        "media": bc.media or [],
+        "photo_url": bc.photo_url,
+        "bot": bot.name if bot else "—",
+        "bot_id": bc.bot_id,
+        "status": bc.status,
+        "total": bc.total,
+        "sent": bc.sent,
+        "failed": bc.failed,
+        "delivered": int(delivered or 0),
+        "not_delivered": int(not_delivered or 0),
+        "created_at": bc.created_at.isoformat(),
+        "audience_kind": audience_kind,
+        "audience": audience,
+        "recipients": [
+            {
+                "id": s.id,
+                "name": (f"{s.first_name or ''} {s.last_name or ''}").strip() or "—",
+                "username": s.username,
+                "delivered": bool(d),
+                "at": (at or bc.created_at).isoformat(),
+            }
+            for s, d, at in rows
+        ],
+    }
+
+
+@router.post("/broadcasts", dependencies=[Depends(require("broadcasts", "edit"))])
 async def create_broadcast(body: BroadcastIn, session=Depends(get_session)):
     if not body.text.strip() and not body.media:
         raise HTTPException(400, "Добавьте текст или вложение")

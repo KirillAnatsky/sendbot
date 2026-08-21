@@ -386,3 +386,163 @@ async def test_delete_subscribers_removes_all_traces(session):
         assert await count(model, model.subscriber_id == keep.id) == 1, model.__name__
     # отложенные задачи удалённого исчезли, у оставшегося — на месте
     assert await count(ScheduledJob) == 1
+
+
+@pytest.mark.asyncio
+async def test_broadcast_detail(session):
+    """Карточка рассылки: содержимое, расшифровка аудитории, факт доставки."""
+    from app.api import broadcast_detail
+    from app.models import Bot, Broadcast, BroadcastRecipient, Subscriber, Tag
+
+    bot = Bot(name="Мой бот", token="t")
+    tag = Tag(name="VIP")
+    session.add_all([bot, tag])
+    await session.flush()
+
+    bc = Broadcast(
+        bot_id=bot.id, name="Акция", text="Привет!",
+        media=[{"type": "photo", "path": "media/a.png", "name": "a.png"},
+               {"type": "video", "path": "media/b.mp4", "name": "b.mp4"}],
+        filters={"segment": {"match": "all", "conditions": [
+            {"field": "tag", "op": "has", "value": str(tag.id)},
+            {"field": "language", "op": "equals", "value": "ru"},
+        ]}},
+        status="done", total=2, sent=1, failed=1,
+    )
+    session.add(bc)
+    s1 = Subscriber(bot_id=bot.id, tg_id=1, first_name="Иван", username="ivan")
+    s2 = Subscriber(bot_id=bot.id, tg_id=2, first_name="Пётр")
+    session.add_all([s1, s2])
+    await session.flush()
+    session.add_all([
+        BroadcastRecipient(broadcast_id=bc.id, subscriber_id=s1.id, delivered=True),
+        BroadcastRecipient(broadcast_id=bc.id, subscriber_id=s2.id, delivered=False),
+    ])
+    await session.commit()
+
+    d = await broadcast_detail(bc.id, session)
+    assert d["text"] == "Привет!"
+    assert len(d["media"]) == 2
+    assert d["bot"] == "Мой бот"
+    assert d["sent"] == 1 and d["failed"] == 1
+    assert d["delivered"] == 1 and d["not_delivered"] == 1
+    # условия сегмента расшифрованы словами, а не id
+    assert d["audience_kind"] == "Сегмент"
+    assert "тег: есть VIP" in d["audience"]
+    assert "язык: = ru" in d["audience"]
+    names = {r["name"] for r in d["recipients"]}
+    assert names == {"Иван", "Пётр"}
+
+
+@pytest.mark.asyncio
+async def test_broadcast_detail_tag_filters(session):
+    """Старый формат фильтра (include/exclude теги) тоже читается словами."""
+    from app.api import broadcast_detail
+    from app.models import Bot, Broadcast, Tag
+
+    bot = Bot(name="b", token="t")
+    t1, t2 = Tag(name="лиды"), Tag(name="отписка")
+    session.add_all([bot, t1, t2])
+    await session.flush()
+    bc = Broadcast(bot_id=bot.id, name="R", text="t",
+                   filters={"include_tags": [t1.id], "exclude_tags": [t2.id]})
+    session.add(bc)
+    await session.commit()
+
+    d = await broadcast_detail(bc.id, session)
+    assert d["audience_kind"] == "Теги"
+    assert "есть тег: лиды" in d["audience"]
+    assert "нет тега: отписка" in d["audience"]
+
+
+# ---------- права доступа ----------
+
+def _user(role="staff", perms=None):
+    from app.models import User
+    u = User(login="u", name="U", password_hash="x", role=role,
+             bot_ids=[], permissions=perms or {})
+    return u
+
+
+def test_permissions_owner_can_everything():
+    from app.auth import FEATURE_KEYS, has_perm, user_permissions
+    owner = _user("owner")
+    for f in FEATURE_KEYS:
+        assert has_perm(owner, f, "edit"), f
+    # владельцу «изменять» показывается везде, кроме разделов только для чтения
+    perms = user_permissions(owner)
+    assert perms["analytics"] == "view"     # смотреть нечего менять
+    assert perms["funnels"] == "edit"
+
+
+def test_permissions_levels():
+    from app.auth import has_perm
+    u = _user(perms={"funnels": "view", "broadcasts": "edit"})
+
+    assert has_perm(u, "funnels", "view")
+    assert not has_perm(u, "funnels", "edit")     # смотреть можно, менять нельзя
+    assert has_perm(u, "broadcasts", "view")      # «изменять» включает «смотреть»
+    assert has_perm(u, "broadcasts", "edit")
+    assert not has_perm(u, "subscribers", "view")  # раздел не выдан вообще
+    assert not has_perm(u, "logs", "view")
+
+
+def test_permissions_normalize():
+    from app.auth import normalize_permissions
+    got = normalize_permissions({
+        "funnels": "edit",
+        "analytics": "edit",      # раздел только для чтения → понижаем
+        "logs": "none",           # «нет» не храним
+        "выдуманное": "edit",     # неизвестный раздел выкидываем
+        "tags": "хакер",          # неизвестный уровень выкидываем
+    })
+    assert got == {"funnels": "edit", "analytics": "view"}
+
+
+@pytest.mark.asyncio
+async def test_require_dependency_blocks_and_allows():
+    from fastapi import HTTPException
+    from app.auth import require
+
+    dep = require("funnels", "edit")
+
+    allowed = _user(perms={"funnels": "edit"})
+    assert await dep(user=allowed) is allowed
+
+    viewer = _user(perms={"funnels": "view"})
+    with pytest.raises(HTTPException) as e:
+        await dep(user=viewer)
+    assert e.value.status_code == 403
+    assert "Воронки" in e.value.detail      # ошибка объясняет, чего не хватает
+
+
+def test_every_endpoint_is_protected():
+    """Ни один маршрут не должен остаться без проверки прав.
+
+    Исключения перечислены явно: health — публичная проверка живости,
+    login — вход, остальные проверяют пользователя внутри себя.
+    """
+    import inspect
+
+    from app.api import router
+
+    ALLOWED_OPEN = {
+        "/api/health",          # публичная проверка живости (нужна деплою)
+        "/api/auth/login",      # вход
+        "/api/logs/ws",         # сокет: право проверяется внутри по токену
+    }
+    unprotected = []
+    for r in router.routes:
+        path = getattr(r, "path", "")
+        if path in ALLOWED_OPEN:
+            continue
+        if getattr(r, "dependencies", None):
+            continue
+        # без dependencies допустимо, только если пользователь берётся аргументом
+        endpoint = getattr(r, "endpoint", None)
+        params = inspect.signature(endpoint).parameters if endpoint else {}
+        if "user" in params:
+            continue
+        unprotected.append(f"{sorted(getattr(r, 'methods', ['WS']))} {path}")
+
+    assert not unprotected, "Маршруты без проверки прав: " + ", ".join(unprotected)

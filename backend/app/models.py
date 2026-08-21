@@ -22,7 +22,10 @@ def utcnow():
 
 
 class User(Base):
-    """Пользователь админки. Роли: owner (владелец) | staff (сотрудник)."""
+    """Пользователь админки.
+
+    owner — владелец, может всё и раздаёт права.
+    staff — сотрудник, права выдаются точечно по разделам (см. permissions)."""
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -33,6 +36,9 @@ class User(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     # к каким ботам есть доступ; пустой список = ко всем
     bot_ids: Mapped[list] = mapped_column(JSON, default=list)
+    # права по разделам: {"funnels": "edit", "analytics": "view", ...}
+    # у владельца игнорируются — ему доступно всё
+    permissions: Mapped[dict] = mapped_column(JSON, default=dict)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 

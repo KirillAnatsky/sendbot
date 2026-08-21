@@ -1,8 +1,12 @@
-"""Авторизация: пользователи с логином/паролем и ролями.
+"""Авторизация и права доступа.
 
-Роли:
-  owner — владелец: всё, включая управление пользователями и токенами ботов
-  staff — сотрудник: работа с ботами/воронками/чатами (можно ограничить списком ботов)
+Владелец (owner) может всё и раздаёт права остальным. Для каждого сотрудника
+владелец отдельно выбирает:
+  * к каким ботам есть доступ (пустой список = ко всем);
+  * что он может делать с каждым разделом: ничего / только смотреть / изменять.
+
+Права хранятся в User.permissions: {"funnels": "edit", "broadcasts": "view", ...}
+Отсутствующий раздел = доступа нет.
 """
 import base64
 import hashlib
@@ -18,6 +22,65 @@ from .config import settings
 
 _bearer = HTTPBearer(auto_error=False)
 TOKEN_TTL = 30 * 24 * 3600  # 30 дней
+
+# ---------- права ----------
+# Каждый раздел админки — отдельная «фича». view_only=True означает, что
+# уровня «изменять» у раздела нет (там нечего менять).
+FEATURES = [
+    {"key": "bots", "label": "Боты",
+     "hint": "смотреть ботов и их статистику · изменять: добавлять, менять токен, включать/выключать"},
+    {"key": "subscribers", "label": "Подписчики",
+     "hint": "смотреть базу и сегменты · изменять: теги, удаление, массовые действия"},
+    {"key": "chat", "label": "Переписка",
+     "hint": "читать диалоги · изменять: отвечать, ставить паузу, запускать воронку вручную"},
+    {"key": "funnels", "label": "Воронки",
+     "hint": "смотреть воронки · изменять: создавать, редактировать, включать"},
+    {"key": "broadcasts", "label": "Рассылки",
+     "hint": "смотреть отчёты · изменять: создавать и запускать рассылки"},
+    {"key": "tags", "label": "Теги",
+     "hint": "смотреть список · изменять: создавать и удалять"},
+    {"key": "analytics", "label": "Аналитика",
+     "hint": "дашборд и анализ воронок", "view_only": True},
+    {"key": "ai", "label": "AI-сборка",
+     "hint": "смотреть расход токенов · изменять: собирать воронки по ТЗ"},
+    {"key": "logs", "label": "Логи",
+     "hint": "системный журнал", "view_only": True},
+]
+FEATURE_KEYS = [f["key"] for f in FEATURES]
+FEATURE_LABEL = {f["key"]: f["label"] for f in FEATURES}
+VIEW_ONLY = {f["key"] for f in FEATURES if f.get("view_only")}
+
+LEVELS = ["none", "view", "edit"]
+_LEVEL_RANK = {"none": 0, "view": 1, "edit": 2}
+
+
+def normalize_permissions(perms: dict | None) -> dict:
+    """Оставляет только известные разделы и допустимые уровни."""
+    out = {}
+    for key, level in (perms or {}).items():
+        if key not in FEATURE_KEYS:
+            continue
+        if level not in LEVELS:
+            continue
+        if key in VIEW_ONLY and level == "edit":
+            level = "view"
+        if level != "none":
+            out[key] = level
+    return out
+
+
+def user_permissions(user) -> dict:
+    """Владельцу — всё «изменять», остальным — что выдал владелец."""
+    if getattr(user, "role", "") == "owner":
+        return {k: ("view" if k in VIEW_ONLY else "edit") for k in FEATURE_KEYS}
+    return normalize_permissions(getattr(user, "permissions", None))
+
+
+def has_perm(user, feature: str, level: str = "view") -> bool:
+    if getattr(user, "role", "") == "owner":
+        return True
+    have = user_permissions(user).get(feature, "none")
+    return _LEVEL_RANK[have] >= _LEVEL_RANK[level]
 
 
 # ---------- пароли ----------
@@ -88,6 +151,21 @@ async def require_auth(user=Depends(current_user)):
     return user
 
 
+def require(feature: str, level: str = "view"):
+    """Зависимость FastAPI: доступ к разделу не ниже указанного уровня.
+
+    Пример:  dependencies=[Depends(require("funnels", "edit"))]
+    """
+    async def dep(user=Depends(current_user)):
+        if not has_perm(user, feature, level):
+            what = "изменять" if level == "edit" else "смотреть"
+            raise HTTPException(
+                403, f"Нет прав: «{FEATURE_LABEL.get(feature, feature)}» ({what}). "
+                     "Обратитесь к владельцу аккаунта.")
+        return user
+    return dep
+
+
 async def require_owner(user=Depends(current_user)):
     """Только владелец: управление людьми, токенами ботов, ключами AI."""
     if user.role != "owner":
@@ -129,6 +207,7 @@ async def ensure_owner_exists():
             role="owner",
             is_active=True,
             bot_ids=[],
+            permissions={},
         )
         session.add(user)
         await session.commit()

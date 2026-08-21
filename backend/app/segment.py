@@ -158,3 +158,45 @@ def fields_meta(tags, funnels, broadcasts):
          "ops": [["after", "после"], ["before", "до"],
                  ["last_days", "за последние N дней"], ["inactive_days", "неактивен N дней"]]},
     ]
+
+
+# ---------- человекочитаемое описание фильтра ----------
+
+_FIELD_LABEL = {
+    "tag": "тег", "name": "имя", "username": "@username", "language": "язык",
+    "status": "статус", "source": "источник (deep-link)",
+    "in_funnel": "был в воронке", "in_broadcast": "был в рассылке",
+    "signup": "дата подписки", "last_activity": "последняя активность",
+}
+_OP_LABEL = {
+    "has": "есть", "not_has": "нет", "contains": "содержит", "equals": "=",
+    "not_equals": "≠", "yes": "да", "no": "нет", "after": "после",
+    "before": "до", "last_days": "за последние N дней",
+    "inactive_days": "неактивен N дней",
+}
+_STATUS_LABEL = {"active": "активен", "blocked": "заблокировал"}
+
+
+def describe(filt: dict, tag_names: dict, funnel_names: dict, bc_names: dict) -> list[str]:
+    """Разбирает фильтр сегмента в список строк вида «тег: есть VIP»."""
+    if not filt:
+        return []
+    out = []
+    for c in filt.get("conditions") or []:
+        field = c.get("field")
+        op = c.get("op")
+        val = c.get("value")
+        if field == "tag":
+            val = tag_names.get(int(val), f"#{val}") if str(val).isdigit() else val
+        elif field == "in_funnel":
+            val = funnel_names.get(int(val), f"#{val}") if str(val).isdigit() else val
+        elif field == "in_broadcast":
+            val = bc_names.get(int(val), f"#{val}") if str(val).isdigit() else val
+        elif field == "status":
+            val = _STATUS_LABEL.get(val, val)
+        label = _FIELD_LABEL.get(field, field)
+        op_l = _OP_LABEL.get(op, op)
+        out.append(f"{label}: {op_l} {val}".strip() if val not in (None, "") else f"{label}: {op_l}")
+    if filt.get("active_24h"):
+        out.append("активен за последние 24 часа")
+    return out
