@@ -59,6 +59,7 @@ class BotManager:
             asyncio.create_task(scheduler_loop(self)),
             asyncio.create_task(broadcast_loop(self)),
             asyncio.create_task(cleanup_loop()),
+            asyncio.create_task(sheets_export_loop()),
         ]
 
     async def _spawn(self, bot_id: int, token: str):
@@ -351,6 +352,61 @@ async def broadcast_loop(mgr: BotManager):
                 await session.commit()
         except Exception:  # noqa: BLE001
             log.exception("Ошибка рассылки")
+
+
+async def sheets_export_loop():
+    """Автовыгрузка статистики в Google Таблицы.
+
+    Раз в час просыпается и решает, пора ли: при режиме «каждый час» —
+    всегда, при «раз в сутки» — только в заданный час и не чаще раза в день.
+    Если автовыгрузка выключена, ничего не делает.
+    """
+    from datetime import datetime
+
+    from ..logging_setup import event_logger
+
+    log = event_logger()
+    await asyncio.sleep(120)  # дать приложению спокойно подняться
+
+    while True:
+        try:
+            from ..api import get_sheets_cfg, run_sheets_export, save_sheets_cfg
+            from ..sheets import SheetsError
+
+            async with SessionLocal() as session:
+                cfg = await get_sheets_cfg(session)
+                if not cfg.get("auto") or not cfg.get("spreadsheet_id"):
+                    await asyncio.sleep(600)
+                    continue
+
+                now = datetime.utcnow()
+                due = True
+                if cfg.get("interval") == "daily":
+                    last = cfg.get("last_run") or ""
+                    already_today = last[:10] == now.strftime("%Y-%m-%d")
+                    due = now.hour == int(cfg.get("hour", 4)) and not already_today
+
+                if due:
+                    try:
+                        counts = await run_sheets_export(session, cfg)
+                        cfg["last_status"] = "ok"
+                        cfg["last_error"] = ""
+                        cfg["last_counts"] = counts
+                        log.info("Автовыгрузка в Google Таблицы: %s", counts)
+                    except SheetsError as e:
+                        cfg["last_status"] = "error"
+                        cfg["last_error"] = str(e)
+                        log.warning("Автовыгрузка в Google Таблицы не удалась: %s", e)
+                    cfg["last_run"] = now.isoformat()
+                    await save_sheets_cfg(session, cfg)
+                    await session.commit()
+        except Exception as e:  # noqa: BLE001 — цикл не должен падать
+            try:
+                from ..logging_setup import event_logger as _el
+                _el().warning("Сбой цикла автовыгрузки: %s", e)
+            except Exception:  # noqa: BLE001
+                pass
+        await asyncio.sleep(600)
 
 
 async def cleanup_loop():

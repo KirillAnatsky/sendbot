@@ -715,3 +715,104 @@ async def test_delete_needs_separate_permission():
     assert await require_delete(user=with_delete) is with_delete
 
     assert can_delete(_user("owner"))
+
+
+# ---------- выгрузка статистики ----------
+
+@pytest.mark.asyncio
+async def test_export_funnel_steps_numbers(session):
+    """Лист «Шаги воронок»: порядок шагов и проценты считаются верно."""
+    from app import exports
+    from app.models import Bot, Funnel, FunnelBot, FunnelRun, NodeVisit, Subscriber
+
+    bot = Bot(name="Бот", token="t")
+    session.add(bot)
+    await session.flush()
+
+    # старт -> сообщение А -> сообщение Б
+    graph = {
+        "start": "1",
+        "nodes": {
+            "1": {"type": "start", "data": {}, "outputs": {"output_1": ["2"]}},
+            "2": {"type": "message", "data": {"text": "Привет"}, "outputs": {"output_1": ["3"]}},
+            "3": {"type": "message", "data": {"text": "Оффер"}, "outputs": {}},
+        },
+    }
+    f = Funnel(name="Прогрев", trigger_type="start", graph=graph, graph_ui={})
+    session.add(f)
+    await session.flush()
+    session.add(FunnelBot(funnel_id=f.id, bot_id=bot.id))
+
+    # 10 вошли, 10 увидели первое сообщение, 4 дошли до второго
+    for i in range(10):
+        sub = Subscriber(bot_id=bot.id, tg_id=1000 + i)
+        session.add(sub)
+        await session.flush()
+        run = FunnelRun(funnel_id=f.id, subscriber_id=sub.id, status="active")
+        session.add(run)
+        await session.flush()
+        session.add(NodeVisit(funnel_id=f.id, node_id="2", subscriber_id=sub.id, run_id=run.id))
+        if i < 4:
+            session.add(NodeVisit(funnel_id=f.id, node_id="3", subscriber_id=sub.id, run_id=run.id))
+    await session.commit()
+
+    rows = await exports.funnels_rows(session)
+    header, *data = rows
+    assert header[:3] == ["Воронка", "Боты", "Статус"]
+
+    # строка входа + два шага, в порядке прохождения
+    assert [r[4] for r in data] == ["Вошли в воронку", "Привет", "Оффер"]
+    entered, step1, step2 = data
+    assert entered[6] == 10
+    assert step1[6] == 10 and step1[7] == 100.0     # 100% от входа
+    assert step2[6] == 4
+    assert step2[7] == 40.0                          # 40% от входа
+    assert step2[8] == 40.0                          # и 40% от предыдущего шага
+
+
+@pytest.mark.asyncio
+async def test_export_respects_bot_access(session):
+    """Сотрудник выгружает только свои воронки и своих ботов."""
+    from app import exports
+    from app.models import Bot, Funnel, FunnelBot
+
+    b1, b2 = Bot(name="Мой", token="t1"), Bot(name="Чужой", token="t2")
+    session.add_all([b1, b2])
+    await session.flush()
+    f1 = Funnel(name="Своя", trigger_type="start", graph={"nodes": {}}, graph_ui={})
+    f2 = Funnel(name="Чужая", trigger_type="start", graph={"nodes": {}}, graph_ui={})
+    session.add_all([f1, f2])
+    await session.flush()
+    session.add_all([FunnelBot(funnel_id=f1.id, bot_id=b1.id),
+                     FunnelBot(funnel_id=f2.id, bot_id=b2.id)])
+    await session.commit()
+
+    rows = await exports.funnels_rows(session, allowed_bots=[b1.id])
+    names = {r[0] for r in rows[1:]}
+    assert names == {"Своя"}
+
+    bots = await exports.bots_rows(session, days=30, allowed_bots=[b1.id])
+    assert [r[0] for r in bots[1:]] == ["Мой"]
+
+
+@pytest.mark.asyncio
+async def test_export_build_tabs_selection(session):
+    """Выгружаются только отмеченные листы, плюс служебный «Обновлено»."""
+    from app import exports
+
+    tabs = await exports.build_tabs(session, {"funnels": True, "bots": False}, days=7)
+    assert set(tabs) == {"Шаги воронок", "Обновлено"}
+
+    tabs2 = await exports.build_tabs(session, {"bots": True, "broadcasts": True}, days=7)
+    assert set(tabs2) == {"Боты", "Рассылки", "Обновлено"}
+
+
+@pytest.mark.asyncio
+async def test_sheets_rejects_bad_key():
+    """Понятная ошибка вместо технической, если вставили не тот файл."""
+    from app.sheets import SheetsError, get_access_token
+
+    with pytest.raises(SheetsError) as e:
+        await get_access_token({"foo": "bar"})
+    assert "client_email" in str(e.value)
+    assert "сервисного аккаунта" in str(e.value)

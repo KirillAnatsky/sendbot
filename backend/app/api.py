@@ -1,10 +1,13 @@
+import json
+import re
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import case, delete, func, select
+from sqlalchemy.orm.attributes import flag_modified
 
-from . import ai, segment
+from . import ai, exports, segment
 from .auth import (
     FEATURES, allowed_bot_ids, can_delete, current_user, ensure_bot_access,
     ensure_funnel_access, hash_password, make_token, normalize_permissions,
@@ -1322,6 +1325,167 @@ async def funnel_stats(funnel_id: int, user=Depends(current_user),
             {"node_id": n, "button": b, "count": c} for n, b, c in clicks
         ],
     }
+
+
+# ---------- интеграция с Google Таблицами ----------
+
+SHEETS_KEY = "sheets_integration"
+
+DEFAULT_SHEETS_CFG = {
+    "spreadsheet_id": "",
+    "credentials": {},          # ключ сервисного аккаунта
+    "auto": False,              # выгружать по расписанию
+    "interval": "daily",        # daily | hourly
+    "hour": 4,                  # час ночной выгрузки (UTC), если daily
+    "days": 30,                 # период для отчётов «за N дней»
+    "sheets": {"funnels": True},
+    "last_run": None,
+    "last_status": None,        # ok | error
+    "last_error": "",
+    "last_counts": {},
+}
+
+
+async def get_sheets_cfg(session) -> dict:
+    from .models import Setting
+
+    row = (await session.execute(
+        select(Setting).where(Setting.key == SHEETS_KEY))).scalar_one_or_none()
+    cfg = dict(DEFAULT_SHEETS_CFG)
+    cfg.update(row.value or {} if row else {})
+    return cfg
+
+
+async def save_sheets_cfg(session, cfg: dict):
+    from .models import Setting
+
+    row = (await session.execute(
+        select(Setting).where(Setting.key == SHEETS_KEY))).scalar_one_or_none()
+    if row:
+        row.value = cfg
+        flag_modified(row, "value")
+    else:
+        session.add(Setting(key=SHEETS_KEY, value=cfg))
+    await session.flush()
+
+
+def _sheets_public(cfg: dict) -> dict:
+    """Наружу отдаём всё, кроме приватного ключа."""
+    cred = cfg.get("credentials") or {}
+    return {
+        "spreadsheet_id": cfg.get("spreadsheet_id", ""),
+        "connected": bool(cred.get("client_email")),
+        "robot_email": cred.get("client_email"),
+        "project_id": cred.get("project_id"),
+        "auto": bool(cfg.get("auto")),
+        "interval": cfg.get("interval", "daily"),
+        "hour": cfg.get("hour", 4),
+        "days": cfg.get("days", 30),
+        "sheets": cfg.get("sheets") or {"funnels": True},
+        "last_run": cfg.get("last_run"),
+        "last_status": cfg.get("last_status"),
+        "last_error": cfg.get("last_error") or "",
+        "last_counts": cfg.get("last_counts") or {},
+        "available": exports.SHEETS,
+    }
+
+
+@router.get("/integrations/sheets", dependencies=[Depends(require("integrations", "view"))])
+async def sheets_get(session=Depends(get_session)):
+    return _sheets_public(await get_sheets_cfg(session))
+
+
+class SheetsCfgIn(BaseModel):
+    spreadsheet_id: str = ""
+    credentials_json: str | None = None   # None = не менять
+    auto: bool = False
+    interval: str = "daily"
+    hour: int = 4
+    days: int = 30
+    sheets: dict = {"funnels": True}
+
+
+@router.put("/integrations/sheets", dependencies=[Depends(require("integrations", "edit"))])
+async def sheets_save(body: SheetsCfgIn, session=Depends(get_session)):
+    cfg = await get_sheets_cfg(session)
+
+    if body.credentials_json:
+        try:
+            cred = json.loads(body.credentials_json)
+        except Exception:  # noqa: BLE001
+            raise HTTPException(400, "Это не похоже на JSON. Вставьте содержимое "
+                                     "файла-ключа целиком, вместе со скобками.")
+        if not cred.get("client_email") or not cred.get("private_key"):
+            raise HTTPException(400, "В файле нет client_email или private_key — "
+                                     "похоже, это не ключ сервисного аккаунта.")
+        cfg["credentials"] = cred
+
+    # из ссылки на таблицу вытащим id сами — так проще, чем объяснять, что копировать
+    sid = (body.spreadsheet_id or "").strip()
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", sid)
+    if m:
+        sid = m.group(1)
+    cfg["spreadsheet_id"] = sid
+
+    cfg["auto"] = bool(body.auto)
+    cfg["interval"] = body.interval if body.interval in ("daily", "hourly") else "daily"
+    cfg["hour"] = max(0, min(23, int(body.hour)))
+    cfg["days"] = max(2, min(365, int(body.days)))
+    chosen = {k: bool(v) for k, v in (body.sheets or {}).items() if k in exports.SHEET_KEYS}
+    if not any(chosen.values()):
+        chosen = {"funnels": True}
+    cfg["sheets"] = chosen
+    await save_sheets_cfg(session, cfg)
+    log.info("Настройки выгрузки в Google Таблицы обновлены (авто: %s)", cfg["auto"])
+    return _sheets_public(cfg)
+
+
+async def run_sheets_export(session, cfg: dict, allowed_bots=None) -> dict:
+    """Собирает выбранные листы и пишет их в таблицу. Возвращает {лист: строк}."""
+    from . import sheets as gs
+
+    if not (cfg.get("credentials") or {}).get("client_email"):
+        raise gs.SheetsError("Сначала вставьте ключ сервисного аккаунта")
+    tabs = await exports.build_tabs(
+        session, cfg.get("sheets") or {}, cfg.get("days", 30), allowed_bots)
+    return await gs.write_tabs(cfg["credentials"], cfg["spreadsheet_id"], tabs)
+
+
+@router.post("/integrations/sheets/export",
+             dependencies=[Depends(require("integrations", "edit"))])
+async def sheets_export_now(user=Depends(current_user), session=Depends(get_session)):
+    from . import sheets as gs
+
+    cfg = await get_sheets_cfg(session)
+    try:
+        counts = await run_sheets_export(session, cfg, await allowed_bot_ids(user, session))
+    except gs.SheetsError as e:
+        cfg["last_run"] = datetime.utcnow().isoformat()
+        cfg["last_status"] = "error"
+        cfg["last_error"] = str(e)
+        await save_sheets_cfg(session, cfg)
+        log.warning("Выгрузка в Google Таблицы не удалась: %s", e)
+        raise HTTPException(400, str(e))
+
+    cfg["last_run"] = datetime.utcnow().isoformat()
+    cfg["last_status"] = "ok"
+    cfg["last_error"] = ""
+    cfg["last_counts"] = counts
+    await save_sheets_cfg(session, cfg)
+    log.info("Выгрузка в Google Таблицы: %s", counts)
+    return {"ok": True, "counts": counts,
+            "url": f"https://docs.google.com/spreadsheets/d/{cfg['spreadsheet_id']}"}
+
+
+@router.get("/integrations/sheets/preview",
+            dependencies=[Depends(require("integrations", "view"))])
+async def sheets_preview(user=Depends(current_user), session=Depends(get_session)):
+    """Первые строки того, что уйдёт в таблицу — посмотреть перед выгрузкой."""
+    cfg = await get_sheets_cfg(session)
+    tabs = await exports.build_tabs(
+        session, cfg.get("sheets") or {}, cfg.get("days", 30),
+        await allowed_bot_ids(user, session))
+    return {t: {"rows": len(rows) - 1, "sample": rows[:6]} for t, rows in tabs.items()}
 
 
 # ---------- AI ----------

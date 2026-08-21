@@ -74,7 +74,7 @@ function canDelete() { return can('delete', 'edit'); }
 const PAGE_PERM = {
   dashboard: 'analytics', analysis: 'analytics', bots: 'bots',
   funnels: 'funnels', subscribers: 'subscribers', tags: 'tags',
-  broadcasts: 'broadcasts', ai: 'ai', logs: 'logs',
+  broadcasts: 'broadcasts', ai: 'ai', logs: 'logs', sheets: 'integrations',
 };
 
 // прячем разделы и кнопки, на которые нет прав
@@ -134,6 +134,7 @@ const loaders = {
   subscribers: async () => { await loadTags(true); await loadBotFilter(); await loadSubscribers(); },
   tags: () => loadTagsPage(),
   broadcasts: () => loadBroadcasts(),
+  sheets: () => loadSheetsPage(),
   analysis: () => loadAnalysisPage(),
   team: () => loadUsers(),
   logs: () => loadLogs(),
