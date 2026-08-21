@@ -309,3 +309,44 @@ th { background: #f8fafc; color: #7a8499; font-weight: 600; font-size: 12.5px; t
   height: calc(100vh - 260px); overflow: auto; white-space: pre-wrap; word-break: break-word; }
 .log-view .log-err { color: #ff8080; }
 .log-view .log-warn { color: #ffc46b; }
+
+
+/* ---------- UX редактора: магнит, крупные порты, dnd из палитры ---------- */
+.palette-item { cursor: grab; user-select: none; }
+.palette-item:active { cursor: grabbing; }
+
+/* карточка-цель, пока тянешь связь */
+.drawflow-node.magnet-target {
+  outline: 3px solid #4c8dff;
+  outline-offset: 2px;
+  border-radius: 10px;
+}
+.drawflow-node.magnet-target .inputs .input {
+  transform: scale(1.5);
+  background: #4c8dff;
+}
+
+/* порты крупнее и с большой зоной попадания */
+.drawflow .drawflow-node .input,
+.drawflow .drawflow-node .output {
+  width: 16px; height: 16px;
+  transition: transform .12s ease, background .12s ease;
+}
+.drawflow .drawflow-node .input:hover,
+.drawflow .drawflow-node .output:hover {
+  transform: scale(1.45);
+  background: #4c8dff;
+}
+/* невидимая «подушка» вокруг порта — попадать проще */
+.drawflow .drawflow-node .input::after,
+.drawflow .drawflow-node .output::after {
+  content: ''; position: absolute; inset: -8px;
+}
+
+/* массовые действия с аудиторией */
+.bulk-actions {
+  margin-left: 14px; display: inline-flex; gap: 6px; align-items: center;
+  font-size: 13px; color: #667;
+}
+.bulk-actions select { max-width: 140px; }
+.btn.danger:hover { background: #d33; color: #fff; border-color: #d33; }

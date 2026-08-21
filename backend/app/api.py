@@ -15,11 +15,14 @@ from .models import (
     AIRequest,
     Bot,
     Broadcast,
+    BroadcastRecipient,
     ButtonClick,
     Funnel,
     FunnelBot,
     FunnelRun,
     Message,
+    NodeVisit,
+    ScheduledJob,
     Subscriber,
     SubscriberTag,
     Tag,
@@ -879,6 +882,95 @@ async def subscribers_search(body: SegmentSearchIn, session=Depends(get_session)
             for s in subs
         ],
     }
+
+
+# ---------- удаление и массовые действия с аудиторией ----------
+
+async def _delete_subscribers(session, sub_ids: list[int]) -> int:
+    """Удаляет подписчиков со всеми следами: переписка, теги, запуски воронок,
+    отложенные задачи, визиты/клики, получатели рассылок."""
+    if not sub_ids:
+        return 0
+    run_ids = select(FunnelRun.id).where(FunnelRun.subscriber_id.in_(sub_ids))
+    await session.execute(delete(ScheduledJob).where(ScheduledJob.run_id.in_(run_ids)))
+    for model in (Message, SubscriberTag, NodeVisit, ButtonClick,
+                  BroadcastRecipient, FunnelRun):
+        await session.execute(delete(model).where(model.subscriber_id.in_(sub_ids)))
+    res = await session.execute(delete(Subscriber).where(Subscriber.id.in_(sub_ids)))
+    return res.rowcount or 0
+
+
+@router.delete("/subscribers/{sub_id}", dependencies=[Depends(require_auth)])
+async def delete_subscriber(sub_id: int, session=Depends(get_session)):
+    sub = (await session.execute(
+        select(Subscriber).where(Subscriber.id == sub_id)
+    )).scalar_one_or_none()
+    if not sub:
+        raise HTTPException(404, "Подписчик не найден")
+    n = await _delete_subscribers(session, [sub_id])
+    log.info("Удалён подписчик id=%s tg_id=%s", sub_id, sub.tg_id)
+    return {"ok": True, "deleted": n}
+
+
+class BulkActionIn(BaseModel):
+    bot_id: int | None = None
+    filter: dict = {}
+    action: str  # delete | add_tag | remove_tag
+    tag_id: int | None = None
+    expected_total: int | None = None  # защита: сколько человек видел пользователь
+
+
+@router.post("/subscribers/bulk", dependencies=[Depends(require_auth)])
+async def subscribers_bulk(body: BulkActionIn, session=Depends(get_session)):
+    """Массовое действие над аудиторией, собранной конструктором сегментов."""
+    try:
+        q = segment.build_query(body.bot_id, body.filter)
+    except segment.SegmentError as e:
+        raise HTTPException(400, str(e))
+
+    sub_ids = [s.id for s in (await session.execute(q)).scalars().all()]
+
+    total = len(sub_ids)
+    # если аудитория успела измениться с момента показа счётчика — не делаем молча
+    if body.expected_total is not None and total != body.expected_total:
+        raise HTTPException(409,
+            f"Аудитория изменилась: сейчас {total}, вы видели {body.expected_total}. "
+            "Обновите список и повторите.")
+
+    if body.action == "delete":
+        n = await _delete_subscribers(session, sub_ids)
+        log.info("Массовое удаление: %s подписчиков (фильтр %s)", n, body.filter)
+        return {"ok": True, "affected": n}
+
+    if body.action in ("add_tag", "remove_tag"):
+        if not body.tag_id:
+            raise HTTPException(400, "Не указан тег")
+        tag = (await session.execute(
+            select(Tag).where(Tag.id == body.tag_id)
+        )).scalar_one_or_none()
+        if not tag:
+            raise HTTPException(404, "Тег не найден")
+        if body.action == "add_tag":
+            have = {r[0] for r in (await session.execute(
+                select(SubscriberTag.subscriber_id).where(
+                    SubscriberTag.tag_id == body.tag_id,
+                    SubscriberTag.subscriber_id.in_(sub_ids),
+                )
+            )).all()}
+            new_ids = [i for i in sub_ids if i not in have]
+            session.add_all([
+                SubscriberTag(subscriber_id=i, tag_id=body.tag_id) for i in new_ids
+            ])
+            log.info("Массово добавлен тег «%s»: %s подписчиков", tag.name, len(new_ids))
+            return {"ok": True, "affected": len(new_ids)}
+        res = await session.execute(delete(SubscriberTag).where(
+            SubscriberTag.tag_id == body.tag_id,
+            SubscriberTag.subscriber_id.in_(sub_ids),
+        ))
+        log.info("Массово снят тег «%s»: %s подписчиков", tag.name, res.rowcount or 0)
+        return {"ok": True, "affected": res.rowcount or 0}
+
+    raise HTTPException(400, "Неизвестное действие")
 
 
 # ---------- funnels ----------

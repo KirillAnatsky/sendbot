@@ -130,6 +130,8 @@ async function openEditor(id) {
   if (!editor) {
     editor = new Drawflow(document.getElementById('drawflow'));
     editor.reroute = true;
+    // «магнит»: отпустил связь в любом месте карточки — цепляется к её входу
+    editor.force_first_input = true;
     editor.start();
     // Drawflow по умолчанию таскает холст левой кнопкой — отключаем:
     // холст двигаем тачпадом/пробелом, а ЛКМ по фону = рамка выделения
@@ -140,7 +142,10 @@ async function openEditor(id) {
       return _origMove(e);
     };
     editor.on('nodeSelected', id => { onNodeSelected(id); showProps(id); });
-    editor.on('nodeUnselected', () => { clearMultiSelection(); hideProps(); });
+    // Drawflow шлёт nodeUnselected и при перевыборе другого блока — группу
+    // при этом сбрасывать нельзя (это и ломало групповое перетаскивание).
+    // Пустой фон снимает выделение сам (см. setupMarquee).
+    editor.on('nodeUnselected', () => { hideProps(); });
     editor.on('nodeRemoved', () => hideProps());
     setupClipboard();
   }
@@ -298,9 +303,8 @@ function updateTriggerInputs() {
 }
 
 // ---------- блоки ----------
-function addBlock(type) {
-  const m = NODE_META[type];
-  const defaults = {
+function blockDefaults(type) {
+  return {
     start: {},
     message: { text: '', photo_url: '', buttons: [] },
     delay: { amount: 1, unit: 'hours' },
@@ -308,8 +312,55 @@ function addBlock(type) {
     action: { op: 'add_tag', tag: TAGS[0] ? String(TAGS[0].id) : '' },
     note: { text: '' },
   }[type];
-  const x = 260 + Math.random() * 120, y = 80 + Math.random() * 200;
-  editor.addNode(type, m.inputs, m.outputs, x, y, type, defaults, nodeHtml(type, defaults), false);
+}
+
+function addBlockAt(type, x, y) {
+  const m = NODE_META[type];
+  const defaults = blockDefaults(type);
+  return editor.addNode(type, m.inputs, m.outputs, x, y, type, defaults, nodeHtml(type, defaults), false);
+}
+
+// клик по палитре — как раньше, блок появляется в видимой части холста
+function addBlock(type) {
+  const x = (-editor.canvas_x + 260 + Math.random() * 120) / (editor.zoom || 1);
+  const y = (-editor.canvas_y + 120 + Math.random() * 200) / (editor.zoom || 1);
+  addBlockAt(type, x, y);
+}
+
+// координаты мыши -> координаты холста Drawflow (с учётом сдвига и зума)
+function canvasPoint(e) {
+  const rect = document.getElementById('drawflow').getBoundingClientRect();
+  const z = editor.zoom || 1;
+  return {
+    x: (e.clientX - rect.left - editor.canvas_x) / z,
+    y: (e.clientY - rect.top - editor.canvas_y) / z,
+  };
+}
+
+// перетаскивание из палитры: блок создаётся там, где отпустили
+function setupPaletteDnD() {
+  const canvas = document.getElementById('drawflow');
+  document.querySelectorAll('.palette-item[data-block]').forEach(item => {
+    item.setAttribute('draggable', 'true');
+    item.addEventListener('dragstart', e => {
+      e.dataTransfer.setData('text/sb-block', item.dataset.block);
+      e.dataTransfer.effectAllowed = 'copy';
+    });
+  });
+  canvas.addEventListener('dragover', e => {
+    if ([...e.dataTransfer.types].includes('text/sb-block')) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+    }
+  });
+  canvas.addEventListener('drop', e => {
+    const type = e.dataTransfer.getData('text/sb-block');
+    if (!type) return;
+    e.preventDefault();
+    const p = canvasPoint(e);
+    // центрируем карточку под курсором
+    addBlockAt(type, p.x - 110, p.y - 20);
+  });
 }
 
 function refreshNodeHtml(id) {
@@ -773,15 +824,21 @@ async function saveFunnel() {
 const CLIPBOARD_KEY = 'sb_node_clipboard';
 let multiSelection = new Set();
 let shiftHeld = false;
+let lastClickCtrl = false;   // Ctrl/⌘ в момент mousedown — для выделения по одному
 
 function onNodeSelected(id) {
-  if (shiftHeld) {
-    multiSelection.add(String(id));
-  } else if (multiSelection.size > 1 && multiSelection.has(String(id))) {
-    // клик по блоку из выделенной группы — группу не сбрасываем (например, перед перетаскиванием)
+  id = String(id);
+  if (lastClickCtrl) {
+    // Ctrl/⌘+клик — добавить/убрать из выделения, как в файловых менеджерах
+    if (multiSelection.has(id)) multiSelection.delete(id);
+    else multiSelection.add(id);
+  } else if (shiftHeld) {
+    multiSelection.add(id);
+  } else if (multiSelection.size > 1 && multiSelection.has(id)) {
+    // клик по блоку из выделенной группы — группу не сбрасываем (перед перетаскиванием)
   } else {
     clearMultiSelection();
-    multiSelection.add(String(id));
+    multiSelection.add(id);
   }
   paintSelection();
 }
@@ -800,6 +857,9 @@ function paintSelection() {
 }
 
 function setupClipboard() {
+  document.getElementById('drawflow').addEventListener('mousedown', e => {
+    lastClickCtrl = e.ctrlKey || e.metaKey;
+  }, true);
   document.addEventListener('keydown', e => {
     shiftHeld = e.shiftKey;
     // работаем только когда открыт редактор и фокус не в поле ввода
@@ -830,6 +890,8 @@ function setupClipboard() {
   setupCanvasNav();
   setupMarquee();
   setupGroupDrag();
+  setupPaletteDnD();
+  setupMagnetConnections();
 
   // вставка картинки из буфера, когда открыт блок «Сообщение» (в любом месте редактора)
   document.addEventListener('paste', e => {
@@ -924,7 +986,7 @@ function setupMarquee() {
     if (e.button !== 0 || spaceHeld) return;   // ЛКМ и не режим «рука»
     // только по пустому фону: не по блоку, не по связи, не по порту
     if (e.target.closest('.drawflow-node') || e.target.closest('svg')) return;
-    if (!e.shiftKey) clearMultiSelection();    // без Shift — начинаем выделение заново
+    if (!e.shiftKey && !e.ctrlKey && !e.metaKey) clearMultiSelection();  // без модификаторов — заново
     active = true; sx = e.clientX; sy = e.clientY;
     box = document.createElement('div');
     box.className = 'marquee-box';
@@ -969,7 +1031,7 @@ function setupGroupDrag() {
   let dragging = false, startX = 0, startY = 0, others = [];
 
   container.addEventListener('mousedown', e => {
-    if (e.shiftKey) return;  // Shift — это выделение, не перетаскивание
+    if (e.shiftKey || e.ctrlKey || e.metaKey) return;  // это выделение, не перетаскивание
     const nodeEl = e.target.closest('.drawflow-node');
     if (!nodeEl) return;
     const id = nodeEl.id.replace('node-', '');
@@ -1008,6 +1070,30 @@ function setupGroupDrag() {
     others = [];
     paintSelection();  // группа остаётся выделенной
   });
+}
+
+// ---------- «магнитные» связи ----------
+// Соединение делает сам Drawflow (force_first_input): бросил на карточку —
+// прицепилось к входу. Здесь только подсветка карточки-цели, пока тянешь.
+function setupMagnetConnections() {
+  const container = document.getElementById('drawflow');
+  let hovered = null;
+
+  function clearHover() {
+    if (hovered) { hovered.classList.remove('magnet-target'); hovered = null; }
+  }
+
+  container.addEventListener('mousemove', e => {
+    if (!editor || !editor.connection) { clearHover(); return; }
+    const nodeEl = e.target.closest('.drawflow-node');
+    const srcEl = editor.ele_selected ? editor.ele_selected.closest('.drawflow-node') : null;
+    if (nodeEl && nodeEl !== srcEl && nodeEl.querySelector('.inputs .input')) {
+      if (hovered !== nodeEl) { clearHover(); hovered = nodeEl; nodeEl.classList.add('magnet-target'); }
+    } else {
+      clearHover();
+    }
+  });
+  container.addEventListener('mouseup', clearHover);
 }
 
 function copyNodes() {

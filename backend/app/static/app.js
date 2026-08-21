@@ -372,8 +372,21 @@ async function loadSubscribers() {
     return;
   }
   const subs = res.subscribers;
+  LAST_AUDIENCE_TOTAL = res.total;
   document.getElementById('subscribers-list').innerHTML = `
-    <div class="list-meta">Найдено: <b>${res.total}</b>${res.total > subs.length ? ` (показаны первые ${subs.length})` : ''}</div>
+    <div class="list-meta">
+      Найдено: <b>${res.total}</b>${res.total > subs.length ? ` (показаны первые ${subs.length})` : ''}
+      ${res.total ? `
+      <span class="bulk-actions">
+        С этой аудиторией (${res.total}):
+        <select id="bulk-tag-select">
+          ${TAGS.map(t => `<option value="${t.id}">${esc(t.name)}</option>`).join('')}
+        </select>
+        <button class="btn" onclick="bulkAction('add_tag')">+ тег</button>
+        <button class="btn" onclick="bulkAction('remove_tag')">− тег</button>
+        <button class="btn danger" onclick="bulkAction('delete')">🗑 Удалить</button>
+      </span>` : ''}
+    </div>
     <table>
     <tr><th>Имя</th><th>Username</th><th>Язык</th><th>Активность</th><th>Статус</th><th>Теги</th><th></th></tr>
     ${subs.map(s => `<tr>
@@ -421,6 +434,44 @@ async function addSubTag(subId, tagId) {
 }
 async function removeSubTag(subId, tagId) {
   await api(`/subscribers/${subId}/tags/${tagId}`, { method: 'DELETE' });
+  loadSubscribers();
+}
+
+let LAST_AUDIENCE_TOTAL = null;
+
+// массовое действие над текущей аудиторией (фильтр сегмента + строка поиска)
+async function bulkAction(action) {
+  const total = LAST_AUDIENCE_TOTAL || 0;
+  if (!total) return;
+  const tagSel = document.getElementById('bulk-tag-select');
+  const tagId = tagSel ? +tagSel.value : null;
+  const tagName = tagSel ? tagSel.options[tagSel.selectedIndex]?.text : '';
+
+  const label = {
+    delete: `УДАЛИТЬ ${total} подписчиков?\n\nУдалится вся история переписки, теги и статистика. Отменить будет нельзя.`,
+    add_tag: `Добавить тег «${tagName}» ${total} подписчикам?`,
+    remove_tag: `Снять тег «${tagName}» у ${total} подписчиков?`,
+  }[action];
+  if (!confirm(label)) return;
+  if (action === 'delete' && total >= 100) {
+    const typed = prompt(`Это ${total} человек. Чтобы подтвердить, введите число ${total}:`);
+    if (typed !== String(total)) { alert('Не совпало — отменено.'); return; }
+  }
+
+  try {
+    const body = { ...currentSubFilter(), action, tag_id: tagId, expected_total: total };
+    const r = await api('/subscribers/bulk', { method: 'POST', body });
+    alert(`Готово. Затронуто: ${r.affected}`);
+  } catch (e) { /* alert показан в api() */ }
+  loadSubscribers();
+}
+
+// удалить одного подписчика (кнопка в чате)
+async function deleteSubscriber(subId) {
+  if (!confirm('Удалить этого подписчика?\n\nПереписка, теги и статистика удалятся. Если он снова напишет боту — появится как новый.')) return;
+  try { await api(`/subscribers/${subId}`, { method: 'DELETE' }); }
+  catch (e) { return; }
+  closeChat();
   loadSubscribers();
 }
 

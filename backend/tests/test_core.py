@@ -340,3 +340,49 @@ async def test_funnel_analysis_respects_event_order(session):
         {"type": "button", "funnel_id": 1, "node_id": "n2", "button": 0},
     ], days=365)
     assert [x["count"] for x in res2["steps"]] == [10, 0]
+
+
+@pytest.mark.asyncio
+async def test_delete_subscribers_removes_all_traces(session):
+    """Удаление подписчика подчищает всё: переписку, теги, запуски, визиты."""
+    from app.api import _delete_subscribers
+    from app.models import (Bot, ButtonClick, FunnelRun, Message, NodeVisit,
+                            ScheduledJob, Subscriber, SubscriberTag, Tag)
+    from sqlalchemy import func, select
+
+    bot = Bot(name="b", token="t")
+    tag = Tag(name="vip")
+    session.add_all([bot, tag])
+    await session.flush()
+
+    keep = Subscriber(bot_id=bot.id, tg_id=1)      # этот должен остаться
+    gone = Subscriber(bot_id=bot.id, tg_id=2)      # этого удаляем
+    session.add_all([keep, gone])
+    await session.flush()
+
+    for s in (keep, gone):
+        session.add(Message(subscriber_id=s.id, direction="in", text="hi"))
+        session.add(SubscriberTag(subscriber_id=s.id, tag_id=tag.id))
+        run = FunnelRun(funnel_id=1, subscriber_id=s.id, status="active")
+        session.add(run)
+        await session.flush()
+        session.add(ScheduledJob(run_id=run.id, node_id="n1",
+                                 execute_at=datetime.utcnow()))
+        session.add(NodeVisit(funnel_id=1, node_id="n1", subscriber_id=s.id, run_id=run.id))
+        session.add(ButtonClick(funnel_id=1, node_id="n1", button_index=0, subscriber_id=s.id))
+    await session.commit()
+
+    n = await _delete_subscribers(session, [gone.id])
+    await session.commit()
+    assert n == 1
+
+    async def count(model, *cond):
+        return (await session.execute(select(func.count()).select_from(model).where(*cond))).scalar()
+
+    assert await count(Subscriber, Subscriber.id == gone.id) == 0
+    assert await count(Subscriber, Subscriber.id == keep.id) == 1
+    for model in (Message, SubscriberTag, FunnelRun, NodeVisit, ButtonClick):
+        assert await count(model, model.subscriber_id == gone.id) == 0, model.__name__
+        assert await count(model, model.subscriber_id == keep.id) == 1, model.__name__
+    # отложенные задачи удалённого исчезли, у оставшегося — на месте
+    assert await count(ScheduledJob) == 1
