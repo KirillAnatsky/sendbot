@@ -162,6 +162,18 @@ class LoginIn(BaseModel):
     password: str
 
 
+def _user_public(user) -> dict:
+    """Данные о себе для интерфейса: и при входе, и при обновлении страницы."""
+    return {
+        "id": user.id,
+        "login": user.login,
+        "name": user.name,
+        "role": user.role,
+        "bot_ids": user.bot_ids or [],
+        "permissions": user_permissions(user),
+    }
+
+
 @router.post("/auth/login")
 async def login(body: LoginIn, session=Depends(get_session)):
     res = await session.execute(select(User).where(User.login == body.login.strip()))
@@ -173,16 +185,15 @@ async def login(body: LoginIn, session=Depends(get_session)):
     log.info("Вход в админку: %s (%s)", user.login, user.role)
     return {
         "token": make_token(user),
-        "user": {"id": user.id, "login": user.login, "name": user.name,
-                 "role": user.role, "bot_ids": user.bot_ids or []},
+        # состав должен совпадать с /auth/me — интерфейс сразу после входа
+        # берёт права отсюда, а не из отдельного запроса
+        "user": _user_public(user),
     }
 
 
 @router.get("/auth/me", dependencies=[Depends(require_auth)])
 async def auth_me(user=Depends(current_user)):
-    return {"id": user.id, "login": user.login, "name": user.name,
-            "role": user.role, "bot_ids": user.bot_ids or [],
-            "permissions": user_permissions(user)}
+    return _user_public(user)
 
 
 @router.get("/permissions/features", dependencies=[Depends(require_owner)])

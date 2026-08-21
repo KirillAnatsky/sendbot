@@ -546,3 +546,26 @@ def test_every_endpoint_is_protected():
         unprotected.append(f"{sorted(getattr(r, 'methods', ['WS']))} {path}")
 
     assert not unprotected, "Маршруты без проверки прав: " + ", ".join(unprotected)
+
+
+@pytest.mark.asyncio
+async def test_login_response_includes_permissions(session):
+    """Вход должен отдавать те же поля, что и /auth/me.
+
+    Иначе сразу после логина интерфейс не знает о правах и прячет всё подряд.
+    """
+    from app.api import LoginIn, auth_me, login
+    from app.auth import hash_password
+    from app.models import User
+
+    u = User(login="vadim", name="Vadim", password_hash=hash_password("secret123"),
+             role="staff", bot_ids=[1], permissions={"bots": "view", "funnels": "edit"})
+    session.add(u)
+    await session.commit()
+
+    res = await login(LoginIn(login="vadim", password="secret123"), session)
+    me = await auth_me(user=u)
+
+    assert res["user"] == me, "состав /auth/login и /auth/me разошёлся"
+    assert res["user"]["permissions"] == {"bots": "view", "funnels": "edit"}
+    assert res["user"]["bot_ids"] == [1]
