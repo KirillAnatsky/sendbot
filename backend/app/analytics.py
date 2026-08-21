@@ -1,7 +1,7 @@
 """Аналитика для дашборда: серии по дням, разбивки, retention, LTV."""
 from datetime import datetime, timedelta
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import DateTime, and_, case, func, literal, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import (
@@ -31,6 +31,36 @@ def _sub_conditions(bot_id, language, source, tag_id):
             )
         )
     return conds
+
+
+LIFETIME_BUCKETS = [
+    ("0–1 дн", 0, 1),
+    ("1–7 дн", 1, 7),
+    ("7–30 дн", 7, 30),
+    ("30–90 дн", 30, 90),
+    ("90+ дн", 90, 10 ** 9),
+]
+
+
+def _is_postgres(session) -> bool:
+    try:
+        return session.get_bind().dialect.name == "postgresql"
+    except Exception:  # noqa: BLE001
+        try:
+            return session.sync_session.get_bind().dialect.name == "postgresql"
+        except Exception:  # noqa: BLE001
+            return False
+
+
+def _lifetime_days_expr(session, now):
+    """Сколько дней подписчик «живёт» с нами — считается на стороне БД."""
+    end = case(
+        (Subscriber.is_active == True, literal(now, DateTime)),  # noqa: E712
+        else_=func.coalesce(Subscriber.last_active_at, Subscriber.created_at),
+    )
+    if _is_postgres(session):
+        return func.extract("epoch", end - Subscriber.created_at) / 86400.0
+    return func.julianday(end) - func.julianday(Subscriber.created_at)
 
 
 def _day_range(days: int):
@@ -66,15 +96,59 @@ async def build_analytics(
         all_c = list(conds) + list(extra)
         return q.where(and_(*all_c)) if all_c else q
 
-    total = (await session.execute(subs_q())).scalar() or 0
-    active = (await session.execute(subs_q(Subscriber.is_active == True))).scalar() or 0  # noqa: E712
-    new_period = (
-        await session.execute(subs_q(Subscriber.created_at >= start_dt))
-    ).scalar() or 0
-    week_ago = datetime.utcnow() - timedelta(days=7)
-    active_7d = (
-        await session.execute(subs_q(Subscriber.last_active_at >= week_ago))
-    ).scalar() or 0
+    now = datetime.utcnow()
+    week_ago = now - timedelta(days=7)
+
+    # Все счётчики + LTV одним запросом: раньше это были 4 отдельных COUNT
+    # плюс выгрузка всей таблицы подписчиков в память приложения.
+    lt = _lifetime_days_expr(session, now)
+
+    def _cnt(cond):
+        return func.sum(case((cond, 1), else_=0))
+
+    def _bucket(lo, hi):
+        return func.sum(case((and_(lt >= lo, lt < hi), 1), else_=0))
+
+    agg_cols = [
+        func.count(Subscriber.id),
+        _cnt(Subscriber.is_active == True),  # noqa: E712
+        _cnt(Subscriber.created_at >= start_dt),
+        _cnt(Subscriber.last_active_at >= week_ago),
+        func.avg(lt),
+        func.avg(case((Subscriber.is_active == False, lt))),  # noqa: E712
+    ] + [_bucket(lo, hi) for _, lo, hi in LIFETIME_BUCKETS]
+
+    agg_q = select(*agg_cols)
+    if conds:
+        agg_q = agg_q.where(and_(*conds))
+    agg = (await session.execute(agg_q)).one()
+
+    total = int(agg[0] or 0)
+    active = int(agg[1] or 0)
+    new_period = int(agg[2] or 0)
+    active_7d = int(agg[3] or 0)
+    lifetime_avg = round(float(agg[4] or 0), 1)
+    churned_avg = round(float(agg[5] or 0), 1)
+    lifetime_dist = [
+        {"k": label, "v": int(agg[6 + i] or 0)}
+        for i, (label, _, _) in enumerate(LIFETIME_BUCKETS)
+    ]
+
+    # медиана — отдельным запросом, на Postgres считает сама БД
+    if _is_postgres(session):
+        med_q = select(func.percentile_cont(0.5).within_group(lt.asc()))
+        if conds:
+            med_q = med_q.where(and_(*conds))
+        lifetime_median = round(float((await session.execute(med_q)).scalar() or 0), 1)
+    else:
+        med_q = select(lt).order_by(lt)
+        if conds:
+            med_q = med_q.where(and_(*conds))
+        vals = [float(v or 0) for (v,) in (await session.execute(med_q)).all()]
+        n = len(vals)
+        lifetime_median = round(
+            (vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2), 1
+        ) if n else 0
 
     # прирост по дням + накопительно
     rows = (
@@ -137,40 +211,6 @@ async def build_analytics(
         )
     ).all()
 
-    # LTV по времени: сколько подписчик «живёт» с нами
-    lt_q = select(Subscriber.created_at, Subscriber.last_active_at, Subscriber.is_active)
-    if conds:
-        lt_q = lt_q.where(and_(*conds))
-    rows_lt = (await session.execute(lt_q)).all()
-    now = datetime.utcnow()
-    lifetimes, lifetimes_churned = [], []
-    for created, last_active, is_act in rows_lt:
-        if not created:
-            continue
-        end = now if is_act else (last_active or created)
-        d = max((end - created).total_seconds() / 86400.0, 0.0)
-        lifetimes.append(d)
-        if not is_act:
-            lifetimes_churned.append(d)
-
-    def _avg(xs):
-        return round(sum(xs) / len(xs), 1) if xs else 0
-
-    def _median(xs):
-        if not xs:
-            return 0
-        s = sorted(xs)
-        n = len(s)
-        return round((s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2), 1)
-
-    # распределение по «возрасту» подписки
-    buckets = [("0–1 дн", 0, 1), ("1–7 дн", 1, 7), ("7–30 дн", 7, 30),
-               ("30–90 дн", 30, 90), ("90+ дн", 90, 10**9)]
-    lifetime_dist = [
-        {"k": label, "v": sum(1 for x in lifetimes if lo <= x < hi)}
-        for label, lo, hi in buckets
-    ]
-
     return {
         "days": [str(d) for d in day_list],
         "series": {
@@ -187,9 +227,9 @@ async def build_analytics(
             "active_7d": active_7d,
             "retention_7d": round(100 * active_7d / total, 1) if total else 0,
             # LTV по времени (в днях)
-            "lifetime_avg_days": _avg(lifetimes),
-            "lifetime_median_days": _median(lifetimes),
-            "churned_lifetime_avg_days": _avg(lifetimes_churned),
+            "lifetime_avg_days": lifetime_avg,
+            "lifetime_median_days": lifetime_median,
+            "churned_lifetime_avg_days": churned_avg,
         },
         "breakdowns": {
             "languages": langs,
@@ -202,40 +242,50 @@ async def build_analytics(
 
 # ---------- анализ воронок (в стиле Amplitude) ----------
 
-async def _step_events(session, step: dict, start_dt, bot_id=None):
-    """-> список (subscriber_id, timestamp) для события-шага."""
+def _step_query(step: dict, start_dt, bot_id=None):
+    """SELECT (subscriber_id, момент события) для одного шага воронки.
+
+    Возвращается именно запрос, а не строки: дальше шаги склеиваются в один
+    SQL-запрос и считаются внутри БД. Раньше каждый шаг выгружал все свои
+    события в память приложения — на 120к подписчиков это было ~1,4 с.
+    """
     t = step.get("type")
     if t == "subscribed":
-        q = select(Subscriber.id, Subscriber.created_at).where(
-            Subscriber.created_at >= start_dt
-        )
+        q = select(
+            Subscriber.id.label("sid"), Subscriber.created_at.label("ts")
+        ).where(Subscriber.created_at >= start_dt)
         if bot_id:
             q = q.where(Subscriber.bot_id == bot_id)
-        return (await session.execute(q)).all()
+        return q
 
     if t == "node":
-        q = select(NodeVisit.subscriber_id, NodeVisit.created_at).where(
+        return select(
+            NodeVisit.subscriber_id.label("sid"), NodeVisit.created_at.label("ts")
+        ).where(
             NodeVisit.funnel_id == int(step["funnel_id"]),
             NodeVisit.node_id == str(step["node_id"]),
             NodeVisit.created_at >= start_dt,
         )
-        return (await session.execute(q)).all()
 
     if t == "button":
-        q = select(ButtonClick.subscriber_id, ButtonClick.created_at).where(
+        q = select(
+            ButtonClick.subscriber_id.label("sid"), ButtonClick.created_at.label("ts")
+        ).where(
             ButtonClick.funnel_id == int(step["funnel_id"]),
             ButtonClick.node_id == str(step["node_id"]),
             ButtonClick.created_at >= start_dt,
         )
-        if step.get("button") is not None and step.get("button") != "":
+        if step.get("button") not in (None, ""):
             q = q.where(ButtonClick.button_index == int(step["button"]))
-        return (await session.execute(q)).all()
+        return q
 
     if t == "broadcast":
-        q = (
+        return (
             select(
-                BroadcastRecipient.subscriber_id,
-                func.coalesce(BroadcastRecipient.created_at, Broadcast.created_at),
+                BroadcastRecipient.subscriber_id.label("sid"),
+                func.coalesce(
+                    BroadcastRecipient.created_at, Broadcast.created_at
+                ).label("ts"),
             )
             .join(Broadcast, Broadcast.id == BroadcastRecipient.broadcast_id)
             .where(
@@ -243,42 +293,54 @@ async def _step_events(session, step: dict, start_dt, bot_id=None):
                 BroadcastRecipient.delivered == True,  # noqa: E712
             )
         )
-        return (await session.execute(q)).all()
 
     if t == "message_in":
-        q = select(Message.subscriber_id, Message.created_at).where(
-            Message.direction == "in", Message.created_at >= start_dt
-        )
+        q = select(
+            Message.subscriber_id.label("sid"), Message.created_at.label("ts")
+        ).where(Message.direction == "in", Message.created_at >= start_dt)
         if bot_id:
             q = q.join(Subscriber, Subscriber.id == Message.subscriber_id).where(
                 Subscriber.bot_id == bot_id
             )
-        return (await session.execute(q)).all()
+        return q
 
-    return []
+    return None
 
 
 async def funnel_analysis(session, steps: list, days: int = 30, bot_id=None) -> dict:
     """Последовательная воронка: на каждом шаге остаются только те, кто сделал
-    событие ПОСЛЕ своего события предыдущего шага (как в Amplitude)."""
+    событие ПОСЛЕ своего события предыдущего шага (как в Amplitude).
+
+    Считается целиком в БД: каждый шаг — подзапрос «подписчик + первый момент
+    события», следующий джойнится к предыдущему с условием ts >= предыдущего.
+    """
     days = max(1, min(days or 30, 365))
     start_dt = datetime.utcnow() - timedelta(days=days)
-    prev: dict | None = None
+
     out = []
+    prev = None
     for step in steps[:10]:
-        rows = await _step_events(session, step, start_dt, bot_id)
-        cur: dict = {}
-        for sub, ts in rows:
-            if ts is None:
-                continue
-            if prev is None:
-                if sub not in cur or ts < cur[sub]:
-                    cur[sub] = ts
-            else:
-                base = prev.get(sub)
-                if base is not None and ts >= base and (sub not in cur or ts < cur[sub]):
-                    cur[sub] = ts
-        out.append(len(cur))
+        base = _step_query(step, start_dt, bot_id)
+        if base is None:
+            out.append(0)
+            prev = None
+            continue
+        b = base.subquery()
+        if prev is None:
+            cur = (
+                select(b.c.sid.label("sid"), func.min(b.c.ts).label("ts"))
+                .where(b.c.ts.isnot(None))
+                .group_by(b.c.sid)
+            ).subquery()
+        else:
+            cur = (
+                select(b.c.sid.label("sid"), func.min(b.c.ts).label("ts"))
+                .join(prev, prev.c.sid == b.c.sid)
+                .where(b.c.ts.isnot(None), b.c.ts >= prev.c.ts)
+                .group_by(b.c.sid)
+            ).subquery()
+        n = (await session.execute(select(func.count()).select_from(cur))).scalar() or 0
+        out.append(int(n))
         prev = cur
 
     result = []

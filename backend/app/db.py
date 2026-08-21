@@ -82,6 +82,12 @@ def _migrate(conn):
         "CREATE INDEX IF NOT EXISTS ix_node_visits_funnel_node ON node_visits (funnel_id, node_id)",
         "CREATE INDEX IF NOT EXISTS ix_node_visits_funnel_sub ON node_visits (funnel_id, subscriber_id)",
         "CREATE INDEX IF NOT EXISTS ix_button_clicks_funnel_node ON button_clicks (funnel_id, node_id)",
+        # под «Анализ воронки»: шаги фильтруются по (воронка, узел, период)
+        "CREATE INDEX IF NOT EXISTS ix_node_visits_fnc ON node_visits (funnel_id, node_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS ix_button_clicks_fnc ON button_clicks (funnel_id, node_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS ix_button_clicks_sub_created ON button_clicks (subscriber_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS ix_messages_dir_created ON messages (direction, created_at)",
+        "CREATE INDEX IF NOT EXISTS ix_bc_recipients_bc ON broadcast_recipients (broadcast_id, delivered)",
         "CREATE INDEX IF NOT EXISTS ix_scheduled_jobs_status_at ON scheduled_jobs (status, execute_at)",
         "CREATE INDEX IF NOT EXISTS ix_runs_funnel_sub ON funnel_runs (funnel_id, subscriber_id)",
     ):

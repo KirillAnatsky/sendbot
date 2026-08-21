@@ -252,3 +252,91 @@ async def test_ai_spec_roundtrip(session):
     back = ai.graph_to_spec(f)
     texts = [n.get("text") for n in back["nodes"] if n["type"] == "message"]
     assert "Привет" in texts and "Конец" in texts
+
+
+# ---------- аналитика: считается в БД, а не в памяти приложения ----------
+
+@pytest.mark.asyncio
+async def test_analytics_ltv_matches_reference(session):
+    """LTV и распределение по «возрасту» должны совпадать с прямым расчётом.
+
+    Раньше это считалось выгрузкой всей таблицы подписчиков в питон; теперь
+    агрегирует БД — цифры обязаны остаться теми же.
+    """
+    from app import analytics as an
+    from app.models import Bot, Subscriber
+
+    bot = Bot(name="b", token="t")
+    session.add(bot)
+    await session.flush()
+
+    now = datetime.utcnow()
+    plan = [(0.5, True), (3, True), (15, False), (45, False), (200, True)]
+    expected = []
+    for i, (age, active) in enumerate(plan * 4):
+        created = now - timedelta(days=age)
+        last = created + timedelta(days=age / 2)
+        session.add(Subscriber(bot_id=bot.id, tg_id=500 + i, created_at=created,
+                               last_active_at=last, is_active=active))
+        expected.append(((now if active else last) - created).total_seconds() / 86400.0)
+    await session.commit()
+
+    res = await an.build_analytics(session, days=365)
+    t = res["totals"]
+
+    assert t["subscribers"] == len(expected)
+    assert abs(t["lifetime_avg_days"] - sum(expected) / len(expected)) < 0.2
+
+    s = sorted(expected)
+    n = len(s)
+    median = s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+    assert abs(t["lifetime_median_days"] - median) < 0.2
+
+    buckets = [(0, 1), (1, 7), (7, 30), (30, 90), (90, 10 ** 9)]
+    got = [d["v"] for d in res["breakdowns"]["lifetime"]]
+    assert got == [sum(1 for x in expected if lo <= x < hi) for lo, hi in buckets]
+
+
+@pytest.mark.asyncio
+async def test_funnel_analysis_respects_event_order(session):
+    """Шаг засчитывается только если событие произошло ПОСЛЕ предыдущего шага."""
+    from app import analytics as an
+    from app.models import Bot, ButtonClick, NodeVisit, Subscriber
+
+    bot = Bot(name="b", token="t")
+    session.add(bot)
+    await session.flush()
+
+    now = datetime.utcnow()
+    subs = []
+    for i in range(20):
+        s = Subscriber(bot_id=bot.id, tg_id=900 + i, created_at=now - timedelta(days=5))
+        session.add(s)
+        subs.append(s)
+    await session.flush()
+
+    for i, s in enumerate(subs):
+        if i % 2 == 0:  # 10 дошли до узла
+            session.add(NodeVisit(funnel_id=1, node_id="n1", subscriber_id=s.id,
+                                  run_id=1, created_at=now - timedelta(days=4)))
+        if i % 4 == 0:  # 5 из них кликнули ПОСЛЕ
+            session.add(ButtonClick(funnel_id=1, node_id="n1", button_index=0,
+                                    subscriber_id=s.id, created_at=now - timedelta(days=3)))
+        if i % 2 == 0:  # клик по n2 — РАНЬШЕ визита, засчитываться не должен
+            session.add(ButtonClick(funnel_id=1, node_id="n2", button_index=0,
+                                    subscriber_id=s.id, created_at=now - timedelta(days=6)))
+    await session.commit()
+
+    steps = [{"type": "subscribed"},
+             {"type": "node", "funnel_id": 1, "node_id": "n1"},
+             {"type": "button", "funnel_id": 1, "node_id": "n1", "button": 0}]
+    res = await an.funnel_analysis(session, steps, days=365)
+    assert [x["count"] for x in res["steps"]] == [20, 10, 5]
+    assert res["steps"][1]["from_prev"] == 50.0
+
+    # событие раньше предыдущего шага не проходит
+    res2 = await an.funnel_analysis(session, [
+        {"type": "node", "funnel_id": 1, "node_id": "n1"},
+        {"type": "button", "funnel_id": 1, "node_id": "n2", "button": 0},
+    ], days=365)
+    assert [x["count"] for x in res2["steps"]] == [10, 0]
