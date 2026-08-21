@@ -1,0 +1,10 @@
+# секреты и данные — в репозиторий не попадают
+.env
+backups/
+backend/media/
+*.db
+__pycache__/
+*.pyc
+.DS_Store
+.pytest_cache/
+test_ci.db

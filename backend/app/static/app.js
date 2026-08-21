@@ -1,0 +1,741 @@
+// ---------- базовое ----------
+let TOKEN = localStorage.getItem('sb_token') || '';
+let TAGS = [];
+
+async function api(path, opts = {}) {
+  opts.headers = Object.assign(
+    { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + TOKEN },
+    opts.headers || {}
+  );
+  if (opts.body && typeof opts.body !== 'string') opts.body = JSON.stringify(opts.body);
+  const r = await fetch('/api' + path, opts);
+  if (r.status === 401) { showLogin(); throw new Error('auth'); }
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) { alert(data.detail || 'Ошибка'); throw new Error(data.detail || 'error'); }
+  return data;
+}
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+
+// ---------- логин ----------
+function showLogin() {
+  document.getElementById('login-screen').classList.remove('hidden');
+  document.getElementById('app').classList.add('hidden');
+}
+function showApp() {
+  document.getElementById('login-screen').classList.add('hidden');
+  document.getElementById('app').classList.remove('hidden');
+  go('dashboard');
+}
+let ME = null;  // текущий пользователь
+
+async function doLogin() {
+  const login = document.getElementById('login-name').value.trim();
+  const pw = document.getElementById('login-password').value;
+  try {
+    const r = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ login, password: pw }),
+    });
+    if (!r.ok) throw new Error();
+    const data = await r.json();
+    TOKEN = data.token;
+    ME = data.user;
+    localStorage.setItem('sb_token', TOKEN);
+    applyRoleUI();
+    showApp();
+  } catch {
+    document.getElementById('login-error').textContent = 'Неверный логин или пароль';
+  }
+}
+
+// прячем от сотрудника то, что доступно только владельцу
+function applyRoleUI() {
+  const owner = ME && ME.role === 'owner';
+  document.querySelectorAll('.owner-only').forEach(el => el.classList.toggle('hidden', !owner));
+  document.getElementById('side-user-name').textContent =
+    ME ? `${ME.name || ME.login}${owner ? ' · владелец' : ''}` : '';
+}
+
+async function changeMyPassword() {
+  const oldPw = prompt('Текущий пароль:');
+  if (!oldPw) return;
+  const newPw = prompt('Новый пароль (минимум 6 символов):');
+  if (!newPw) return;
+  try {
+    await api('/auth/password', { method: 'POST', body: { old_password: oldPw, new_password: newPw } });
+    alert('Пароль изменён');
+  } catch (e) { /* ошибка уже показана */ }
+}
+function logout() { localStorage.removeItem('sb_token'); TOKEN = ''; showLogin(); }
+document.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !document.getElementById('login-screen').classList.contains('hidden')) doLogin();
+});
+
+// ---------- навигация ----------
+// вызовы ленивые: часть функций объявлена в других файлах (dashboard.js, bot.js),
+// которые подключаются после app.js — прямые ссылки давали бы ReferenceError
+const loaders = {
+  dashboard: () => loadDashboard(),
+  bots: () => loadBots(),
+  funnels: () => loadFunnels(),
+  subscribers: async () => { await loadTags(true); await loadBotFilter(); await loadSubscribers(); },
+  tags: () => loadTagsPage(),
+  broadcasts: () => loadBroadcasts(),
+  analysis: () => loadAnalysisPage(),
+  team: () => loadUsers(),
+  ai: () => loadAIPage(),
+};
+function go(page) {
+  document.querySelectorAll('.page').forEach(p => p.classList.add('hidden'));
+  document.getElementById('page-' + page).classList.remove('hidden');
+  document.querySelectorAll('.nav-item').forEach(n =>
+    n.classList.toggle('active', n.dataset.page === page));
+  (loaders[page] || (() => {}))();
+}
+
+// дашборд живёт в dashboard.js (loadDashboard)
+
+// ---------- боты ----------
+let BOTS = [];
+async function loadBots() {
+  BOTS = await api('/bots');
+  document.getElementById('bots-list').innerHTML = BOTS.length ? `<table>
+    <tr><th>Название</th><th>Токен</th><th>Статус</th><th>Подписчиков</th><th>Воронок</th><th></th></tr>
+    ${BOTS.map(b => `<tr>
+      <td><a href="#" onclick="openBot(${b.id});return false"><b>${esc(b.name)}</b></a>${b.tg_username ? ` <span style="color:#7a8499">@${esc(b.tg_username)}</span>` : ''}</td>
+      <td style="font-family:monospace;font-size:12px">${esc(b.token_hint)}</td>
+      <td>${b.is_active
+        ? (b.running ? '<span class="status-active">работает</span>' : `<span style="color:#d33" title="${esc(b.last_error||'')}">ошибка</span>`)
+        : '<span class="status-off">выключен</span>'}</td>
+      <td>${b.subscribers}</td>
+      <td>${b.funnels}</td>
+      <td>
+        <button class="btn primary" onclick="openBot(${b.id})">Открыть</button>
+        ${ME && ME.role === 'owner' ? `
+        <button class="btn" onclick="toggleBot(${b.id})">${b.is_active ? 'Выключить' : 'Включить'}</button>
+        <button class="btn danger" onclick="deleteBot(${b.id})">Удалить</button>` : ''}
+      </td>
+    </tr>`).join('')}
+  </table>` : '<div class="panel">Ботов пока нет. Создайте первого — токен возьмите у @BotFather.</div>';
+  if (BOTS.some(b => b.is_active && !b.running)) {
+    clearTimeout(window._botTimer);
+    window._botTimer = setTimeout(() => {
+      if (!document.getElementById('page-bots').classList.contains('hidden')) loadBots();
+    }, 3000);
+  }
+}
+function showBotForm() { document.getElementById('bot-form').classList.remove('hidden'); }
+function hideBotForm() { document.getElementById('bot-form').classList.add('hidden'); }
+async function createBot() {
+  const name = document.getElementById('bot-name').value.trim();
+  const token = document.getElementById('bot-token').value.trim();
+  if (!token) { alert('Вставьте токен'); return; }
+  await api('/bots', { method: 'POST', body: { name, token } });
+  document.getElementById('bot-name').value = '';
+  document.getElementById('bot-token').value = '';
+  hideBotForm();
+  loadBots();
+}
+async function toggleBot(id) {
+  try { await api(`/bots/${id}/toggle`, { method: 'POST' }); }
+  finally { loadBots(); }
+}
+async function editBotToken(id) {
+  const token = prompt('Новый токен бота (от @BotFather):');
+  if (!token) return;
+  const b = BOTS.find(x => x.id === id);
+  await api(`/bots/${id}`, { method: 'PUT', body: { name: b ? b.name : '', token } });
+  loadBots();
+}
+async function checkBot(id) {
+  const r = await api(`/bots/${id}/check`);
+  if (!r.ok) { alert('Ошибка связи с Telegram:\n' + r.error); return; }
+  alert(
+    `@${r.username}\n` +
+    `Запущен в приложении: ${r.running ? 'да' : 'нет'}\n` +
+    `Вебхук: ${r.webhook_url || 'нет'}\n` +
+    `Ожидает апдейтов: ${r.pending_updates}\n` +
+    (r.webhook_last_error ? `Ошибка вебхука: ${r.webhook_last_error}\n` : '') +
+    `\n${r.hint}`
+  );
+}
+async function deleteBot(id) {
+  if (!confirm('Удалить бота? Его подписчики и рассылки тоже удалятся.')) return;
+  await api('/bots/' + id, { method: 'DELETE' });
+  loadBots();
+}
+async function loadBotFilter() {
+  const bots = await api('/bots');
+  const sel = document.getElementById('sub-bot-filter');
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">Все боты</option>' +
+    bots.map(b => `<option value="${b.id}">${esc(b.name)}</option>`).join('');
+  sel.value = cur;
+}
+
+// ---------- команда ----------
+let EDIT_USER_ID = null;
+
+async function loadUsers() {
+  const [users, bots] = await Promise.all([api('/users'), api('/bots')]);
+  window._allBots = bots;
+  document.getElementById('users-list').innerHTML = `<table>
+    <tr><th>Логин</th><th>Имя</th><th>Роль</th><th>Боты</th><th>Статус</th><th>Последний вход</th><th></th></tr>
+    ${users.map(u => `<tr>
+      <td><b>${esc(u.login)}</b></td>
+      <td>${esc(u.name || '—')}</td>
+      <td>${u.role === 'owner' ? 'Владелец' : 'Сотрудник'}</td>
+      <td>${(u.bot_ids && u.bot_ids.length)
+        ? u.bot_ids.map(id => { const b = bots.find(x => x.id === id); return `<span class="pill">${esc(b ? b.name : id)}</span>`; }).join('')
+        : '<span style="color:#7a8499;font-size:12px">все</span>'}</td>
+      <td>${u.is_active ? '<span class="status-active">активен</span>' : '<span class="status-off">отключён</span>'}</td>
+      <td>${u.last_login_at ? new Date(u.last_login_at + 'Z').toLocaleString('ru') : '—'}</td>
+      <td>
+        <button class="btn" onclick='editUser(${JSON.stringify(u)})'>Изменить</button>
+        <button class="btn danger" onclick="deleteUser(${u.id})">Удалить</button>
+      </td>
+    </tr>`).join('')}
+  </table>`;
+}
+
+function showUserForm() {
+  EDIT_USER_ID = null;
+  document.getElementById('u-login').value = '';
+  document.getElementById('u-login').disabled = false;
+  document.getElementById('u-name').value = '';
+  document.getElementById('u-pass').value = '';
+  document.getElementById('u-role').value = 'staff';
+  renderUserBots([]);
+  document.getElementById('user-form').classList.remove('hidden');
+}
+function hideUserForm() { document.getElementById('user-form').classList.add('hidden'); }
+
+function renderUserBots(selected) {
+  const bots = window._allBots || [];
+  document.getElementById('u-bots').innerHTML = bots.length
+    ? bots.map(b => `<span class="pill gray ${selected.includes(b.id) ? 'on' : ''}" data-id="${b.id}" onclick="this.classList.toggle('on')">${esc(b.name)}</span>`).join('')
+    : '<span style="color:#99a;font-size:12px">ботов пока нет</span>';
+}
+
+function editUser(u) {
+  EDIT_USER_ID = u.id;
+  document.getElementById('u-login').value = u.login;
+  document.getElementById('u-login').disabled = true;
+  document.getElementById('u-name').value = u.name || '';
+  document.getElementById('u-pass').value = '';
+  document.getElementById('u-pass').placeholder = 'оставь пустым, чтобы не менять';
+  document.getElementById('u-role').value = u.role;
+  renderUserBots(u.bot_ids || []);
+  document.getElementById('user-form').classList.remove('hidden');
+}
+
+async function saveUser() {
+  const body = {
+    login: document.getElementById('u-login').value.trim(),
+    name: document.getElementById('u-name').value.trim(),
+    password: document.getElementById('u-pass').value || null,
+    role: document.getElementById('u-role').value,
+    bot_ids: [...document.querySelectorAll('#u-bots .pill.on')].map(p => +p.dataset.id),
+    is_active: true,
+  };
+  if (EDIT_USER_ID) await api('/users/' + EDIT_USER_ID, { method: 'PUT', body });
+  else await api('/users', { method: 'POST', body });
+  hideUserForm();
+  loadUsers();
+}
+
+async function deleteUser(id) {
+  if (!confirm('Удалить пользователя?')) return;
+  await api('/users/' + id, { method: 'DELETE' });
+  loadUsers();
+}
+
+// ---------- теги ----------
+async function loadTags(fillFilters = false) {
+  TAGS = await api('/tags');
+}
+async function loadTagsPage() {
+  await loadTags();
+  document.getElementById('tags-list').innerHTML = `<table>
+    <tr><th>Тег</th><th>Подписчиков</th><th></th></tr>
+    ${TAGS.map(t => `<tr><td>${esc(t.name)}</td><td>${t.count}</td>
+      <td><button class="btn danger" onclick="deleteTag(${t.id})">Удалить</button></td></tr>`).join('')}
+  </table>`;
+}
+async function createTag() {
+  const name = document.getElementById('new-tag-name').value.trim();
+  if (!name) return;
+  await api('/tags', { method: 'POST', body: { name } });
+  document.getElementById('new-tag-name').value = '';
+  loadTagsPage();
+}
+async function deleteTag(id) {
+  if (!confirm('Удалить тег?')) return;
+  await api('/tags/' + id, { method: 'DELETE' });
+  loadTagsPage();
+}
+
+// ---------- подписчики + сегмент ----------
+let SEG_BUILDER = null;
+let SEG_APPLIED = null;  // применённый фильтр сегмента (или null)
+
+function currentSubFilter() {
+  const botId = +document.getElementById('sub-bot-filter').value || null;
+  const search = document.getElementById('sub-search').value.trim();
+  let filter = SEG_APPLIED ? JSON.parse(JSON.stringify(SEG_APPLIED)) : { match: 'all', conditions: [] };
+  // строка поиска добавляется как доп. условие «имя содержит» (И)
+  if (search) {
+    filter = { match: 'all', active_24h: filter.active_24h,
+      conditions: [...(filter.conditions || []), { field: 'name', op: 'contains', value: search }] };
+  }
+  return { bot_id: botId, filter };
+}
+
+async function loadSubscribers() {
+  let res;
+  try {
+    const body = currentSubFilter();
+    res = await api('/subscribers/search', { method: 'POST', body: { ...body, limit: 500 } });
+  } catch (e) {
+    document.getElementById('subscribers-list').innerHTML =
+      `<div class="panel" style="color:#d33">Не удалось загрузить подписчиков: ${esc(e.message || e)}. Обновите страницу (Cmd+Shift+R).</div>`;
+    return;
+  }
+  const subs = res.subscribers;
+  document.getElementById('subscribers-list').innerHTML = `
+    <div class="list-meta">Найдено: <b>${res.total}</b>${res.total > subs.length ? ` (показаны первые ${subs.length})` : ''}</div>
+    <table>
+    <tr><th>Имя</th><th>Username</th><th>Язык</th><th>Активность</th><th>Статус</th><th>Теги</th><th></th></tr>
+    ${subs.map(s => `<tr>
+      <td><a href="#" onclick="openChat(${s.id});return false"><b>${esc(s.first_name || '')} ${esc(s.last_name || '')}</b></a></td>
+      <td>${s.username ? '@' + esc(s.username) : '—'}</td>
+      <td>${esc(s.language_code || '—')}</td>
+      <td>${s.last_active_at ? new Date(s.last_active_at + 'Z').toLocaleDateString('ru') : '—'}</td>
+      <td>${s.is_active ? '<span class="status-active">активен</span>' : '<span class="status-off">блок</span>'}</td>
+      <td>${s.tags.map(t => `<span class="pill">${esc(t.name)}<span class="x" onclick="removeSubTag(${s.id},${t.id})">✕</span></span>`).join('')}</td>
+      <td><select onchange="addSubTag(${s.id}, this.value); this.value=''">
+        <option value="">+ тег</option>
+        ${TAGS.map(t => `<option value="${t.id}">${esc(t.name)}</option>`).join('')}
+      </select></td>
+    </tr>`).join('')}
+  </table>`;
+}
+
+async function toggleSegPanel() {
+  const panel = document.getElementById('seg-panel');
+  const willShow = panel.classList.contains('hidden');
+  panel.classList.toggle('hidden');
+  if (willShow && !SEG_BUILDER) {
+    await loadSegFields();
+    SEG_BUILDER = makeSegment(document.getElementById('seg-builder'));
+  }
+}
+async function applySegment() {
+  SEG_APPLIED = SEG_BUILDER.getFilter();
+  await loadSubscribers();
+  // показать точное число совпадений сегмента (без учёта строки поиска)
+  const botId = +document.getElementById('sub-bot-filter').value || null;
+  const r = await api('/subscribers/search', { method: 'POST', body: { bot_id: botId, filter: SEG_APPLIED, count_only: true } });
+  document.getElementById('seg-count').textContent = `Подходит под сегмент: ${r.total}`;
+}
+function resetSegment() {
+  if (SEG_BUILDER) SEG_BUILDER.reset();
+  SEG_APPLIED = null;
+  document.getElementById('seg-count').textContent = '';
+  loadSubscribers();
+}
+async function addSubTag(subId, tagId) {
+  if (!tagId) return;
+  await api(`/subscribers/${subId}/tags`, { method: 'POST', body: { tag_id: +tagId } });
+  loadSubscribers();
+}
+async function removeSubTag(subId, tagId) {
+  await api(`/subscribers/${subId}/tags/${tagId}`, { method: 'DELETE' });
+  loadSubscribers();
+}
+
+// ---------- воронки: список ----------
+const TRIGGER_LABEL = { start: '/start', keyword: 'слово', tag_added: 'тег', message: 'сообщение' };
+async function loadFunnels() {
+  const funnels = await api('/funnels');
+  document.getElementById('funnels-list').innerHTML = funnels.length ? `<table>
+    <tr><th>Название</th><th>Триггер</th><th>Боты</th><th>Статус</th><th>Запусков</th><th></th></tr>
+    ${funnels.map(f => `<tr>
+      <td><a href="#" onclick="openEditor(${f.id});return false"><b>${esc(f.name)}</b></a></td>
+      <td>${TRIGGER_LABEL[f.trigger_type] || f.trigger_type}${f.trigger_value ? ': ' + esc(f.trigger_value) : ''}</td>
+      <td>${(f.bots && f.bots.length) ? f.bots.map(b => `<span class="pill">${esc(b)}</span>`).join('') : '<span style="color:#c33;font-size:12px">не назначена</span>'}</td>
+      <td>${f.is_active ? '<span class="status-active">включена</span>' : '<span class="status-off">выключена</span>'}</td>
+      <td>${f.runs}</td>
+      <td>
+        <button class="btn" onclick="toggleFunnel(${f.id})">${f.is_active ? 'Выключить' : 'Включить'}</button>
+        <button class="btn danger" onclick="deleteFunnel(${f.id})">Удалить</button>
+      </td>
+    </tr>`).join('')}
+  </table>` : '<div class="panel">Пока нет воронок — создайте первую.</div>';
+}
+async function createFunnel() {
+  const r = await api('/funnels', { method: 'POST', body: { name: 'Новая воронка', graph_ui: {} } });
+  openEditor(r.id);
+}
+async function toggleFunnel(id) { await api(`/funnels/${id}/toggle`, { method: 'POST' }); loadFunnels(); }
+async function deleteFunnel(id) {
+  if (!confirm('Удалить воронку?')) return;
+  await api('/funnels/' + id, { method: 'DELETE' });
+  loadFunnels();
+}
+
+// ---------- рассылки ----------
+let BC_SEG = null;
+let BC_MEDIA = null;
+async function showBroadcastForm() {
+  await loadTags();
+  await loadSegFields();
+  const bots = await api('/bots');
+  const botSel = document.getElementById('bc-bot');
+  botSel.innerHTML = bots.length
+    ? bots.map(b => `<option value="${b.id}">${esc(b.name)} (${b.subscribers} подписчиков)</option>`).join('')
+    : '<option value="">нет ботов</option>';
+  BC_SEG = makeSegment(document.getElementById('bc-segment'));
+  BC_MEDIA = mountMediaUploader(document.getElementById('bc-media'), []);
+  document.getElementById('bc-count').textContent = '';
+  document.getElementById('broadcast-form').classList.remove('hidden');
+}
+function hideBroadcastForm() { document.getElementById('broadcast-form').classList.add('hidden'); }
+async function countBroadcast() {
+  const botId = +document.getElementById('bc-bot').value;
+  if (!botId) { alert('Выберите бота'); return; }
+  const r = await api('/subscribers/search', { method: 'POST',
+    body: { bot_id: botId, filter: BC_SEG.getFilter(), count_only: true } });
+  document.getElementById('bc-count').textContent = `Получателей: ${r.total}`;
+}
+async function sendBroadcast() {
+  const botId = +document.getElementById('bc-bot').value;
+  if (!botId) { alert('Выберите бота'); return; }
+  const body = {
+    bot_id: botId,
+    name: document.getElementById('bc-name').value || 'Рассылка',
+    text: document.getElementById('bc-text').value,
+    media: BC_MEDIA ? BC_MEDIA.getItems() : [],
+    segment: BC_SEG.getFilter(),
+  };
+  if (!body.text.trim() && !body.media.length) { alert('Добавьте текст или вложение'); return; }
+  if (!confirm('Запустить рассылку?')) return;
+  await api('/broadcasts', { method: 'POST', body });
+  hideBroadcastForm();
+  document.getElementById('bc-text').value = '';
+  loadBroadcasts();
+}
+const BC_STATUS = { pending: 'в очереди', running: 'отправляется', done: 'завершена', failed: 'ошибка' };
+async function loadBroadcasts() {
+  const bcs = await api('/broadcasts');
+  document.getElementById('broadcasts-list').innerHTML = bcs.length ? `<table>
+    <tr><th>Название</th><th>Бот</th><th>Статус</th><th>Прогресс</th><th>Дата</th></tr>
+    ${bcs.map(b => {
+      const pct = b.total ? Math.round(100 * (b.sent + b.failed) / b.total) : 0;
+      return `<tr>
+        <td><b>${esc(b.name)}</b><br><span style="color:#7a8499;font-size:12px">${esc(b.text.slice(0, 60))}…</span></td>
+        <td>${esc(b.bot || '—')}</td>
+        <td>${BC_STATUS[b.status] || b.status}</td>
+        <td>${b.sent}/${b.total}${b.failed ? ` (не дошло: ${b.failed})` : ''}
+          <div class="progress"><i style="width:${pct}%"></i></div></td>
+        <td>${new Date(b.created_at + 'Z').toLocaleString('ru')}</td>
+      </tr>`;
+    }).join('')}
+  </table>` : '<div class="panel">Рассылок ещё не было.</div>';
+  // автообновление, пока есть активные
+  if (bcs.some(b => b.status === 'running' || b.status === 'pending')) {
+    clearTimeout(window._bcTimer);
+    window._bcTimer = setTimeout(() => {
+      if (!document.getElementById('page-broadcasts').classList.contains('hidden')) loadBroadcasts();
+    }, 3000);
+  }
+}
+
+// ---------- AI ----------
+const AI_DEFAULT_MODELS = { anthropic: 'claude-sonnet-4-5', openai: 'gpt-4o' };
+
+async function loadAIPage() {
+  const s = await api('/ai/settings');
+  document.getElementById('ai-provider').value = s.provider;
+  document.getElementById('ai-model').value = s.model || '';
+  document.getElementById('ai-key-hint').textContent =
+    s.has_key ? `(сохранён: ${s.key_hint})` : '(не задан)';
+  loadAIUsage();
+}
+function aiProviderChanged() {
+  document.getElementById('ai-model').value =
+    AI_DEFAULT_MODELS[document.getElementById('ai-provider').value] || '';
+}
+async function saveAISettings() {
+  const key = document.getElementById('ai-key').value.trim();
+  await api('/ai/settings', { method: 'PUT', body: {
+    provider: document.getElementById('ai-provider').value,
+    model: document.getElementById('ai-model').value.trim() || null,
+    api_key: key || null,
+  }});
+  document.getElementById('ai-key').value = '';
+  alert('Сохранено ✅');
+  loadAIPage();
+}
+async function aiGenerate() {
+  const spec = document.getElementById('ai-spec').value.trim();
+  if (!spec) { alert('Вставь ТЗ'); return; }
+  const btn = document.getElementById('ai-generate-btn');
+  const status = document.getElementById('ai-status');
+  btn.disabled = true;
+  status.textContent = 'Генерирую… (обычно 20–60 сек)';
+  try {
+    const r = await api('/ai/generate', { method: 'POST', body: { spec_text: spec } });
+    status.textContent = `Готово: «${r.name}» (${r.input_tokens}+${r.output_tokens} токенов)`;
+    if (confirm(`Воронка «${r.name}» собрана (выключена). Открыть в редакторе?`)) {
+      openEditor(r.funnel_id);
+    }
+  } catch (e) {
+    status.textContent = 'Ошибка — детали в алерте';
+  } finally {
+    btn.disabled = false;
+    loadAIUsage();
+  }
+}
+async function aiUploadDocx(input) {
+  const file = input.files[0];
+  if (!file) return;
+  input.value = '';
+  const status = document.getElementById('ai-status');
+  status.textContent = 'Читаю документ…';
+  const fd = new FormData();
+  fd.append('file', file);
+  try {
+    const r = await fetch('/api/ai/extract_docx', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + TOKEN },
+      body: fd,
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.detail || 'Ошибка чтения файла');
+    document.getElementById('ai-spec').value = data.text;
+    status.textContent = `Загружено: ${file.name} (${data.chars.toLocaleString('ru')} симв.`
+      + (data.images ? `, картинок: ${data.images}` : '')
+      + `). Проверь текст и жми «Собрать воронку».`;
+  } catch (e) {
+    status.textContent = '';
+    alert(e.message);
+  }
+}
+
+async function loadAIUsage() {
+  const u = await api('/ai/usage');
+  document.getElementById('ai-usage').innerHTML = `
+    <div class="cards" style="margin-bottom:14px">
+      <div class="card"><div class="num">${u.requests}</div><div class="lbl">Запросов</div></div>
+      <div class="card"><div class="num">${u.input_tokens.toLocaleString('ru')}</div><div class="lbl">Входных токенов</div></div>
+      <div class="card"><div class="num">${u.output_tokens.toLocaleString('ru')}</div><div class="lbl">Выходных токенов</div></div>
+    </div>` + (u.recent.length ? `<table>
+      <tr><th>Дата</th><th>Модель</th><th>Токены</th><th>Результат</th></tr>
+      ${u.recent.map(r => `<tr>
+        <td>${new Date(r.created_at + 'Z').toLocaleString('ru')}</td>
+        <td>${esc(r.model)}</td>
+        <td>${r.input_tokens}+${r.output_tokens}</td>
+        <td>${r.status === 'ok'
+          ? (r.funnel_id ? `<a href="#" onclick="openEditor(${r.funnel_id});return false">воронка #${r.funnel_id}</a>` : 'ок')
+          : `<span style="color:#d33" title="${esc(r.error || '')}">ошибка</span>`}</td>
+      </tr>`).join('')}
+    </table>` : '');
+}
+
+// ---------- живой чат ----------
+let CHAT_SUB = null;
+let CHAT_TIMER = null;
+let CHAT_LAST_COUNT = -1;
+
+async function openChat(subId) {
+  CHAT_SUB = subId;
+  CHAT_LAST_COUNT = -1;
+  CHAT_MEDIA = [];
+  renderChatAttachments();
+  setupChatDropzone();
+  if (!TAGS.length) await loadTags();
+  document.getElementById('chat-overlay').classList.remove('hidden');
+  document.getElementById('chat-drawer').classList.remove('hidden');
+  await refreshChatInfo();
+  await refreshChatMessages();
+  clearInterval(CHAT_TIMER);
+  CHAT_TIMER = setInterval(() => { refreshChatMessages(); }, 4000);
+}
+function closeChat() {
+  clearInterval(CHAT_TIMER);
+  CHAT_SUB = null;
+  document.getElementById('chat-overlay').classList.add('hidden');
+  document.getElementById('chat-drawer').classList.add('hidden');
+  if (!document.getElementById('page-subscribers').classList.contains('hidden')) loadSubscribers();
+  if (!document.getElementById('page-bot').classList.contains('hidden') && typeof botLoadSubs === 'function') botLoadSubs();
+}
+
+async function refreshChatInfo() {
+  const s = await api('/subscribers/' + CHAT_SUB);
+  document.getElementById('chat-name').textContent =
+    `${s.first_name || ''} ${s.last_name || ''}`.trim() || 'Подписчик';
+  document.getElementById('chat-username').textContent = s.username ? '@' + s.username : '';
+
+  const paused = s.paused_until && new Date(s.paused_until + 'Z') > new Date();
+  document.getElementById('chat-info').innerHTML = `
+    <div class="chat-info-row"><span>Статус</span><b>${s.is_active ? 'Подписан' : 'Заблокировал'}</b></div>
+    <div class="chat-info-row"><span>Добавлен</span><b>${new Date(s.created_at + 'Z').toLocaleString('ru')}</b></div>
+    <div class="chat-info-row"><span>Активность</span><b>${s.last_active_at ? new Date(s.last_active_at + 'Z').toLocaleString('ru') : '—'}</b></div>
+    <div class="chat-info-row"><span>Язык</span><b>${esc(s.language_code || '—')}</b></div>
+    <div class="chat-info-row"><span>Метка (последняя)</span><b>${esc(s.source || '—')}</b></div>
+    ${s.first_source && s.first_source !== s.source
+      ? `<div class="chat-info-row"><span>Первая метка</span><b>${esc(s.first_source)}</b></div>` : ''}
+    ${Object.entries(s.params || {}).map(([k, v]) =>
+      `<div class="chat-info-row"><span>param ${esc(k)}</span><b>${esc(v)}</b></div>`).join('')}
+    <div class="chat-info-row"><span>Бот</span><b>${esc(s.bot_name)} ${s.bot_running ? '🟢' : '🔴'}</b></div>`;
+
+  document.getElementById('chat-pause-state').textContent = paused
+    ? `на паузе до ${new Date(s.paused_until + 'Z').toLocaleTimeString('ru')}` : 'не на паузе';
+
+  // теги подписчика
+  document.getElementById('chat-tags').innerHTML = s.tags.length
+    ? s.tags.map(t => `<span class="pill">${esc(t.name)}<span class="x" onclick="chatRemoveTag(${t.id})">✕</span></span>`).join('')
+    : '<span style="color:#99a;font-size:12px">нет тегов</span>';
+  document.getElementById('chat-add-tag').innerHTML = '<option value="">+ добавить тег</option>' +
+    TAGS.filter(t => !s.tags.some(x => x.id === t.id)).map(t => `<option value="${t.id}">${esc(t.name)}</option>`).join('');
+
+  // воронки для ручного запуска
+  if (!document.getElementById('chat-flow').options.length) {
+    const funnels = await api('/funnels');
+    document.getElementById('chat-flow').innerHTML = '<option value="">выбрать…</option>' +
+      funnels.map(f => `<option value="${f.id}">${esc(f.name)}</option>`).join('');
+  }
+}
+
+async function refreshChatMessages() {
+  if (CHAT_SUB == null) return;
+  const msgs = await api(`/subscribers/${CHAT_SUB}/messages`);
+  if (msgs.length === CHAT_LAST_COUNT) return;  // без изменений — не перерисовываем
+  CHAT_LAST_COUNT = msgs.length;
+  const box = document.getElementById('chat-messages');
+  box.innerHTML = msgs.map(m => {
+    const cls = m.direction === 'in' ? 'in' : (m.is_operator ? 'out op' : 'out');
+    const who = m.direction === 'in' ? '' : (m.is_operator ? 'оператор' : 'бот');
+    return `<div class="msg ${cls}">
+      <div class="msg-bubble">${esc(m.text)}</div>
+      <div class="msg-meta">${who ? who + ' · ' : ''}${new Date(m.created_at + 'Z').toLocaleTimeString('ru', {hour:'2-digit',minute:'2-digit'})}</div>
+    </div>`;
+  }).join('') || '<div class="chat-empty">Переписки пока нет.</div>';
+  box.scrollTop = box.scrollHeight;
+}
+
+// --- вложения в чате оператора ---
+let CHAT_MEDIA = [];
+const CHAT_ICON = { video: '🎬', audio: '🎵', voice: '🎤', video_note: '⭕️', document: '📎' };
+
+function chatPickFiles(input) {
+  if (input.files.length) chatUploadFiles([...input.files]);
+  input.value = '';
+}
+
+async function chatUploadFiles(files) {
+  const box = document.getElementById('chat-attachments');
+  box.classList.remove('hidden');
+  for (const file of files) {
+    const fd = new FormData();
+    fd.append('file', file, file.name || 'pasted.png');
+    try {
+      const r = await fetch('/api/media/upload', {
+        method: 'POST', headers: { 'Authorization': 'Bearer ' + TOKEN }, body: fd,
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.detail || 'Ошибка загрузки');
+      CHAT_MEDIA.push({ type: data.kind, path: data.path, name: data.name });
+    } catch (e) { alert(e.message); }
+  }
+  renderChatAttachments();
+}
+
+function renderChatAttachments() {
+  const box = document.getElementById('chat-attachments');
+  if (!CHAT_MEDIA.length) { box.classList.add('hidden'); box.innerHTML = ''; return; }
+  box.classList.remove('hidden');
+  box.innerHTML = CHAT_MEDIA.map((m, i) => {
+    const thumb = m.type === 'photo'
+      ? `<img src="/${esc(m.path)}" alt="">`
+      : `<span class="ca-icon">${CHAT_ICON[m.type] || '📎'}</span>`;
+    return `<div class="chat-att">${thumb}
+      <span class="ca-name">${esc((m.name || '').slice(0, 18))}</span>
+      <button class="ca-del" onclick="chatRemoveAttachment(${i})">✕</button></div>`;
+  }).join('');
+}
+function chatRemoveAttachment(i) { CHAT_MEDIA.splice(i, 1); renderChatAttachments(); }
+
+// перетаскивание файлов в окно чата и вставка картинки из буфера
+let _chatDropReady = false;
+function setupChatDropzone() {
+  if (_chatDropReady) return;
+  _chatDropReady = true;
+  const drawer = document.getElementById('chat-drawer');
+  drawer.addEventListener('dragover', e => { e.preventDefault(); drawer.classList.add('drop-hint'); });
+  drawer.addEventListener('dragleave', e => {
+    if (!drawer.contains(e.relatedTarget)) drawer.classList.remove('drop-hint');
+  });
+  drawer.addEventListener('drop', e => {
+    e.preventDefault(); drawer.classList.remove('drop-hint');
+    if (e.dataTransfer.files.length) chatUploadFiles([...e.dataTransfer.files]);
+  });
+  document.getElementById('chat-text').addEventListener('paste', e => {
+    const imgs = [...(e.clipboardData.items || [])]
+      .filter(i => i.type.startsWith('image/')).map(i => i.getAsFile());
+    if (imgs.length) { e.preventDefault(); chatUploadFiles(imgs); }
+  });
+}
+
+async function sendChatMessage() {
+  const ta = document.getElementById('chat-text');
+  const text = ta.value.trim();
+  const media = CHAT_MEDIA.slice();
+  if (!text && !media.length) return;
+  ta.value = '';
+  CHAT_MEDIA = [];
+  renderChatAttachments();
+  try {
+    await api(`/subscribers/${CHAT_SUB}/send`, { method: 'POST', body: { text, media } });
+    await refreshChatMessages();
+  } catch (e) {
+    ta.value = text;
+    CHAT_MEDIA = media;
+    renderChatAttachments();
+  }
+}
+async function chatPause(minutes) {
+  await api(`/subscribers/${CHAT_SUB}/pause`, { method: 'POST', body: { minutes } });
+  refreshChatInfo();
+}
+async function chatStartFlow() {
+  const fid = +document.getElementById('chat-flow').value;
+  if (!fid) return;
+  await api(`/subscribers/${CHAT_SUB}/start_flow`, { method: 'POST', body: { funnel_id: fid } });
+  setTimeout(refreshChatMessages, 500);
+}
+async function chatAddTag(tagId) {
+  if (!tagId) return;
+  await api(`/subscribers/${CHAT_SUB}/tags`, { method: 'POST', body: { tag_id: +tagId } });
+  refreshChatInfo();
+}
+async function chatRemoveTag(tagId) {
+  await api(`/subscribers/${CHAT_SUB}/tags/${tagId}`, { method: 'DELETE' });
+  refreshChatInfo();
+}
+
+// ---------- старт ----------
+// ждём загрузки всех скриптов (dashboard.js, bot.js и т.д.)
+window.addEventListener('load', async function init() {
+  if (!TOKEN) { showLogin(); return; }
+  try {
+    ME = await api('/auth/me');
+    applyRoleUI();
+    showApp();
+  } catch { /* показан логин */ }
+});

@@ -1,0 +1,74 @@
+# Боевая конфигурация: HTTPS (сертификат выпускается автоматически),
+# автозапуск после перезагрузки сервера, ежедневные бэкапы базы.
+#
+# Запуск:  docker compose -f docker-compose.prod.yml up -d --build
+services:
+  db:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: sendbot
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-sendbot}
+      POSTGRES_DB: sendbot
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sendbot"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build: ./backend
+    restart: always
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://sendbot:${DB_PASSWORD:-sendbot}@db:5432/sendbot
+      MEDIA_DIR: /app/media
+      HISTORY_RETENTION_DAYS: ${HISTORY_RETENTION_DAYS:-0}
+    volumes:
+      - media:/app/media
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # Caddy сам получает и продлевает бесплатный SSL-сертификат Let's Encrypt
+  caddy:
+    image: caddy:2-alpine
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - app
+
+  # Ежедневный бэкап базы в 03:00, хранится 14 последних копий
+  backup:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      PGPASSWORD: ${DB_PASSWORD:-sendbot}
+    volumes:
+      - ./backups:/backups
+    depends_on:
+      db:
+        condition: service_healthy
+    entrypoint: >
+      sh -c 'while true; do
+        sleep $$(( ( $$(date -d "tomorrow 03:00" +%s) - $$(date +%s) ) % 86400 ));
+        f=/backups/sendbot-$$(date +%Y%m%d-%H%M).sql.gz;
+        pg_dump -h db -U sendbot sendbot | gzip > $$f && echo "backup: $$f";
+        ls -1t /backups/*.sql.gz | tail -n +15 | xargs -r rm --;
+      done'
+
+volumes:
+  pgdata:
+  media:
+  caddy_data:
+  caddy_config:

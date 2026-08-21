@@ -1,0 +1,9 @@
+fastapi>=0.111
+uvicorn[standard]>=0.30
+aiogram>=3.7
+SQLAlchemy[asyncio]>=2.0
+asyncpg>=0.29
+aiosqlite>=0.20
+pydantic>=2.7
+python-docx>=1.1
+python-multipart>=0.0.9
