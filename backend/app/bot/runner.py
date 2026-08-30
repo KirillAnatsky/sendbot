@@ -9,7 +9,7 @@ import logging
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import CallbackQuery, Message
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from ..config import settings
 from ..db import SessionLocal
@@ -335,8 +335,14 @@ async def broadcast_loop(mgr: BotManager):
         await asyncio.sleep(3)
         try:
             async with SessionLocal() as session:
+                # «running» здесь означает рассылку, которую оборвал рестарт:
+                # цикл последовательный, сам себя он обогнать не может.
+                # Такие доделываем в первую очередь, с места обрыва.
                 res = await session.execute(
-                    select(Broadcast).where(Broadcast.status == "pending").limit(1)
+                    select(Broadcast)
+                    .where(Broadcast.status.in_(("running", "pending")))
+                    .order_by(Broadcast.status != "running", Broadcast.id)
+                    .limit(1)
                 )
                 bc = res.scalar_one_or_none()
                 if bc is None:
@@ -460,8 +466,10 @@ async def _process_broadcast(session, bot, bc: Broadcast):
             q = q.where(Subscriber.id.notin_(
                 select(SubscriberTag.subscriber_id).where(SubscriberTag.tag_id.in_(exclude))))
 
-    subs = (await session.execute(q)).scalars().all()
-    bc.total = len(subs)
+    # Размер аудитории берём COUNT'ом, а не длиной списка: на 400 тысячах
+    # `.all()` притащил бы в память все объекты подписчиков разом.
+    bc.total = (await session.execute(
+        select(func.count()).select_from(q.subquery()))).scalar() or 0
     await session.commit()
 
     # медиа: новый формат bc.media, иначе одиночное photo_url (обратная совместимость)
@@ -469,14 +477,41 @@ async def _process_broadcast(session, bot, bc: Broadcast):
     if not media and bc.photo_url:
         media = [{"type": "photo", "path": bc.photo_url}]
 
+    # Если рассылку оборвал рестарт — продолжаем с места обрыва. Идём строго
+    # по возрастанию id, поэтому максимальный уже записанный получатель и есть
+    # граница: всё до него разослано.
+    last_id = (await session.execute(
+        select(func.max(BroadcastRecipient.subscriber_id))
+        .where(BroadcastRecipient.broadcast_id == bc.id))).scalar() or 0
+    if last_id:
+        log.info("Рассылка «%s»: продолжаю после обрыва, с подписчика #%s", bc.name, last_id)
+
     delay = 1.0 / max(settings.broadcast_rate, 1.0)
-    for sub in subs:
-        ok = await send_message_content(bot, session, sub, bc.text, media, None)
-        bc.sent += 1 if ok else 0
-        bc.failed += 0 if ok else 1
-        session.add(BroadcastRecipient(broadcast_id=bc.id, subscriber_id=sub.id, delivered=ok))
+    PAGE = 500          # сколько подписчиков достаём из базы за раз
+    COMMIT_EVERY = 50   # как часто фиксируем прогресс (а не после каждого письма)
+    since_commit = 0
+
+    while True:
+        chunk = (await session.execute(
+            q.where(Subscriber.id > last_id).order_by(Subscriber.id).limit(PAGE)
+        )).scalars().all()
+        if not chunk:
+            break
+        for sub in chunk:
+            last_id = sub.id
+            ok = await send_message_content(bot, session, sub, bc.text, media, None)
+            bc.sent += 1 if ok else 0
+            bc.failed += 0 if ok else 1
+            session.add(BroadcastRecipient(
+                broadcast_id=bc.id, subscriber_id=sub.id, delivered=ok))
+            since_commit += 1
+            if since_commit >= COMMIT_EVERY:
+                await session.commit()
+                since_commit = 0
+            await asyncio.sleep(delay)
         await session.commit()
-        await asyncio.sleep(delay)
+        since_commit = 0
+
     bc.status = "done"
     log.info("Рассылка «%s» завершена: отправлено %s, не доставлено %s (всего %s)",
              bc.name, bc.sent, bc.failed, bc.total)
