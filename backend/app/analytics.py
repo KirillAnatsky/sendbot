@@ -84,6 +84,7 @@ def _fill(rows, days_list):
 
 _CACHE: dict = {}
 _CACHE_TTL = 45.0  # сек — дашборд не обязан быть посекундно свежим
+_INFLIGHT: dict = {}   # ключ -> задача, которая прямо сейчас его считает
 
 
 def invalidate_analytics_cache() -> None:
@@ -123,13 +124,31 @@ async def build_analytics(
     if hit and (time.monotonic() - hit[0]) < _CACHE_TTL:
         return hit[1]
 
-    data = await _build_analytics(session, days, bot_id, language, source, tag_id,
-                                  allowed_bots)
+    # Кэша мало: когда дашборд открывают несколько человек сразу, все они
+    # промахиваются одновременно и каждый запускает свой полный пересчёт —
+    # а это восемь параллельных запросов к базе на каждого. Считаем один раз,
+    # остальные ждут тот же результат.
+    task = _INFLIGHT.get(key)
+    if task is None:
+        async def _build_once():
+            from .db import SessionLocal
+            try:
+                # своя сессия: ждущие переживут отключение того, кто начал счёт
+                async with SessionLocal() as own:
+                    data = await _build_analytics(own, days, bot_id, language,
+                                                  source, tag_id, allowed_bots)
+                if len(_CACHE) > 64:
+                    _CACHE.clear()
+                _CACHE[key] = (time.monotonic(), data)
+                return data
+            finally:
+                _INFLIGHT.pop(key, None)
 
-    if len(_CACHE) > 64:
-        _CACHE.clear()
-    _CACHE[key] = (time.monotonic(), data)
-    return data
+        task = asyncio.create_task(_build_once())
+        _INFLIGHT[key] = task
+
+    # shield: если один клиент отвалился, счёт для остальных не отменяется
+    return await asyncio.shield(task)
 
 
 async def _build_analytics(

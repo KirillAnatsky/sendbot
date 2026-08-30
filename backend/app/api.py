@@ -762,16 +762,7 @@ async def list_subscribers(
         )
     subs = (await session.execute(q.limit(500))).scalars().all()
 
-    st = (
-        await session.execute(
-            select(SubscriberTag.subscriber_id, Tag.id, Tag.name).join(
-                Tag, Tag.id == SubscriberTag.tag_id
-            )
-        )
-    ).all()
-    tag_map: dict[int, list] = {}
-    for sub_id, tid, tname in st:
-        tag_map.setdefault(sub_id, []).append({"id": tid, "name": tname})
+    tag_map = await _tags_of(session, [s.id for s in subs])
 
     return [
         {
@@ -999,6 +990,28 @@ class SegmentSearchIn(BaseModel):
     count_only: bool = False
 
 
+async def _tags_of(session, sub_ids: list[int]) -> dict[int, list]:
+    """Теги только для перечисленных подписчиков.
+
+    Раньше здесь выбиралась ВСЯ таблица связок «подписчик — тег» и уже в
+    питоне из неё брались нужные пятьсот строк. На пустой базе незаметно, на
+    сотне тысяч подписчиков это сотни тысяч строк на КАЖДЫЙ запрос списка —
+    и, поскольку приложение однопроцессное, каждый такой запрос вставал
+    поперёк всех остальных.
+    """
+    if not sub_ids:
+        return {}
+    rows = (await session.execute(
+        select(SubscriberTag.subscriber_id, Tag.id, Tag.name)
+        .join(Tag, Tag.id == SubscriberTag.tag_id)
+        .where(SubscriberTag.subscriber_id.in_(sub_ids))
+    )).all()
+    out: dict[int, list] = {}
+    for sub_id, tid, tname in rows:
+        out.setdefault(sub_id, []).append({"id": tid, "name": tname})
+    return out
+
+
 @router.post("/subscribers/search", dependencies=[Depends(require("subscribers", "view"))])
 async def subscribers_search(body: SegmentSearchIn, user=Depends(current_user),
                              session=Depends(get_session)):
@@ -1018,16 +1031,7 @@ async def subscribers_search(body: SegmentSearchIn, user=Depends(current_user),
     subs = (await session.execute(
         q.order_by(Subscriber.created_at.desc()).limit(body.limit)
     )).scalars().all()
-    st = (
-        await session.execute(
-            select(SubscriberTag.subscriber_id, Tag.id, Tag.name).join(
-                Tag, Tag.id == SubscriberTag.tag_id
-            )
-        )
-    ).all()
-    tag_map: dict[int, list] = {}
-    for sub_id, tid, tname in st:
-        tag_map.setdefault(sub_id, []).append({"id": tid, "name": tname})
+    tag_map = await _tags_of(session, [s.id for s in subs])
     return {
         "total": total,
         "subscribers": [
