@@ -69,9 +69,16 @@ services:
       PGHOST: ${DB_HOST:-db}
     volumes:
       - ./backups:/backups
+    # BusyBox (образ alpine) не понимает date -d "tomorrow 03:00" — раньше
+    # выражение схлопывалось в ноль и дамп снимался каждую минуту, круглые
+    # сутки нагружая базу. Считаем секунды до 03:00 UTC арифметикой по
+    # epoch: остаток от деления на 86400 — это и есть время от полуночи.
     entrypoint: >
       sh -c 'while true; do
-        sleep $$(( ( $$(date -d "tomorrow 03:00" +%s) - $$(date +%s) ) % 86400 ));
+        wait=$$(( (10800 - $$(date +%s) % 86400 + 86400) % 86400 ));
+        [ $$wait -lt 60 ] && wait=$$(( wait + 86400 ));
+        echo "next backup in $$wait s";
+        sleep $$wait;
         f=/backups/sendbot-$$(date +%Y%m%d-%H%M).sql.gz;
         pg_dump -h $$PGHOST -U sendbot sendbot | gzip > $$f && echo "backup: $$f";
         ls -1t /backups/*.sql.gz | tail -n +15 | xargs -r rm --;

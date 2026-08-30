@@ -236,14 +236,27 @@ async def run_benchmarks(session, bots, tags, funnel, n_subs):
     session.add(bc)
     await session.flush()
 
-    async def write_recipients():
-        rows = [BroadcastRecipient(broadcast_id=bc.id, subscriber_id=i + 1, delivered=True)
-                for i in range(1000)]
-        session.add_all(rows)
-        await session.commit()
-        return 1000
+    # Берём РЕАЛЬНЫЕ id подписчиков, а не 1..1000. После любой чистки базы
+    # нумерация начинается не с единицы, и вставка падала по внешнему ключу.
+    sub_ids = (await session.execute(
+        select(Subscriber.id)
+        .where(Subscriber.bot_id.in_([b.id for b in bots]))
+        .limit(1000)
+    )).scalars().all()
 
-    rec_ms = await t.measure("Запись 1000 получателей рассылки", write_recipients, runs=2)
+    async def write_recipients():
+        session.add_all([
+            BroadcastRecipient(broadcast_id=bc.id, subscriber_id=sid, delivered=True)
+            for sid in sub_ids
+        ])
+        await session.commit()
+        return len(sub_ids)
+
+    rec_ms = await t.measure(
+        f"Запись {len(sub_ids)} получателей рассылки", write_recipients, runs=2)
+    # приводим к «на 1000 штук», как ждёт экстраполяция
+    if sub_ids:
+        rec_ms = rec_ms * 1000 / len(sub_ids)
 
     return {
         "subscribers": total,
