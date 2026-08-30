@@ -113,6 +113,10 @@ async def advance(
             has = await _has_tag(session, sub.id, data["tag"])
             node_id = next_node(graph, node_id, "output_1" if has else "output_2")
 
+        elif ntype == "language":
+            # авто-роутинг по языку Telegram-профиля: юзера ни о чём не спрашиваем
+            node_id = next_node(graph, node_id, _language_port(data, sub))
+
         elif ntype == "action":
             if data["op"] == "add_tag":
                 await _add_tag(session, sub.id, data["tag"])
@@ -133,6 +137,25 @@ async def advance(
         if pending.first() is None:
             run.status = "done"
     await session.flush()
+
+
+def _language_port(data: dict, sub: Subscriber) -> str:
+    """Порт ветки, чей язык совпал с language_code подписчика.
+
+    В ветке можно перечислить несколько кодов через запятую («ru, uk, be»).
+    Сравниваем и точно, и по основному подтегу: подписчик «pt-br» попадает
+    в ветку «pt». Ничего не совпало (или язык неизвестен) — output_1
+    «остальные».
+    """
+    sub_lang = (sub.language_code or "").strip().lower()
+    if not sub_lang:
+        return "output_1"
+    sub_primary = sub_lang.split("-")[0]
+    for i, entry in enumerate(data.get("languages") or []):
+        codes = [c.strip().lower() for c in str(entry).split(",") if c.strip()]
+        if sub_lang in codes or sub_primary in [c.split("-")[0] for c in codes]:
+            return f"output_{i + 2}"
+    return "output_1"
 
 
 async def handle_button(bot: Bot, session: AsyncSession, run_id: int, node_id: str, btn: int):

@@ -120,6 +120,7 @@ th { background: #f8fafc; color: #7a8499; font-weight: 600; font-size: 12.5px; t
 .drawflow .drawflow-node.delay { border-color: #e8a13c; }
 .drawflow .drawflow-node.condition { border-color: #9a5df0; }
 .drawflow .drawflow-node.action { border-color: #e05c9a; }
+.drawflow .drawflow-node.language { border-color: #39b0d2; }
 .drawflow .drawflow-node.note { border-color: #e8a13c; background: #fff8ec; border-style: dashed; }
 .drawflow .drawflow-node.note .df-sub { color: #8a6d3b; }
 .drawflow .drawflow-node.multi-sel { box-shadow: 0 0 0 3px rgba(46,107,255,.35); }
@@ -466,3 +467,8 @@ th { background: #f8fafc; color: #7a8499; font-weight: 600; font-size: 12.5px; t
   .chat-drawer { width: 100vw; }
   .chat-side { display: none; }  /* на телефоне — только переписка */
 }
+
+/* быстрые кнопки языков в панели свойств блока «Язык» */
+.lang-quick { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 3px; }
+.lang-quick .pill { cursor: pointer; user-select: none; }
+.lang-quick .pill:hover { background: #2e6bff; color: #fff; }

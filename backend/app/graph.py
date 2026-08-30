@@ -7,9 +7,11 @@
   delay:     output_1 -> дальше (после паузы)
   condition: output_1 -> да (тег есть), output_2 -> нет
   action:    output_1 -> дальше
+  language:  output_1 -> «остальные» (язык не совпал),
+             output_{i+2} -> ветка языка i (0-индекс) — как кнопки у message
 """
 
-NODE_TYPES = {"start", "message", "delay", "condition", "action", "note"}
+NODE_TYPES = {"start", "message", "delay", "condition", "action", "note", "language"}
 
 
 class GraphError(Exception):
@@ -73,6 +75,10 @@ def _validate(nodes: dict):
         elif n["type"] == "condition":
             if not d.get("tag"):
                 raise GraphError(f"Блок «Условие» ({nid}): не выбран тег")
+        elif n["type"] == "language":
+            langs = [str(x).strip() for x in (d.get("languages") or []) if str(x).strip()]
+            if not langs:
+                raise GraphError(f"Блок «Язык» ({nid}): добавьте хотя бы один язык")
         elif n["type"] == "action":
             if d.get("op") not in ("add_tag", "remove_tag"):
                 raise GraphError(f"Блок «Действие» ({nid}): некорректная операция")

@@ -55,6 +55,8 @@ def _node_label(ntype: str, data: dict) -> str:
         return f"задержка {data.get('amount')} {unit}"
     if ntype == "condition":
         return "условие по тегу"
+    if ntype == "language":
+        return "развилка по языку: " + (", ".join(map(str, data.get("languages") or [])) or "?")
     if ntype == "action":
         return "проставить/снять тег"
     return ntype

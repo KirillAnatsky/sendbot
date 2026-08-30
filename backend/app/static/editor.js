@@ -9,6 +9,7 @@ const NODE_META = {
   delay:     { title: '⏱ Задержка',   inputs: 1, outputs: 1 },
   condition: { title: '❓ Условие',    inputs: 1, outputs: 2 },
   action:    { title: '🏷 Тег',       inputs: 1, outputs: 1 },
+  language:  { title: '🌐 Язык',      inputs: 1, outputs: 2 },
   note:      { title: '⚠️ Заметка',   inputs: 0, outputs: 0 },
 };
 
@@ -48,6 +49,14 @@ function nodeHtml(type, data) {
     return `<div class="df-title">${NODE_META.message.title}</div>${mediaHtml}${textHtml}${btnsHtml}` +
            `<div class="df-ports">${buttons.some(b => !b.url) ? '1: далее' : ''}</div>`;
   }
+  if (type === 'language') {
+    const langs = data.languages || [];
+    const rows = langs.map((l, i) =>
+      `<div class="df-btn"><span class="df-btn-port">${i + 2}</span>${esc(l)}</div>`).join('');
+    return `<div class="df-title">${NODE_META.language.title}</div>` +
+           `<div class="df-btns">${rows || '<div class="df-sub empty">языки не заданы</div>'}</div>` +
+           `<div class="df-ports">1: остальные</div>`;
+  }
   const sum = summary(type, data);
   const toggle = sum.length > 120
     ? `<span class="df-toggle" onclick="toggleNodeExpand(event, this)">развернуть ▾</span>` : '';
@@ -84,6 +93,7 @@ function summary(type, d) {
     return `Ждать ${d.amount || '?'} ${u}`;
   }
   if (type === 'condition') return `Есть тег «${tagName(d.tag)}»?`;
+  if (type === 'language') return `Язык: ${(d.languages || []).join(' / ') || '?'} / остальные`;
   if (type === 'note') return d.text || 'пустая заметка';
   if (type === 'action') return (d.op === 'remove_tag' ? 'Снять тег: ' : 'Добавить тег: ') + tagName(d.tag);
   return '';
@@ -341,6 +351,7 @@ function blockDefaults(type) {
     message: { text: '', photo_url: '', buttons: [] },
     delay: { amount: 1, unit: 'hours' },
     condition: { tag: TAGS[0] ? String(TAGS[0].id) : '' },
+    language: { languages: ['ru'] },
     action: { op: 'add_tag', tag: TAGS[0] ? String(TAGS[0].id) : '' },
     note: { text: '' },
   }[type];
@@ -424,7 +435,7 @@ function decoratePorts() {
       if (outs[1]) { outs[1].textContent = '✕'; outs[1].classList.add('port-no'); outs[1].title = 'нет — тега нет'; }
       return;
     }
-    if (n.name !== 'message') return;
+    if (n.name !== 'message' && n.name !== 'language') return;
 
     const zoom = editor.zoom || 1;
     const nodeRect = nodeEl.getBoundingClientRect();
@@ -436,14 +447,16 @@ function decoratePorts() {
       const target = idx === 0 ? nextLine : btnRows[idx - 1];
       out.classList.add('port-labeled');
       if (idx === 0) {
-        out.textContent = '→';
+        out.textContent = n.name === 'language' ? '∗' : '→';
         out.classList.add('port-next');
-        out.title = 'далее (сразу после отправки)';
+        out.title = n.name === 'language'
+          ? 'остальные — язык не совпал ни с одной веткой'
+          : 'далее (сразу после отправки)';
       } else {
         out.textContent = String(idx + 1);
         out.classList.add('port-btn');
         const label = btnRows[idx - 1] ? btnRows[idx - 1].textContent.replace(/^\d+/, '').trim() : '';
-        out.title = 'кнопка «' + label + '»';
+        out.title = (n.name === 'language' ? 'язык «' : 'кнопка «') + label + '»';
       }
       if (target) {
         const r = target.getBoundingClientRect();
@@ -513,6 +526,27 @@ function showProps(id) {
       <select id="p-tag">${TAGS.map(t =>
         `<option value="${t.id}" ${String(d.tag) === String(t.id) ? 'selected' : ''}>${esc(t.name)}</option>`).join('')}</select>
       <p style="font-size:12px;color:#7a8499;margin-top:8px">Выход 1 — «да», выход 2 — «нет».</p>`;
+  } else if (node.name === 'language') {
+    const langs = d.languages || [];
+    html += `
+      <p style="font-size:12.5px;color:#7a8499;margin-bottom:8px">
+        Развилка по языку Telegram-профиля. Определяется автоматически —
+        подписчика ни о чём не спрашиваем.
+      </p>
+      <label>Ветки (код языка; несколько через запятую)</label>
+      <div id="p-langs">${langs.map(l => langRow(l)).join('')}</div>
+      <button class="btn" onclick="addLangRow()">+ язык</button>
+      <div class="lang-quick">
+        ${['ru', 'en', 'uk', 'pl', 'de', 'es', 'pt'].map(c =>
+          `<span class="pill gray" onclick="addLangRow('${c}')">${c}</span>`).join('')}
+      </div>
+      <div class="hint-box">
+        Коды — как в Telegram: <code>ru</code>, <code>en</code>, <code>uk</code>,
+        <code>pl</code>… Подписчик с <code>pt-br</code> попадёт в ветку
+        <code>pt</code>. В одну ветку можно несколько кодов:
+        <code>ru, uk, be</code>. Кто не совпал ни с одной веткой — уходит
+        в выход «остальные» (∗).
+      </div>`;
   } else if (node.name === 'action') {
     html += `
       <label>Операция</label>
@@ -633,6 +667,24 @@ function setupImageUploader() {
   };
 }
 
+function langRow(value) {
+  return `<div class="btn-row-item">
+    <input placeholder="ru или ru, uk" class="p-lang" value="${esc(value || '')}">
+    <button class="btn danger" onclick="this.parentElement.remove();scheduleAutoApply()">✕</button>
+  </div>`;
+}
+function addLangRow(code) {
+  const box = document.getElementById('p-langs');
+  if (code) {
+    // не дублируем уже добавленный язык
+    const have = [...box.querySelectorAll('.p-lang')].some(inp =>
+      inp.value.split(',').map(x => x.trim().toLowerCase()).includes(code));
+    if (have) return;
+  }
+  box.insertAdjacentHTML('beforeend', langRow(code || ''));
+  if (code) scheduleAutoApply();
+}
+
 function btnRow(b, i) {
   return `<div class="btn-row-item">
     <input placeholder="Текст кнопки" class="p-btn-label" value="${esc(b.label || '')}">
@@ -668,6 +720,14 @@ function applyProps() {
     d.unit = document.getElementById('p-unit').value;
   } else if (node.name === 'condition') {
     d.tag = document.getElementById('p-tag').value;
+  } else if (node.name === 'language') {
+    d.languages = [...document.querySelectorAll('#p-langs .p-lang')]
+      .map(inp => inp.value.trim()).filter(Boolean);
+    // выходы: 1 («остальные») + по одному на каждую ветку языка
+    const need = 1 + d.languages.length;
+    const cur = Object.keys(editor.getNodeFromId(selectedNodeId).outputs).length;
+    for (let i = cur; i < need; i++) editor.addNodeOutput(selectedNodeId);
+    for (let i = cur; i > need; i--) editor.removeNodeOutput(selectedNodeId, 'output_' + i);
   } else if (node.name === 'action') {
     d.op = document.getElementById('p-op').value;
     d.tag = document.getElementById('p-tag').value;

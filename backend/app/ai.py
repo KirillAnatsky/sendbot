@@ -35,6 +35,7 @@ SYSTEM_PROMPT = """Ты — конструктор воронок для тел�
     {"id": "n2", "type": "delay", "amount": 1, "unit": "seconds|minutes|hours|days", "next": "n3"},
     {"id": "n3", "type": "condition", "tag": "имя-тега", "yes": "id или null", "no": "id или null"},
     {"id": "n4", "type": "action", "op": "add_tag|remove_tag", "tag": "имя-тега", "next": null},
+    {"id": "n6", "type": "language", "languages": [{"code": "ru", "next": "id или null"}, {"code": "en", "next": "id или null"}], "other": "id или null — куда идут все остальные языки"},
     {"id": "n5", "type": "note", "text": "⚠️ предупреждение", "about": "id узла, к которому относится"}
   ]
 }
@@ -48,6 +49,7 @@ SYSTEM_PROMPT = """Ты — конструктор воронок для тел�
 - Теги называй короткими латинскими slug'ами.
 - Если в ТЗ встречается маркер [КАРТИНКА: media/имя-файла] — поставь это значение в photo_url ближайшего сообщения.
 - Узлы note используй для предупреждений о недостающем: в ТЗ упомянут скрин/картинка, но файла нет; нужна ссылка (регистрация, оплата, канал), а её нет; лид-магнит описан, но самого материала нет; неясное условие или сроки. Каждый note привязывай через "about". Ничего не выдумывай вместо недостающего — ставь note.
+- МУЛЬТИЯЗЫЧНОСТЬ: для воронки на нескольких языках ставь узел language сразу после входа — он сам определяет язык Telegram-профиля, юзера спрашивать не надо. Каждая ветка ведёт в полную копию воронки на своём языке, "other" — в ветку языка по умолчанию (обычно английского). Коды языков — как в Telegram: ru, en, uk, de, es, pt. Кнопочный выбор языка делай только если в ТЗ это просят явно.
 """
 
 
@@ -176,12 +178,15 @@ def _summary(ntype: str, d: dict, tag_names: dict) -> str:
         return op + tag_names.get(str(d.get("tag")), "?")
     if ntype == "note":
         return (d.get("text") or "")[:500]
+    if ntype == "language":
+        return "Развилка по языку: " + (", ".join(map(str, d.get("languages") or [])) or "?")
     return ""
 
 
 NODE_TITLES = {
     "start": "▶️ Старт", "message": "💬 Сообщение", "delay": "⏱ Задержка",
     "condition": "❓ Условие", "action": "🏷 Тег", "note": "⚠️ Заметка",
+    "language": "🌐 Язык",
 }
 
 
@@ -229,6 +234,16 @@ def _html(ntype: str, d: dict, tag_names: dict) -> str:
             f'<div class="df-ports">{ports}</div>'
         )
 
+    if ntype == "language":
+        rows = "".join(
+            f'<div class="df-btn"><span class="df-btn-port">{k + 2}</span>{h.escape(str(c))}</div>'
+            for k, c in enumerate(d.get("languages") or []))
+        return (
+            f'<div class="df-title">{NODE_TITLES["language"]}</div>'
+            f'<div class="df-btns">{rows}</div>'
+            '<div class="df-ports">1: остальные</div>'
+        )
+
     sum_ = _summary(ntype, d, tag_names)
     toggle = (
         '<span class="df-toggle" onclick="toggleNodeExpand(event, this)">развернуть ▾</span>'
@@ -271,7 +286,7 @@ def build_drawflow(spec: dict, tag_ids: dict) -> dict:
     for i, n in enumerate(nodes_spec):
         nid = id_map[str(n["id"])]
         ntype = n.get("type")
-        if ntype not in ("message", "delay", "condition", "action", "note"):
+        if ntype not in ("message", "delay", "condition", "action", "note", "language"):
             raise AIError(f"Неизвестный тип узла: {ntype}")
 
         if ntype == "note":
@@ -298,6 +313,10 @@ def build_drawflow(spec: dict, tag_ids: dict) -> dict:
         elif ntype == "condition":
             data = {"tag": str(tag_ids.get(str(n.get("tag")), ""))}
             n_out = 2
+        elif ntype == "language":
+            branches = n.get("languages") or []
+            data = {"languages": [str(b.get("code", "")).strip() for b in branches]}
+            n_out = 1 + len(branches)
         else:
             data = {
                 "op": n.get("op", "add_tag"),
@@ -331,6 +350,14 @@ def build_drawflow(spec: dict, tag_ids: dict) -> dict:
                 t = tgt(ref)
                 if t:
                     add_conn(nid, port, t)
+        elif ntype == "language":
+            t = tgt(n.get("other"))
+            if t:
+                add_conn(nid, "output_1", t)
+            for k, b in enumerate(n.get("languages") or []):
+                t = tgt(b.get("next"))
+                if t:
+                    add_conn(nid, f"output_{k + 2}", t)
         else:
             t = tgt(n.get("next"))
             if t:
@@ -494,6 +521,11 @@ def graph_to_spec(funnel) -> dict:
             item.update(amount=d.get("amount"), unit=d.get("unit"), next=first(n, "output_1"))
         elif t == "condition":
             item.update(tag=d.get("tag"), yes=first(n, "output_1"), no=first(n, "output_2"))
+        elif t == "language":
+            item.update(
+                languages=[{"code": c, "next": first(n, f"output_{k + 2}")}
+                           for k, c in enumerate(d.get("languages") or [])],
+                other=first(n, "output_1"))
         elif t == "action":
             item.update(op=d.get("op"), tag=d.get("tag"), next=first(n, "output_1"))
         elif t == "note":
@@ -522,7 +554,7 @@ spec = null, если менять нечего (просто вопрос). Е�
 - Сохраняй существующие id узлов, которые не менял; новым давай id вида "n1","n2".
 - Тексты, которые не просили менять, переноси ДОСЛОВНО.
 - В условиях/действиях поле tag — ИМЯ тега (латинский slug). Несуществующие теги создадутся автоматически.
-- МУЛЬТИЯЗЫЧНОСТЬ: если просят перевод на другие языки — сделай первым узлом вопрос выбора языка (кнопки с флагами, напр. «🇷🇺 Русский», «🇬🇧 English»), каждая кнопка ведёт в action с тегом lang-ru / lang-en / …, дальше — полная ветка воронки на этом языке (переведи все тексты и кнопки, ссылки не меняй). Существующая ветка становится одной из языковых.
+- МУЛЬТИЯЗЫЧНОСТЬ: если просят перевод на другие языки — поставь первым узлом language (авто-определение языка Telegram-профиля, юзера не спрашиваем): {"type": "language", "languages": [{"code": "ru", "next": ...}, ...], "other": ...}. Каждая ветка — полная копия воронки на своём языке (переведи все тексты и кнопки, ссылки не меняй), существующая ветка становится одной из языковых, "other" веди в ветку английского (или основного) языка. Кнопочный выбор языка делай, только если это просят явно.
 - Задержки: unit seconds|minutes|hours|days.
 - next: null — конец ветки.
 """
