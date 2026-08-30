@@ -25,8 +25,11 @@ from sqlalchemy import func, select
 
 from . import exports
 from . import sheets as gs
+from .logging_setup import event_logger
 from .models import Bot, Funnel, FunnelBot, NodeVisit, Subscriber
 from .sheets import SheetsError
+
+log = event_logger()
 
 # в листе колонки Step 1 users … Step 25 users
 MAX_STEPS = 25
@@ -96,25 +99,33 @@ async def collect_rows(session, weeks, allowed_bots=None) -> list[dict]:
         fids = [f for f in funnels_of.get(b.id, []) if f in funnels]
         if not fids:
             continue
-        # если на боте одна воронка — в таблице достаточно юзернейма бота,
-        # он там в выпадающем списке. Если несколько — иначе строки за одну
-        # неделю схлопнулись бы в одну.
-        many = len(fids) > 1
-        uname = f"@{b.tg_username}" if b.tg_username else b.name
+        # На бота приходится одна воронка — так устроена работа, и так же
+        # устроена таблица: в колонке «Funnel / Bot» стоит юзернейм бота,
+        # по нему же строки сходятся с рекламной частью (08_CAMPAIGNS).
+        # Если воронок вдруг окажется несколько, берём одну — включённую и
+        # самую свежую, — иначе две строки за неделю легли бы в одну ячейку.
+        label = f"@{b.tg_username}" if b.tg_username else b.name
 
-        for fid in fids:
-            f = funnels[fid]
+        chosen = sorted(
+            (funnels[fid] for fid in fids),
+            key=lambda f: (f.is_active, f.updated_at or f.created_at),
+            reverse=True)
+        if len(chosen) > 1:
+            log.warning(
+                "У бота %s несколько воронок (%s) — в таблицу пойдёт «%s»",
+                label, len(chosen), chosen[0].name)
+
+        for f in chosen[:1]:
             steps = funnel_steps(f.graph)
             if not steps:
                 continue
-            label = f"{uname} / {f.name}" if many else uname
 
             for ws, we in weeks:
                 counts = dict((await session.execute(
                     select(NodeVisit.node_id,
                            func.count(func.distinct(NodeVisit.subscriber_id)))
                     .join(Subscriber, Subscriber.id == NodeVisit.subscriber_id)
-                    .where(NodeVisit.funnel_id == fid,
+                    .where(NodeVisit.funnel_id == f.id,
                            Subscriber.bot_id == b.id,
                            NodeVisit.created_at >= ws,
                            NodeVisit.created_at < we)
@@ -127,7 +138,7 @@ async def collect_rows(session, weeks, allowed_bots=None) -> list[dict]:
                     "week": ws.strftime("%Y-%m-%d"),
                     "label": label,
                     "steps": values,
-                    "bot": uname,
+                    "bot": label,
                     "funnel": f.name,
                 })
     return out
