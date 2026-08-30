@@ -60,6 +60,7 @@ class BotManager:
             asyncio.create_task(broadcast_loop(self)),
             asyncio.create_task(cleanup_loop()),
             asyncio.create_task(sheets_export_loop()),
+            asyncio.create_task(funnel_input_export_loop()),
         ]
 
     async def _spawn(self, bot_id: int, token: str):
@@ -511,3 +512,72 @@ async def maybe_seed_default_bot():
             session.add(FunnelBot(funnel_id=f.id, bot_id=b.id))
         await session.commit()
         log.info("Создан бот «Основной» из BOT_TOKEN (#%s)", b.id)
+
+
+async def funnel_input_export_loop():
+    """Автовыгрузка недельных конверсий в лист вида 08B_FUNNEL_INPUT.
+
+    Просыпается раз в десять минут и смотрит, пора ли:
+      каждый час — в начале каждого часа, но не чаще раза в час;
+      раз в сутки — в заданный час, не чаще раза в день;
+      раз в неделю — в понедельник в заданный час (неделя уже закрылась,
+      цифры за неё финальные), не чаще раза в день.
+    """
+    from datetime import datetime
+
+    from ..logging_setup import event_logger
+
+    log = event_logger()
+    await asyncio.sleep(150)   # чуть позже обычной выгрузки, чтобы не столкнуться
+
+    while True:
+        try:
+            from ..api import (
+                get_fi_cfg, run_funnel_input_export, save_fi_cfg,
+            )
+            from ..funnel_input import monday
+            from ..sheets import SheetsError
+
+            async with SessionLocal() as session:
+                cfg = await get_fi_cfg(session)
+                if not cfg.get("auto") or not cfg.get("spreadsheet_id"):
+                    await asyncio.sleep(600)
+                    continue
+
+                now = datetime.utcnow()
+                last = cfg.get("last_run") or ""
+                interval = cfg.get("interval", "daily")
+                hour = int(cfg.get("hour", 4))
+
+                if interval == "hourly":
+                    due = last[:13] != now.strftime("%Y-%m-%dT%H")
+                elif interval == "weekly":
+                    due = (now.weekday() == 0 and now.hour == hour
+                           and last[:10] != now.strftime("%Y-%m-%d"))
+                else:
+                    due = (now.hour == hour
+                           and last[:10] != now.strftime("%Y-%m-%d"))
+
+                if due:
+                    try:
+                        result = await run_funnel_input_export(session, cfg)
+                        if not cfg.get("start_week"):
+                            cfg["start_week"] = monday(now.date()).isoformat()
+                        cfg["last_status"] = "ok"
+                        cfg["last_error"] = ""
+                        cfg["last_result"] = result
+                        log.info("Автовыгрузка конверсий: %s", result)
+                    except SheetsError as e:
+                        cfg["last_status"] = "error"
+                        cfg["last_error"] = str(e)
+                        log.warning("Автовыгрузка конверсий не удалась: %s", e)
+                    cfg["last_run"] = now.isoformat()
+                    await save_fi_cfg(session, cfg)
+                    await session.commit()
+        except Exception as e:  # noqa: BLE001 — цикл не должен падать
+            try:
+                from ..logging_setup import event_logger as _el
+                _el().warning("Сбой цикла выгрузки конверсий: %s", e)
+            except Exception:  # noqa: BLE001
+                pass
+        await asyncio.sleep(600)

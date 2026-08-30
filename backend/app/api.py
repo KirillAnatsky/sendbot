@@ -1915,3 +1915,172 @@ async def create_broadcast(body: BroadcastIn, user=Depends(current_user),
     log.info("Создана рассылка «%s» (id=%s, бот %s, вложений %s)",
              bc.name, bc.id, bc.bot_id, len(bc.media or []))
     return {"id": bc.id}
+
+
+# ---------- конверсии по шагам в лист вида 08B_FUNNEL_INPUT ----------
+# Отдельная от «обычной» выгрузки история: там листы наши и мы их затираем,
+# здесь лист чужой, в нём есть ручные колонки и формулы — пишем точечно.
+# Ключ робота общий, берём из настроек выше.
+
+FI_KEY = "funnel_input_integration"
+
+DEFAULT_FI_CFG = {
+    "spreadsheet_id": "",
+    "sheet_name": "08B_FUNNEL_INPUT",
+    "auto": False,
+    "interval": "daily",        # weekly | daily | hourly
+    "hour": 4,                  # час выгрузки (UTC) для daily и weekly
+    "start_week": None,         # с какой недели начали писать
+    "last_run": None,
+    "last_status": None,
+    "last_error": "",
+    "last_result": {},
+}
+
+
+async def get_fi_cfg(session) -> dict:
+    from .models import Setting
+
+    row = (await session.execute(
+        select(Setting).where(Setting.key == FI_KEY))).scalar_one_or_none()
+    cfg = dict(DEFAULT_FI_CFG)
+    cfg.update(row.value or {} if row else {})
+    return cfg
+
+
+async def save_fi_cfg(session, cfg: dict):
+    from .models import Setting
+
+    row = (await session.execute(
+        select(Setting).where(Setting.key == FI_KEY))).scalar_one_or_none()
+    if row:
+        row.value = cfg
+        flag_modified(row, "value")
+    else:
+        session.add(Setting(key=FI_KEY, value=cfg))
+    await session.flush()
+
+
+def _fi_public(cfg: dict) -> dict:
+    return {
+        "spreadsheet_id": cfg.get("spreadsheet_id", ""),
+        "sheet_name": cfg.get("sheet_name") or "08B_FUNNEL_INPUT",
+        "auto": bool(cfg.get("auto")),
+        "interval": cfg.get("interval", "daily"),
+        "hour": cfg.get("hour", 4),
+        "start_week": cfg.get("start_week"),
+        "last_run": cfg.get("last_run"),
+        "last_status": cfg.get("last_status"),
+        "last_error": cfg.get("last_error") or "",
+        "last_result": cfg.get("last_result") or {},
+    }
+
+
+@router.get("/integrations/funnel-input",
+            dependencies=[Depends(require("integrations", "view"))])
+async def fi_get(session=Depends(get_session)):
+    cfg = await get_fi_cfg(session)
+    sheets_cfg = await get_sheets_cfg(session)
+    cred = sheets_cfg.get("credentials") or {}
+    out = _fi_public(cfg)
+    out["connected"] = bool(cred.get("client_email"))
+    out["robot_email"] = cred.get("client_email")
+    return out
+
+
+class FunnelInputCfgIn(BaseModel):
+    spreadsheet_id: str = ""
+    sheet_name: str = "08B_FUNNEL_INPUT"
+    auto: bool = False
+    interval: str = "daily"
+    hour: int = 4
+
+
+@router.put("/integrations/funnel-input",
+            dependencies=[Depends(require("integrations", "edit"))])
+async def fi_save(body: FunnelInputCfgIn, session=Depends(get_session)):
+    cfg = await get_fi_cfg(session)
+
+    sid = (body.spreadsheet_id or "").strip()
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", sid)
+    if m:
+        sid = m.group(1)
+    cfg["spreadsheet_id"] = sid
+    cfg["sheet_name"] = (body.sheet_name or "").strip() or "08B_FUNNEL_INPUT"
+    cfg["auto"] = bool(body.auto)
+    cfg["interval"] = (body.interval
+                       if body.interval in ("weekly", "daily", "hourly") else "daily")
+    cfg["hour"] = max(0, min(23, int(body.hour)))
+    await save_fi_cfg(session, cfg)
+    log.info("Настройки выгрузки конверсий обновлены (авто: %s, %s)",
+             cfg["auto"], cfg["interval"])
+    return _fi_public(cfg)
+
+
+async def run_funnel_input_export(session, cfg: dict, allowed_bots=None) -> dict:
+    """Собирает недельные конверсии и дописывает их в лист."""
+    from . import funnel_input as fi
+    from . import sheets as gs
+
+    cred = (await get_sheets_cfg(session)).get("credentials") or {}
+    if not cred.get("client_email"):
+        raise gs.SheetsError(
+            "Сначала подключите робота в блоке выше — вставьте ключ сервисного аккаунта")
+
+    weeks = fi.weeks_since(cfg.get("start_week"))
+    rows = await fi.collect_rows(session, weeks, allowed_bots)
+    result = await fi.write_rows(
+        cred, cfg.get("spreadsheet_id", ""),
+        cfg.get("sheet_name") or "08B_FUNNEL_INPUT", rows)
+    result["weeks"] = len(weeks)
+    return result
+
+
+@router.post("/integrations/funnel-input/export",
+             dependencies=[Depends(require("integrations", "edit"))])
+async def fi_export_now(user=Depends(current_user), session=Depends(get_session)):
+    from . import funnel_input as fi
+    from . import sheets as gs
+
+    cfg = await get_fi_cfg(session)
+    try:
+        result = await run_funnel_input_export(
+            session, cfg, await allowed_bot_ids(user, session))
+    except gs.SheetsError as e:
+        cfg["last_run"] = datetime.utcnow().isoformat()
+        cfg["last_status"] = "error"
+        cfg["last_error"] = str(e)
+        await save_fi_cfg(session, cfg)
+        log.warning("Выгрузка конверсий не удалась: %s", e)
+        raise HTTPException(400, str(e))
+
+    if not cfg.get("start_week"):
+        cfg["start_week"] = fi.monday(datetime.utcnow().date()).isoformat()
+    cfg["last_run"] = datetime.utcnow().isoformat()
+    cfg["last_status"] = "ok"
+    cfg["last_error"] = ""
+    cfg["last_result"] = result
+    await save_fi_cfg(session, cfg)
+    log.info("Выгрузка конверсий: %s", result)
+    return {"ok": True, "result": result,
+            "url": f"https://docs.google.com/spreadsheets/d/{cfg['spreadsheet_id']}"}
+
+
+@router.get("/integrations/funnel-input/preview",
+            dependencies=[Depends(require("integrations", "view"))])
+async def fi_preview(user=Depends(current_user), session=Depends(get_session)):
+    """Что уйдёт в лист — посмотреть, не трогая таблицу."""
+    from . import funnel_input as fi
+
+    cfg = await get_fi_cfg(session)
+    weeks = fi.weeks_since(cfg.get("start_week"))
+    rows = await fi.collect_rows(session, weeks, await allowed_bot_ids(user, session))
+    return {
+        "weeks": [w[0].strftime("%Y-%m-%d") for w in weeks],
+        "rows": len(rows),
+        "sample": [
+            {"week": r["week"], "label": r["label"],
+             "steps": r["steps"][:12], "total_steps": len(r["steps"])}
+            for r in rows[:12]
+        ],
+    }

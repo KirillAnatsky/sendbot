@@ -5,6 +5,7 @@ async function loadSheetsPage() {
   try { SHEETS_CFG = await api('/integrations/sheets'); }
   catch (e) { return; }
   renderSheetsPage();
+  await loadFunnelInput();
 }
 
 function renderSheetsPage() {
@@ -190,4 +191,191 @@ async function previewSheets() {
         i === 0 ? `<th>${esc(String(cell))}</th>` : `<td>${esc(String(cell)).slice(0, 40)}</td>`
       ).join('')}</tr>`).join('')}</table>
     </div>`).join('');
+}
+
+// ---------- Конверсии по шагам в готовый лист (08B_FUNNEL_INPUT) ----------
+// Отдельный блок: пишет не в наши листы, а в чужую таблицу — построчно,
+// не затирая ручные колонки.
+let FI_CFG = null;
+
+async function loadFunnelInput() {
+  try { FI_CFG = await api('/integrations/funnel-input'); }
+  catch (e) { return; }
+  renderFunnelInput();
+}
+
+function renderFunnelInput() {
+  const c = FI_CFG;
+  const rw = can('integrations', 'edit');
+  const dis = rw ? '' : 'disabled';
+  const r = c.last_result || {};
+
+  const status = c.last_run
+    ? (c.last_status === 'ok'
+        ? `<span class="status-active">успешно</span> · ${new Date(c.last_run + 'Z').toLocaleString('ru')}`
+        : `<span style="color:#d33">ошибка</span> · ${new Date(c.last_run + 'Z').toLocaleString('ru')}<div class="sheets-err">${esc(c.last_error)}</div>`)
+    : '<span style="color:#7a8499">ещё не выгружали</span>';
+
+  let host = document.getElementById('fi-block');
+  if (!host) {
+    host = document.createElement('div');
+    host.id = 'fi-block';
+    document.getElementById('sheets-body').appendChild(host);
+  }
+
+  host.innerHTML = `
+    <h3 style="margin:26px 0 10px">Конверсии по шагам — в готовый лист</h3>
+
+    <div class="panel">
+      <div class="hint-box" style="margin-top:0">
+        Одна строка = <b>неделя × бот × воронка</b>. Шагами считаются сообщения
+        воронки по порядку, в колонки <code>Step N users</code> уходит число
+        уникальных подписчиков, дошедших до шага за эту неделю.
+        Колонки <code>Site transitions</code>, <code>GEO</code> и
+        <code>Custom metrics</code> выгрузка не трогает — они ваши.
+        Повторный запуск обновляет строку за ту же неделю, а не добавляет новую.
+        Недели считаются с понедельника по UTC.
+      </div>
+
+      <label>Ссылка на таблицу</label>
+      <input id="fi-id" class="inline-input" style="width:100%" ${dis}
+        placeholder="https://docs.google.com/spreadsheets/d/..." value="${esc(c.spreadsheet_id || '')}">
+
+      <div class="row" style="margin-top:14px">
+        <div>
+          <label>Название листа</label>
+          <input id="fi-sheet" class="inline-input" ${dis} value="${esc(c.sheet_name || '')}">
+        </div>
+        <div>
+          <label>Обновление</label>
+          <select id="fi-auto" onchange="toggleFiFields()" ${dis}>
+            <option value="0" ${!c.auto ? 'selected' : ''}>только по кнопке</option>
+            <option value="1" ${c.auto ? 'selected' : ''}>автоматически</option>
+          </select>
+        </div>
+        <div id="fi-interval-wrap" class="${c.auto ? '' : 'hidden'}">
+          <label>Как часто</label>
+          <select id="fi-interval" onchange="toggleFiFields()" ${dis}>
+            <option value="weekly" ${c.interval === 'weekly' ? 'selected' : ''}>раз в неделю (пн)</option>
+            <option value="daily" ${c.interval === 'daily' ? 'selected' : ''}>раз в сутки</option>
+            <option value="hourly" ${c.interval === 'hourly' ? 'selected' : ''}>каждый час</option>
+          </select>
+        </div>
+        <div id="fi-hour-wrap" class="${c.auto && c.interval !== 'hourly' ? '' : 'hidden'}">
+          <label>В котором часу (UTC)</label>
+          <select id="fi-hour" ${dis}>
+            ${Array.from({ length: 24 }, (_, h) =>
+              `<option value="${h}" ${c.hour === h ? 'selected' : ''}>${String(h).padStart(2, '0')}:00</option>`).join('')}
+          </select>
+        </div>
+      </div>
+
+      <div style="margin-top:14px">
+        <label>Последняя выгрузка</label>
+        <div>${status}</div>
+        ${r.rows !== undefined
+          ? `<div class="sheets-counts">
+               <span class="pill gray">строк: ${r.rows}</span>
+               <span class="pill gray">обновлено: ${r.updated || 0}</span>
+               <span class="pill gray">добавлено: ${r.appended || 0}</span>
+               ${r.steps ? `<span class="pill gray">колонок-шагов: ${r.steps}</span>` : ''}
+             </div>` : ''}
+      </div>
+
+      ${rw ? `<div style="margin-top:14px">
+        <button class="btn primary" onclick="saveFunnelInput()">Сохранить</button>
+        <button class="btn" onclick="exportFunnelInputNow()" id="fi-export-btn">📤 Выгрузить сейчас</button>
+        <button class="btn" onclick="previewFunnelInput()">Показать, что уйдёт</button>
+        <span id="fi-status" class="sheets-inline-status"></span>
+      </div>` : ''}
+      <div id="fi-preview"></div>
+
+      ${!c.connected ? `<div class="hint-box" style="margin-top:14px">
+        Робот ещё не подключён — вставьте ключ сервисного аккаунта в блоке выше.
+        Ключ общий для обеих выгрузок.</div>` : `<div class="hint-box" style="margin-top:14px">
+        Не забудьте дать <code>${esc(c.robot_email || '')}</code> права
+        <b>Редактор</b> на эту таблицу — кнопкой «Поделиться».</div>`}
+    </div>`;
+}
+
+function toggleFiFields() {
+  const auto = document.getElementById('fi-auto').value === '1';
+  const hourly = document.getElementById('fi-interval').value === 'hourly';
+  document.getElementById('fi-interval-wrap').classList.toggle('hidden', !auto);
+  document.getElementById('fi-hour-wrap').classList.toggle('hidden', !(auto && !hourly));
+}
+
+function flashFi(text, isError) {
+  const el = document.getElementById('fi-status');
+  if (!el) return;
+  el.textContent = text;
+  el.style.color = isError ? '#d33' : '#2a8';
+  clearTimeout(el._t);
+  el._t = setTimeout(() => { el.textContent = ''; }, 5000);
+}
+
+function collectFunnelInput() {
+  return {
+    spreadsheet_id: document.getElementById('fi-id').value.trim(),
+    sheet_name: document.getElementById('fi-sheet').value.trim(),
+    auto: document.getElementById('fi-auto').value === '1',
+    interval: document.getElementById('fi-interval').value,
+    hour: +document.getElementById('fi-hour').value,
+  };
+}
+
+async function saveFunnelInput() {
+  try {
+    FI_CFG = await api('/integrations/funnel-input', { method: 'PUT', body: collectFunnelInput() });
+  } catch (e) { return; }
+  FI_CFG = await api('/integrations/funnel-input');
+  renderFunnelInput();
+  flashFi('Сохранено ✅');
+}
+
+async function exportFunnelInputNow() {
+  const btn = document.getElementById('fi-export-btn');
+  if (btn) btn.disabled = true;
+  flashFi('Выгружаю…');
+  try {
+    await api('/integrations/funnel-input', { method: 'PUT', body: collectFunnelInput() });
+    const r = await api('/integrations/funnel-input/export', { method: 'POST' });
+    FI_CFG = await api('/integrations/funnel-input');
+    renderFunnelInput();
+    const d = r.result || {};
+    flashFi(`Готово — строк ${d.rows || 0} (обновлено ${d.updated || 0}, добавлено ${d.appended || 0})`);
+    if (confirm('Выгружено. Открыть таблицу?')) window.open(r.url, '_blank');
+  } catch (e) {
+    try { FI_CFG = await api('/integrations/funnel-input'); renderFunnelInput(); } catch {}
+  } finally {
+    const b = document.getElementById('fi-export-btn');
+    if (b) b.disabled = false;
+  }
+}
+
+async function previewFunnelInput() {
+  let d;
+  try {
+    await api('/integrations/funnel-input', { method: 'PUT', body: collectFunnelInput() });
+    d = await api('/integrations/funnel-input/preview');
+  } catch (e) { return; }
+
+  const box = document.getElementById('fi-preview');
+  if (!d.rows) {
+    box.innerHTML = `<div class="hint-box">За ${d.weeks.length === 1 ? 'текущую неделю' : 'выбранные недели'}
+      данных пока нет — ни один подписчик не прошёл ни одного шага.
+      Строки появятся, как только по воронке пойдут люди.</div>`;
+    return;
+  }
+  box.innerHTML = `
+    <div class="sheets-preview">
+      <b>Уйдёт строк: ${d.rows}</b>
+      <span style="color:#7a8499">— недели: ${d.weeks.join(', ')}</span>
+      <table>
+        <tr><th>Week start</th><th>Funnel / Bot</th>
+          ${d.sample[0].steps.map((_, i) => `<th>Step ${i + 1}</th>`).join('')}</tr>
+        ${d.sample.map(r => `<tr><td>${esc(r.week)}</td><td>${esc(r.label)}</td>
+          ${r.steps.map(v => `<td>${v}</td>`).join('')}</tr>`).join('')}
+      </table>
+    </div>`;
 }
