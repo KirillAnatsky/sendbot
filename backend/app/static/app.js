@@ -1019,8 +1019,11 @@ async function refreshChatMessages() {
   CHAT_LAST_COUNT = msgs.length;
   const box = document.getElementById('chat-messages');
   box.innerHTML = msgs.map(m => {
-    const cls = m.direction === 'in' ? 'in' : (m.is_operator ? 'out op' : 'out');
-    const who = m.direction === 'in' ? '' : (m.is_operator ? 'оператор' : 'бот');
+    const cls = m.direction === 'in' ? 'in'
+      : (m.is_broadcast ? 'out bc' : (m.is_operator ? 'out op' : 'out'));
+    const who = m.direction === 'in' ? ''
+      : (m.is_broadcast ? '📣 рассылка «' + esc(m.broadcast_name || '') + '»'
+        : (m.is_operator ? 'оператор' : 'бот'));
     return `<div class="msg ${cls}">
       <div class="msg-bubble">${esc(m.text)}</div>
       <div class="msg-meta">${who ? who + ' · ' : ''}${new Date(m.created_at + 'Z').toLocaleTimeString('ru', {hour:'2-digit',minute:'2-digit'})}</div>

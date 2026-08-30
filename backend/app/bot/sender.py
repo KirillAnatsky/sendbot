@@ -345,10 +345,16 @@ async def send_message_content(
     bot: Bot, session: AsyncSession, sub: Subscriber,
     text: str, media: list | None, keyboard: InlineKeyboardMarkup | None,
     is_operator: bool = False,
+    log_history: bool = True,
 ) -> bool:
     """Отправка сообщения воронки: текст + любое число вложений + кнопки.
     Правила: одиночное вложение несёт подпись+кнопки; при нескольких —
-    альбомы без кнопок, а текст/кнопки уходят отдельным сообщением."""
+    альбомы без кнопок, а текст/кнопки уходят отдельным сообщением.
+
+    log_history=False — не писать копию в переписку. Так уходят массовые
+    рассылки: их текст уже лежит один раз в таблице broadcasts, а кто его
+    получил — в broadcast_recipients. Писать одну и ту же строку в историю
+    каждому из 400 тысяч человек незачем, в чате она собирается на лету."""
     text = personalize(text or "", sub)
     media = [m for m in (media or []) if m.get("path")]
 
@@ -359,7 +365,7 @@ async def send_message_content(
             lambda: bot.send_message(sub.tg_id, text or "", reply_markup=keyboard, parse_mode=ParseMode.HTML),
             bot, session, sub,
         )
-        if ok:
+        if ok and log_history:
             await _log_out(session, sub, text, is_operator)
         return ok
 
@@ -394,6 +400,7 @@ async def send_message_content(
         )
         delivered = delivered or ok
 
-    summary = text or ("📎 " + ", ".join(KIND_LABEL.get(m["type"], m["type"]) for m in media))
-    await _log_out(session, sub, summary, is_operator)
+    if log_history:
+        summary = text or ("📎 " + ", ".join(KIND_LABEL.get(m["type"], m["type"]) for m in media))
+        await _log_out(session, sub, summary, is_operator)
     return delivered

@@ -499,7 +499,8 @@ async def _process_broadcast(session, bot, bc: Broadcast):
             break
         for sub in chunk:
             last_id = sub.id
-            ok = await send_message_content(bot, session, sub, bc.text, media, None)
+            ok = await send_message_content(
+                bot, session, sub, bc.text, media, None, log_history=False)
             bc.sent += 1 if ok else 0
             bc.failed += 0 if ok else 1
             session.add(BroadcastRecipient(

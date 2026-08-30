@@ -872,13 +872,34 @@ async def get_messages(sub_id: int, user=Depends(current_user),
             select(Message).where(Message.subscriber_id == sub_id).order_by(Message.created_at)
         )
     ).scalars().all()
-    return [
+    out = [
         {
             "id": m.id, "direction": m.direction, "text": m.text,
-            "is_operator": m.is_operator, "created_at": m.created_at.isoformat(),
+            "is_operator": m.is_operator, "is_broadcast": False,
+            "created_at": m.created_at.isoformat(),
         }
         for m in msgs
     ]
+
+    # Массовые рассылки в переписку не дублируются: их текст лежит один раз
+    # в broadcasts, а факт доставки — в broadcast_recipients. Здесь достаём
+    # их и подмешиваем в ленту, чтобы оператор видел полную картину.
+    sent = (await session.execute(
+        select(BroadcastRecipient.created_at, Broadcast.name, Broadcast.text,
+               Broadcast.id, Broadcast.created_at)
+        .join(Broadcast, Broadcast.id == BroadcastRecipient.broadcast_id)
+        .where(BroadcastRecipient.subscriber_id == sub_id,
+               BroadcastRecipient.delivered == True)  # noqa: E712
+    )).all()
+    for at, name, text, bc_id, bc_at in sent:
+        out.append({
+            "id": f"bc{bc_id}", "direction": "out", "text": text or "",
+            "is_operator": False, "is_broadcast": True, "broadcast_name": name,
+            "created_at": (at or bc_at).isoformat(),
+        })
+
+    out.sort(key=lambda m: m["created_at"])
+    return out
 
 
 class SendMsgIn(BaseModel):

@@ -472,3 +472,6 @@ th { background: #f8fafc; color: #7a8499; font-weight: 600; font-size: 12.5px; t
 .lang-quick { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 3px; }
 .lang-quick .pill { cursor: pointer; user-select: none; }
 .lang-quick .pill:hover { background: #2e6bff; color: #fff; }
+
+/* рассылка в ленте чата — визуально отличается от личных сообщений бота */
+.msg.out.bc .msg-bubble { background: #fff6e8; border: 1px solid #f0dcbd; color: #6b5636; }
