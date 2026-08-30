@@ -147,15 +147,28 @@ def _language_port(data: dict, sub: Subscriber) -> str:
     в ветку «pt». Ничего не совпало (или язык неизвестен) — output_1
     «остальные».
     """
+    branches = data.get("languages") or []
     sub_lang = (sub.language_code or "").strip().lower()
-    if not sub_lang:
-        return "output_1"
-    sub_primary = sub_lang.split("-")[0]
-    for i, entry in enumerate(data.get("languages") or []):
-        codes = [c.strip().lower() for c in str(entry).split(",") if c.strip()]
-        if sub_lang in codes or sub_primary in [c.split("-")[0] for c in codes]:
-            return f"output_{i + 2}"
-    return "output_1"
+    port, matched = "output_1", None
+
+    if sub_lang:
+        sub_primary = sub_lang.split("-")[0]
+        for i, entry in enumerate(branches):
+            codes = [c.strip().lower() for c in str(entry).split(",") if c.strip()]
+            if sub_lang in codes or sub_primary in [c.split("-")[0] for c in codes]:
+                port, matched = f"output_{i + 2}", entry
+                break
+
+    # решение видно в разделе «Логи»: без этого невозможно понять, почему
+    # человек ушёл не в ту ветку — Telegram присылает язык интерфейса, а он
+    # у многих не совпадает с языком, на котором человек реально говорит
+    log.info(
+        "Язык-развилка: подписчик #%s language_code=%r → %s (ветки: %s)",
+        sub.id, sub.language_code,
+        f"ветка «{matched}»" if matched else "остальные",
+        ", ".join(map(str, branches)) or "нет",
+    )
+    return port
 
 
 async def handle_button(bot: Bot, session: AsyncSession, run_id: int, node_id: str, btn: int):
