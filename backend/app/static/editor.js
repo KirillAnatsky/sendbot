@@ -103,6 +103,34 @@ function portsHint(type, d) {
 
 // ---------- открытие/закрытие ----------
 let editorReturnTo = 'funnels';  // куда вернуться по «Назад»
+let EDITOR_SNAPSHOT = null;      // состояние на момент загрузки/сохранения
+
+// всё, что уходит в saveFunnel — если отличается от снимка, есть несохранённое
+function editorStateJson() {
+  if (!editor) return '';
+  try {
+    return JSON.stringify({
+      graph: editor.export(),
+      name: document.getElementById('funnel-name').value,
+      trigger: document.getElementById('funnel-trigger').value,
+      triggerValue: document.getElementById('funnel-trigger-value').value,
+      triggerTag: document.getElementById('funnel-trigger-tag').value,
+      bots: [...document.querySelectorAll('#funnel-bots .pill.on')].map(p => p.dataset.id),
+    });
+  } catch (e) { return ''; }
+}
+
+function editorDirty() {
+  return EDITOR_SNAPSHOT !== null && editorStateJson() !== EDITOR_SNAPSHOT;
+}
+
+// не дать закрыть вкладку с несохранённой воронкой
+window.addEventListener('beforeunload', e => {
+  if (!document.getElementById('page-editor').classList.contains('hidden') && editorDirty()) {
+    e.preventDefault();
+    e.returnValue = '';
+  }
+});
 
 async function openEditor(id) {
   // запоминаем, откуда пришли (список воронок или экран бота)
@@ -161,6 +189,7 @@ async function openEditor(id) {
   document.getElementById('steps-drawer').classList.add('hidden');
   decoratePorts();
   loadFunnelStats();
+  EDITOR_SNAPSHOT = editorStateJson();
 }
 
 // ---------- статистика шагов ----------
@@ -268,6 +297,9 @@ async function toggleStepsDrawer() {
 }
 
 function closeEditor() {
+  if (editorDirty() &&
+      !confirm('Есть несохранённые изменения — выйти без сохранения?\n\n(Сохранить: кнопка «💾 Сохранить» или Ctrl/⌘+S)')) return;
+  EDITOR_SNAPSHOT = null;
   if (editorReturnTo === 'bot' && typeof BOT_ID !== 'undefined' && BOT_ID) openBot(BOT_ID);
   else go('funnels');
 }
@@ -604,7 +636,7 @@ function setupImageUploader() {
 function btnRow(b, i) {
   return `<div class="btn-row-item">
     <input placeholder="Текст кнопки" class="p-btn-label" value="${esc(b.label || '')}">
-    <input placeholder="URL (или пусто)" class="p-btn-url" value="${esc(b.url || '')}" style="width:90px">
+    <input placeholder="URL (или пусто)" class="p-btn-url" value="${esc(b.url || '')}">
     <button class="btn danger" onclick="this.parentElement.remove();scheduleAutoApply()">✕</button>
   </div>`;
 }
@@ -697,6 +729,7 @@ async function aiChatSend() {
       // граф приходит прямо в ответе — рисуем сразу, без второго запроса
       const f = r.funnel || await api('/funnels/' + currentFunnelId);
       applyFunnelToCanvas(f);
+      setTimeout(() => { EDITOR_SNAPSHOT = editorStateJson(); }, 120);
       flashStatus('Воронка обновлена ✅');
     }
   } catch (e) {
@@ -816,6 +849,7 @@ async function saveFunnel() {
         bot_ids: botIds,
       },
     });
+    EDITOR_SNAPSHOT = editorStateJson();
     flashStatus('Сохранено ✅');
   } catch (e) { /* alert уже показан */ }
 }
@@ -866,6 +900,8 @@ function setupClipboard() {
     if (document.getElementById('page-editor').classList.contains('hidden')) return;
     const inField = /^(INPUT|TEXTAREA|SELECT)$/.test((e.target.tagName || ''));
     const mod = e.ctrlKey || e.metaKey;
+    // Ctrl/⌘+S сохраняет даже из поля ввода — рука сама тянется
+    if (mod && e.key.toLowerCase() === 's') { e.preventDefault(); saveFunnel(); return; }
     if (inField) return;
     if (mod && e.key.toLowerCase() === 'c') { e.preventDefault(); copyNodes(); }
     else if (mod && e.key.toLowerCase() === 'v') { e.preventDefault(); pasteNodes(); }

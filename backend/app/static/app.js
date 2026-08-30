@@ -23,11 +23,22 @@ function esc(s) {
 function showLogin() {
   document.getElementById('login-screen').classList.remove('hidden');
   document.getElementById('app').classList.add('hidden');
+  // курсор сразу в нужное поле: логин уже заполнен — значит в пароль
+  setTimeout(() => {
+    const login = document.getElementById('login-name');
+    const pw = document.getElementById('login-password');
+    (login.value.trim() ? pw : login).focus();
+  }, 50);
 }
 function showApp() {
   document.getElementById('login-screen').classList.add('hidden');
   document.getElementById('app').classList.remove('hidden');
-  const page = firstAllowedPage();
+  // если в адресе уже есть раздел (#broadcasts) и он доступен — открываем его
+  const fromHash = location.hash.slice(1);
+  const hashOk = fromHash && loaders[fromHash]
+    && !(PAGE_PERM[fromHash] && !can(PAGE_PERM[fromHash]))
+    && !(fromHash === 'team' && ME.role !== 'owner');
+  const page = hashOk ? fromHash : firstAllowedPage();
   if (page) go(page);
   else document.getElementById('app').innerHTML =
     '<div class="panel" style="margin:40px">Вам пока не выдали доступ ни к одному разделу. Обратитесь к владельцу аккаунта.</div>';
@@ -37,12 +48,21 @@ let ME = null;  // текущий пользователь
 async function doLogin() {
   const login = document.getElementById('login-name').value.trim();
   const pw = document.getElementById('login-password').value;
+  const errEl = document.getElementById('login-error');
+  errEl.textContent = '';
   try {
-    const r = await fetch('/api/auth/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ login, password: pw }),
-    });
+    let r;
+    try {
+      r = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ login, password: pw }),
+      });
+    } catch {
+      // сеть упала — это не «неверный пароль», говорим честно
+      errEl.textContent = 'Сервер недоступен — проверьте соединение';
+      return;
+    }
     if (!r.ok) throw new Error();
     const data = await r.json();
     TOKEN = data.token;
@@ -152,8 +172,24 @@ function go(page) {
   document.getElementById('page-' + page).classList.remove('hidden');
   document.querySelectorAll('.nav-item').forEach(n =>
     n.classList.toggle('active', n.dataset.page === page));
+  // раздел живёт в адресе: F5 и кнопка «назад» возвращают куда надо
+  if (location.hash.slice(1) !== page) {
+    try { history.replaceState(null, '', '#' + page); } catch (e) {}
+  }
   (loaders[page] || (() => {}))();
 }
+
+window.addEventListener('hashchange', () => {
+  const p = location.hash.slice(1);
+  if (!ME || !p || !loaders[p]) return;
+  const el = document.getElementById('page-' + p);
+  if (el && el.classList.contains('hidden')) {
+    const feature = PAGE_PERM[p];
+    if (feature && !can(feature)) return;
+    if (p === 'team' && ME.role !== 'owner') return;
+    go(p);
+  }
+});
 
 // дашборд живёт в dashboard.js (loadDashboard)
 
@@ -506,6 +542,12 @@ async function deleteTag(id) {
 let SEG_BUILDER = null;
 let SEG_APPLIED = null;  // применённый фильтр сегмента (или null)
 
+let _subsTimer = null;
+function subsDebounce() {           // поиск не дёргает сервер на каждую букву
+  clearTimeout(_subsTimer);
+  _subsTimer = setTimeout(loadSubscribers, 300);
+}
+
 function currentSubFilter() {
   const botId = +document.getElementById('sub-bot-filter').value || null;
   const search = document.getElementById('sub-search').value.trim();
@@ -698,7 +740,15 @@ async function sendBroadcast() {
     segment: BC_SEG.getFilter(),
   };
   if (!body.text.trim() && !body.media.length) { alert('Добавьте текст или вложение'); return; }
-  if (!confirm('Запустить рассылку?')) return;
+  // перед стартом показываем, скольким людям уйдёт — запуск вслепую опасен
+  let total = null;
+  try {
+    const r = await api('/subscribers/search', { method: 'POST',
+      body: { bot_id: botId, filter: body.segment, count_only: true } });
+    total = r.total;
+  } catch (e) { /* не посчиталось — спросим без числа */ }
+  if (total === 0) { alert('Под выбранный сегмент не попадает ни один подписчик.'); return; }
+  if (!confirm(total != null ? `Запустить рассылку? Получателей: ${total}` : 'Запустить рассылку?')) return;
   await api('/broadcasts', { method: 'POST', body });
   hideBroadcastForm();
   document.getElementById('bc-text').value = '';
@@ -1078,6 +1128,21 @@ async function chatRemoveTag(tagId) {
   await api(`/subscribers/${CHAT_SUB}/tags/${tagId}`, { method: 'DELETE' });
   refreshChatInfo();
 }
+
+// Esc закрывает верхний открытый слой: модалку, карточку рассылки, чат
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return;
+  const visible = id => !document.getElementById(id).classList.contains('hidden');
+  if (visible('dl-modal')) { closeDeepLink(); return; }
+  if (visible('bc-detail')) { closeBroadcast(); return; }
+  if (visible('chat-drawer')) { closeChat(); return; }
+  if (visible('page-editor')) {
+    const ai = document.getElementById('ai-chat');
+    if (ai && !ai.classList.contains('hidden')) { toggleAiChat(); return; }
+    const sd = document.getElementById('steps-drawer');
+    if (sd && !sd.classList.contains('hidden')) { sd.classList.add('hidden'); return; }
+  }
+});
 
 // ---------- старт ----------
 // ждём загрузки всех скриптов (dashboard.js, bot.js и т.д.)

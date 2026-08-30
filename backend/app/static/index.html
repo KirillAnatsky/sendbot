@@ -5,7 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>SendBot — админка</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/drawflow@0.0.60/dist/drawflow.min.css">
-<link rel="stylesheet" href="style.css?v=39">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 100 100%27%3E%3Ctext y=%27.9em%27 font-size=%2790%27%3E%F0%9F%A4%96%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css?v=40">
 </head>
 <body>
 
@@ -14,8 +15,8 @@
   <div class="login-box">
     <h1>SendBot</h1>
     <p>Конструктор ТГ-ботов и воронок</p>
-    <input type="text" id="login-name" placeholder="Логин" value="admin">
-    <input type="password" id="login-password" placeholder="Пароль">
+    <input type="text" id="login-name" placeholder="Логин" value="admin" autocomplete="username" oninput="document.getElementById('login-error').textContent=''">
+    <input type="password" id="login-password" placeholder="Пароль" autocomplete="current-password" oninput="document.getElementById('login-error').textContent=''">
     <button class="btn primary" onclick="doLogin()">Войти</button>
     <div id="login-error" class="error"></div>
   </div>
@@ -160,7 +161,7 @@
       </div>
       <div id="bot-tab-subs" class="bot-tab">
         <div class="page-head" style="margin-top:14px">
-          <input id="bot-sub-search" class="inline-input" placeholder="Поиск по имени…" oninput="botLoadSubs()">
+          <input id="bot-sub-search" class="inline-input" placeholder="Поиск по имени…" oninput="botSubsDebounce()">
           <button class="btn" onclick="botToggleSeg()">🔎 Сегмент</button>
           <span class="spacer"></span>
         </div>
@@ -269,7 +270,7 @@
     <section id="page-subscribers" class="page hidden">
       <div class="page-head">
         <h2>Подписчики</h2>
-        <input id="sub-search" class="inline-input" placeholder="Поиск по имени…" oninput="loadSubscribers()">
+        <input id="sub-search" class="inline-input" placeholder="Поиск по имени…" oninput="subsDebounce()">
         <select id="sub-bot-filter" onchange="loadSubscribers()"><option value="">Все боты</option></select>
         <button class="btn" onclick="toggleSegPanel()">🔎 Сегмент</button>
       </div>
@@ -595,13 +596,13 @@
 
 <script src="https://cdn.jsdelivr.net/npm/drawflow@0.0.60/dist/drawflow.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-<script src="app.js?v=39"></script>
-<script src="media.js?v=39"></script>
-<script src="segment.js?v=39"></script>
-<script src="bot.js?v=39"></script>
-<script src="dashboard.js?v=39"></script>
-<script src="sheets.js?v=39"></script>
-<script src="analysis.js?v=39"></script>
-<script src="editor.js?v=39"></script>
+<script src="app.js?v=40"></script>
+<script src="media.js?v=40"></script>
+<script src="segment.js?v=40"></script>
+<script src="bot.js?v=40"></script>
+<script src="dashboard.js?v=40"></script>
+<script src="sheets.js?v=40"></script>
+<script src="analysis.js?v=40"></script>
+<script src="editor.js?v=40"></script>
 </body>
 </html>

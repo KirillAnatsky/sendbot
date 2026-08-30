@@ -57,6 +57,12 @@ function botTab(tab) {
 }
 
 // --- вкладка подписчиков (с чатом и сегментом) ---
+let _botSubsTimer = null;
+function botSubsDebounce() {        // поиск не дёргает сервер на каждую букву
+  clearTimeout(_botSubsTimer);
+  _botSubsTimer = setTimeout(botLoadSubs, 300);
+}
+
 async function botLoadSubs() {
   if (!TAGS.length) await loadTags();
   const search = document.getElementById('bot-sub-search').value.trim();

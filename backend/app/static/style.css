@@ -76,6 +76,7 @@ th { background: #f8fafc; color: #7a8499; font-weight: 600; font-size: 12.5px; t
 .props .btn { margin-top: 12px; }
 .btn-row-item { display: flex; gap: 6px; margin-bottom: 6px; }
 .btn-row-item input { flex: 1; }
+.btn-row-item .p-btn-url { flex: 1.4; min-width: 0; }  /* URL длиннее текста кнопки */
 
 /* загрузчик картинки */
 .img-drop { border: 2px dashed #cfd6e4; border-radius: 10px; padding: 12px; text-align: center;
@@ -442,3 +443,26 @@ th { background: #f8fafc; color: #7a8499; font-weight: 600; font-size: 12.5px; t
 .sheets-preview { margin-top: 16px; overflow-x: auto; }
 .sheets-preview table { font-size: 12px; margin-top: 6px; }
 .sheets-preview td, .sheets-preview th { white-space: nowrap; }
+
+
+/* ---------- узкие экраны: планшет и телефон ----------
+   Сайдбар складывается в горизонтальное меню сверху, таблицы скроллятся,
+   контент занимает всю ширину. Редактор воронок остаётся десктопным. */
+@media (max-width: 900px) {
+  #app { display: block; }
+  .sidebar { position: static; width: 100%; flex-direction: row; flex-wrap: wrap;
+    align-items: center; gap: 4px; padding: 8px 10px; }
+  .sidebar nav { display: flex; flex-wrap: wrap; gap: 2px; flex: 1; min-width: 0; }
+  .sidebar .nav-item { padding: 7px 10px; font-size: 13px; margin-bottom: 0; white-space: nowrap; }
+  .logo { padding: 0 8px; font-size: 16px; }
+  .side-user { margin-top: 0; border-top: none; padding-top: 0; display: flex; align-items: center; gap: 2px; }
+  .side-user #side-user-name { display: none; }
+  main { margin-left: 0; padding: 14px 12px; }
+  .page-head { flex-wrap: wrap; }
+  .page-head h2 { flex-basis: 100%; }
+  /* таблица шире экрана — скроллим её, а не всю страницу */
+  table { display: block; overflow-x: auto; white-space: nowrap; }
+  .editor-toolbar { flex-wrap: wrap; }
+  .chat-drawer { width: 100vw; }
+  .chat-side { display: none; }  /* на телефоне — только переписка */
+}
