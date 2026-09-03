@@ -30,6 +30,8 @@ function nodeHtml(type, data) {
         return `<span class="df-media-thumb icon" title="${esc(m.type)}">${MEDIA_ICON[m.type] || '📎'}</span>`;
       }).join('') + (media.length > 6 ? `<span class="df-media-more">+${media.length - 6}</span>` : '') + `</div>`;
     }
+    const orderHint = (data.text_first && media.length)
+      ? '<div class="df-order">↑ текст идёт первым</div>' : '';
     const text = (data.text || '').slice(0, 500);
     const toggle = text.length > 120
       ? `<span class="df-toggle" onclick="toggleNodeExpand(event, this)">развернуть ▾</span>` : '';
@@ -48,7 +50,7 @@ function nodeHtml(type, data) {
         return `<div class="df-btn${st}${off}"><span class="df-btn-port">${port++}</span>${esc(b.label || 'кнопка')}</div>`;
       }).join('') + `</div>`;
     }
-    return `<div class="df-title">${NODE_META.message.title}</div>${mediaHtml}${textHtml}${btnsHtml}` +
+    return `<div class="df-title">${NODE_META.message.title}</div>${orderHint}${mediaHtml}${textHtml}${btnsHtml}` +
            `<div class="df-ports">${buttons.some(b => !b.url) ? '1: далее' : ''}</div>`;
   }
   if (type === 'language') {
@@ -518,6 +520,17 @@ function showProps(id) {
     html += `
       <label>Текст (HTML, {first_name})</label>
       <textarea id="p-text" rows="6">${esc(d.text || '')}</textarea>
+      <label>Порядок</label>
+      <select id="p-order">
+        <option value="" ${d.text_first ? '' : 'selected'}>сначала вложение, текст подписью</option>
+        <option value="1" ${d.text_first ? 'selected' : ''}>сначала текст, потом вложение</option>
+      </select>
+      <div class="hint-box" style="margin-top:6px">
+        По умолчанию Telegram вешает текст подписью под картинкой — одним
+        сообщением. Второй вариант шлёт текст отдельным сообщением перед
+        вложением; кнопки в обоих случаях остаются внизу.
+      </div>
+
       <label>Вложения (фото, видео, аудио, голосовое, кружок, файл)</label>
       <div id="media-list"></div>
       <div id="img-drop" class="img-drop" tabindex="0">
@@ -750,6 +763,7 @@ function applyProps() {
 
   if (node.name === 'message') {
     d.text = document.getElementById('p-text').value;
+    d.text_first = document.getElementById('p-order').value === '1';
     d.media = MEDIA_ITEMS.map(m => ({ type: m.type, path: m.path, name: m.name || '' }));
     d.photo_url = '';  // старое поле больше не используем (медиа в d.media)
     d.buttons = [...document.querySelectorAll('#p-buttons .btn-row')].map(row => {

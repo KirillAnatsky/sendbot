@@ -24,7 +24,7 @@ from ..models import (
 )
 from .. import segment as seg
 from . import engine as fx
-from .sender import send_message_content, send_to_subscriber
+from .sender import build_broadcast_keyboard, send_message_content, send_to_subscriber
 
 log = logging.getLogger("sendbot.bot")
 
@@ -34,6 +34,7 @@ def build_dispatcher() -> Dispatcher:
     d = Dispatcher()
     d.message.register(on_message, F.text)
     d.callback_query.register(on_button, F.data.startswith("f:"))
+    d.callback_query.register(on_broadcast_button, F.data.startswith("b:"))
     return d
 
 
@@ -296,6 +297,35 @@ async def on_button(cb: CallbackQuery, db_bot_id: int):
     await cb.answer()
 
 
+async def on_broadcast_button(cb: CallbackQuery, db_bot_id: int):
+    """Клик по кнопке рассылки: вешаем тег, если он задан у кнопки.
+
+    Ветвиться, как в воронке, тут некуда — узлов у рассылки нет. Зато тег
+    даёт главное: сегмент откликнувшихся, по которому дальше можно слать
+    отдельно или запускать воронку.
+    """
+    try:
+        _, bc_id, idx = cb.data.split(":")
+        bc_id, idx = int(bc_id), int(idx)
+    except ValueError:
+        await cb.answer()
+        return
+
+    note = None
+    async with SessionLocal() as session:
+        sub = await upsert_subscriber(session, db_bot_id, cb.from_user)
+        bc = await session.get(Broadcast, bc_id)
+        buttons = (bc.buttons or []) if bc else []
+        btn = buttons[idx] if 0 <= idx < len(buttons) else None
+        if btn and btn.get("tag_id"):
+            await fx._add_tag(session, sub.id, btn["tag_id"])
+            note = btn.get("reply") or "Принято 👌"
+            log.info("Рассылка #%s: клик по кнопке «%s» от подписчика #%s",
+                     bc_id, btn.get("label"), sub.id)
+        await session.commit()
+    await cb.answer(note or "")
+
+
 async def trigger_tag_added(session, sub: Subscriber, tag_id: int):
     """Вызывается из API при добавлении тега вручную."""
     bot = manager.get(sub.bot_id)
@@ -499,8 +529,10 @@ async def _process_broadcast(session, bot, bc: Broadcast):
             break
         for sub in chunk:
             last_id = sub.id
+            kb = build_broadcast_keyboard(bc.buttons or [], bc.id, sub)
             ok = await send_message_content(
-                bot, session, sub, bc.text, media, None, log_history=False)
+                bot, session, sub, bc.text, media, kb,
+                log_history=False, text_first=bool(bc.text_first))
             bc.sent += 1 if ok else 0
             bc.failed += 0 if ok else 1
             session.add(BroadcastRecipient(

@@ -718,10 +718,79 @@ async function showBroadcastForm() {
     : '<option value="">нет ботов</option>';
   BC_SEG = makeSegment(document.getElementById('bc-segment'));
   BC_MEDIA = mountMediaUploader(document.getElementById('bc-media'), []);
+  document.getElementById('bc-buttons').innerHTML = '';
+  document.getElementById('bc-order').value = '';
   document.getElementById('bc-count').textContent = '';
   document.getElementById('broadcast-form').classList.remove('hidden');
 }
 function hideBroadcastForm() { document.getElementById('broadcast-form').classList.add('hidden'); }
+
+// ---------- кнопки рассылки ----------
+// Два вида: ссылка и «повесить тег». Ветвление, как в воронке, тут
+// невозможно — у рассылки нет узлов, некуда вести.
+const BC_BTN_STYLES = [
+  ['', 'обычная'], ['primary', '🔵 основная'],
+  ['success', '🟢 зелёная'], ['danger', '🔴 красная'],
+];
+
+function bcButtonRow(b = {}) {
+  const isTag = !b.url && (b.tag_id || b.tag_id === 0);
+  return `<div class="bc-btn-row">
+    <div class="row1">
+      <input class="bc-label inline-input" placeholder="Текст кнопки" value="${esc(b.label || '')}">
+      <select class="bc-style inline-input" style="flex:0 0 130px">
+        ${BC_BTN_STYLES.map(([v, l]) =>
+          `<option value="${v}" ${(b.style || '') === v ? 'selected' : ''}>${l}</option>`).join('')}
+      </select>
+      <button class="btn danger" type="button" title="убрать"
+        onclick="this.closest('.bc-btn-row').remove()">✕</button>
+    </div>
+    <div class="row2">
+      <select class="bc-kind inline-input" onchange="bcButtonKind(this)">
+        <option value="url" ${isTag ? '' : 'selected'}>ссылка</option>
+        <option value="tag" ${isTag ? 'selected' : ''}>повесить тег</option>
+      </select>
+      <input class="bc-action bc-url inline-input ${isTag ? 'hidden' : ''}"
+        placeholder="https://…" value="${esc(b.url || '')}">
+      <select class="bc-action bc-tag inline-input ${isTag ? '' : 'hidden'}">
+        ${TAGS.map(t => `<option value="${t.id}" ${String(b.tag_id) === String(t.id) ? 'selected' : ''}>${esc(t.name)}</option>`).join('')}
+      </select>
+      <input class="bc-reply inline-input ${isTag ? '' : 'hidden'}" style="flex:1"
+        placeholder="ответ во всплывашке (необязательно)" value="${esc(b.reply || '')}">
+    </div>
+  </div>`;
+}
+
+function bcButtonKind(sel) {
+  const row = sel.closest('.bc-btn-row');
+  const tag = sel.value === 'tag';
+  row.querySelector('.bc-url').classList.toggle('hidden', tag);
+  row.querySelector('.bc-tag').classList.toggle('hidden', !tag);
+  row.querySelector('.bc-reply').classList.toggle('hidden', !tag);
+}
+
+function bcAddButton() {
+  if (!TAGS.length) { /* теги подтянутся при открытии формы */ }
+  document.getElementById('bc-buttons')
+    .insertAdjacentHTML('beforeend', bcButtonRow());
+}
+
+function collectBcButtons() {
+  return [...document.querySelectorAll('#bc-buttons .bc-btn-row')].map(row => {
+    const b = { label: row.querySelector('.bc-label').value.trim() };
+    const style = row.querySelector('.bc-style').value;
+    if (style) b.style = style;
+    if (row.querySelector('.bc-kind').value === 'tag') {
+      const tag = row.querySelector('.bc-tag').value;
+      if (tag) b.tag_id = +tag;
+      const reply = row.querySelector('.bc-reply').value.trim();
+      if (reply) b.reply = reply;
+    } else {
+      b.url = row.querySelector('.bc-url').value.trim();
+    }
+    return b;
+  }).filter(b => b.label && (b.url || b.tag_id));
+}
 async function countBroadcast() {
   const botId = +document.getElementById('bc-bot').value;
   if (!botId) { alert('Выберите бота'); return; }
@@ -737,9 +806,13 @@ async function sendBroadcast() {
     name: document.getElementById('bc-name').value || 'Рассылка',
     text: document.getElementById('bc-text').value,
     media: BC_MEDIA ? BC_MEDIA.getItems() : [],
+    buttons: collectBcButtons(),
+    text_first: document.getElementById('bc-order').value === '1',
     segment: BC_SEG.getFilter(),
   };
-  if (!body.text.trim() && !body.media.length) { alert('Добавьте текст или вложение'); return; }
+  if (!body.text.trim() && !body.media.length && !body.buttons.length) {
+    alert('Добавьте текст, вложение или кнопку'); return;
+  }
   // перед стартом показываем, скольким людям уйдёт — запуск вслепую опасен
   let total = null;
   try {
@@ -803,7 +876,13 @@ async function openBroadcast(id) {
               <span>${esc(m.name || m.path.split('/').pop())}</span>
             </div>`).join('')}</div>` : ''}
           <div class="bc-text">${b.text ? esc(b.text).replace(/\n/g, '<br>') : '<i style="color:#99a">без текста</i>'}</div>
+          ${(b.buttons || []).length ? `<div class="df-btns">${b.buttons.map(x => {
+            const st = x.style ? ` st-${x.style}` : '';
+            const what = x.url ? '🔗 ' + esc(x.url) : 'тег «' + esc(x.tag_name || x.tag_id) + '»';
+            return `<div class="df-btn${st}" title="${esc(what)}">${esc(x.label)}</div>`;
+          }).join('')}</div>` : ''}
         </div>
+        ${b.text_first ? '<div class="bc-hint">Текст уходил отдельным сообщением перед вложением.</div>' : ''}
         ${media.length > 1 ? '<div class="bc-hint">Несколько фото/видео уходят одним альбомом.</div>' : ''}
       </div>
 

@@ -62,6 +62,8 @@ def _migrate(conn):
     add("subscribers", "automation_paused_until", "automation_paused_until TIMESTAMP")
     add("broadcasts", "bot_id", "bot_id INTEGER DEFAULT 0")
     add("broadcasts", "media", "media JSON")
+    add("broadcasts", "buttons", "buttons JSON")
+    add("broadcasts", "text_first", "text_first BOOLEAN DEFAULT FALSE")
     add("broadcast_recipients", "created_at", "created_at TIMESTAMP")
 
     if "subscribers" not in tables:

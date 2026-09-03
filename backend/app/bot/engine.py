@@ -90,7 +90,8 @@ async def advance(
             media = list(data.get("media") or [])
             if not media and data.get("photo_url"):  # обратная совместимость
                 media = [{"type": "photo", "path": data["photo_url"]}]
-            await send_message_content(bot, session, sub, data.get("text", ""), media, kb)
+            await send_message_content(bot, session, sub, data.get("text", ""), media, kb,
+                                       text_first=bool(data.get("text_first")))
             has_branchy_buttons = any(
                 node["outputs"].get(f"output_{i + 2}") for i in range(len(buttons))
             )

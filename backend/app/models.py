@@ -245,6 +245,10 @@ class Broadcast(Base):
     text: Mapped[str] = mapped_column(Text)
     photo_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
     media: Mapped[list] = mapped_column(JSON, default=list)  # [{type, path, name}]
+    # [{label, url}] — ссылка, либо {label, tag_id} — повесить тег по клику
+    buttons: Mapped[list] = mapped_column(JSON, default=list)
+    # True — текст уходит отдельным сообщением ПЕРЕД вложениями
+    text_first: Mapped[bool] = mapped_column(Boolean, default=False)
     # {"include_tags": [ids], "exclude_tags": [ids]}
     filters: Mapped[dict] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True)  # pending | running | done | failed

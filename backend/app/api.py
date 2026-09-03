@@ -1807,12 +1807,43 @@ async def ai_edit(body: AIEditIn, session=Depends(get_session)):
 
 # ---------- broadcasts ----------
 
+def _clean_broadcast_buttons(raw: list | None) -> list:
+    """Оставляем только осмысленные кнопки: с текстом и одним действием."""
+    out = []
+    for b in raw or []:
+        if not isinstance(b, dict):
+            continue
+        label = str(b.get("label") or "").strip()
+        if not label:
+            continue
+        item = {"label": label}
+        url = str(b.get("url") or "").strip()
+        if url:
+            item["url"] = url
+        elif b.get("tag_id"):
+            item["tag_id"] = int(b["tag_id"])
+            reply = str(b.get("reply") or "").strip()
+            if reply:
+                item["reply"] = reply[:180]   # всплывашка Telegram короткая
+        else:
+            continue          # ни ссылки, ни тега — кнопке нечего делать
+        for k in ("style", "icon_custom_emoji_id"):
+            if b.get(k):
+                item[k] = str(b[k]).strip()
+        if b.get("disabled"):
+            item["disabled"] = True
+        out.append(item)
+    return out
+
+
 class BroadcastIn(BaseModel):
     name: str
     text: str
     bot_id: int
     photo_url: str | None = None
     media: list = []  # [{type, path, name}] — вложения (в т.ч. видео/альбомы)
+    buttons: list = []  # [{label, url}] — ссылка, либо {label, tag_id} — тег по клику
+    text_first: bool = False  # текст отдельным сообщением перед вложениями
     include_tags: list[int] = []
     exclude_tags: list[int] = []
     segment: dict | None = None  # если задан — используется вместо include/exclude
@@ -1901,6 +1932,12 @@ async def broadcast_detail(bc_id: int, user=Depends(current_user),
         "text": bc.text,
         "media": bc.media or [],
         "photo_url": bc.photo_url,
+        "buttons": [
+            # имя тега вместо id — в карточке важно, что кнопка делает
+            {**b, "tag_name": tag_names.get(b.get("tag_id"))} if b.get("tag_id") else b
+            for b in (bc.buttons or [])
+        ],
+        "text_first": bool(bc.text_first),
         "bot": bot.name if bot else "—",
         "bot_id": bc.bot_id,
         "status": bc.status,
@@ -1943,6 +1980,8 @@ async def create_broadcast(body: BroadcastIn, user=Depends(current_user),
         text=body.text,
         photo_url=body.photo_url,
         media=body.media or [],
+        buttons=_clean_broadcast_buttons(body.buttons),
+        text_first=bool(body.text_first),
         filters=filters,
     )
     session.add(bc)

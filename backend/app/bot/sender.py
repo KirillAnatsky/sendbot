@@ -112,6 +112,33 @@ def _make_button(**kwargs) -> InlineKeyboardButton:
         return InlineKeyboardButton(**plain)
 
 
+def build_broadcast_keyboard(buttons: list, broadcast_id: int,
+                             sub: Subscriber | None = None) -> InlineKeyboardMarkup | None:
+    """Клавиатура рассылки.
+
+    В воронке нажатие ведёт в следующий узел, а у рассылки узлов нет —
+    поэтому кнопка либо ссылка, либо вешает тег: `b:<id рассылки>:<номер>`.
+    """
+    if not buttons:
+        return None
+    rows = []
+    for i, b in enumerate(buttons):
+        if not isinstance(b, dict):
+            b = {"label": str(b)}
+        label = b.get("label")
+        url = b.get("url")
+        if sub is not None:
+            label = personalize(label or "", sub)
+        extra = _button_extras(b)
+        if url:
+            if sub is not None:
+                url = personalize(url, sub)
+            rows.append([_make_button(text=label, url=url, **extra)])
+        else:
+            rows.append([_make_button(text=label, callback_data=f"b:{broadcast_id}:{i}", **extra)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def build_keyboard(buttons: list, run_id: int, node_id: str, sub: Subscriber | None = None) -> InlineKeyboardMarkup | None:
     if not buttons:
         return None
@@ -390,6 +417,7 @@ async def send_message_content(
     text: str, media: list | None, keyboard: InlineKeyboardMarkup | None,
     is_operator: bool = False,
     log_history: bool = True,
+    text_first: bool = False,
 ) -> bool:
     """Отправка сообщения воронки: текст + любое число вложений + кнопки.
     Правила: одиночное вложение несёт подпись+кнопки; при нескольких —
@@ -419,12 +447,24 @@ async def send_message_content(
     kb_used = False
     delivered = False
 
+    # text_first — текст отдельным сообщением ПЕРЕД вложениями. По умолчанию
+    # Telegram-логика обратная: текст становится подписью под картинкой, то
+    # есть визуально идёт после неё. Кнопки в этом режиме остаются на потом,
+    # чтобы оказаться внизу, под последним вложением.
+    if text_first and text:
+        ok = await _deliver(
+            lambda: bot.send_message(sub.tg_id, text, parse_mode=ParseMode.HTML),
+            bot, session, sub,
+        )
+        delivered = delivered or ok
+        caption_used = True   # текст уже ушёл, подписью его не дублируем
+
     for kind, fam, items in sends:
         cap, markup = None, None
         real_single = kind == "single" or (kind == "group" and len(items) == 1)
         if single_total and real_single:
             t = items[0]["type"]
-            if t in CAPTION_CAPABLE:
+            if t in CAPTION_CAPABLE and not caption_used:
                 cap, caption_used = text or None, True
             markup, kb_used = keyboard, True  # кнопки на единственном вложении (в т.ч. кружке)
         elif keyboard is None and not caption_used and items[0]["type"] in CAPTION_CAPABLE:
