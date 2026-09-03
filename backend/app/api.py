@@ -233,6 +233,8 @@ def _user_public(user) -> dict:
         "bot_ids": user.bot_ids or [],
         "funnel_ids": (user.funnel_ids or []) if user.role != "owner" else [],
         "permissions": user_permissions(user),
+        "tg_id": user.tg_id,
+        "tg_username": user.tg_username,
     }
 
 
@@ -251,6 +253,104 @@ async def login(body: LoginIn, session=Depends(get_session)):
         # берёт права отсюда, а не из отдельного запроса
         "user": _user_public(user),
     }
+
+
+AUTH_KEY = "auth_telegram"
+
+
+async def get_auth_cfg(session) -> dict:
+    from .models import Setting
+
+    row = (await session.execute(
+        select(Setting).where(Setting.key == AUTH_KEY))).scalar_one_or_none()
+    return {"bot_id": None, **((row.value or {}) if row else {})}
+
+
+async def _auth_bot(session):
+    """Бот, чьим токеном проверяется подпись виджета. Он же — в котором
+    у @BotFather командой /setdomain привязан домен админки."""
+    cfg = await get_auth_cfg(session)
+    if not cfg.get("bot_id"):
+        return None
+    return await session.get(Bot, int(cfg["bot_id"]))
+
+
+@router.get("/auth/telegram/config")
+async def tg_auth_config(session=Depends(get_session)):
+    """Публично: показывать ли кнопку входа через Telegram и от какого бота."""
+    bot = await _auth_bot(session)
+    return {"enabled": bool(bot and bot.tg_username),
+            "bot_username": bot.tg_username if bot else None}
+
+
+class TgAuthIn(BaseModel):
+    id: int
+    auth_date: int
+    hash: str
+    first_name: str | None = None
+    last_name: str | None = None
+    username: str | None = None
+    photo_url: str | None = None
+
+
+@router.post("/auth/telegram")
+async def tg_auth(body: TgAuthIn, session=Depends(get_session)):
+    """Вход по подписи виджета Telegram.
+
+    Аккаунты здесь не заводятся: телеграм должен быть заранее привязан к
+    пользователю админки. Иначе войти мог бы любой, у кого есть Telegram.
+    """
+    from .auth import verify_telegram_login
+
+    bot = await _auth_bot(session)
+    if bot is None:
+        raise HTTPException(400, "Вход через Telegram не настроен")
+
+    data = {k: v for k, v in body.model_dump().items() if v is not None}
+    err = verify_telegram_login(data, bot.token)
+    if err:
+        log.warning("Вход через Telegram отклонён: %s (tg_id=%s)", err, body.id)
+        raise HTTPException(401, err)
+
+    user = (await session.execute(
+        select(User).where(User.tg_id == body.id))).scalar_one_or_none()
+    if user is None:
+        raise HTTPException(
+            403, "Этот телеграм не привязан ни к одному пользователю. "
+                 "Владелец привязывает его в разделе «Команда».")
+    if not user.is_active:
+        raise HTTPException(403, "Доступ отключён")
+
+    user.tg_username = body.username
+    user.last_login_at = datetime.utcnow()
+    log.info("Вход через Telegram: %s (@%s)", user.login, body.username or "—")
+    return {"token": make_token(user), "user": _user_public(user)}
+
+
+@router.post("/auth/telegram/link", dependencies=[Depends(require_auth)])
+async def tg_auth_link(body: TgAuthIn, user=Depends(current_user),
+                       session=Depends(get_session)):
+    """Привязать свой телеграм к своей же учётке — из админки, уже войдя."""
+    from .auth import verify_telegram_login
+
+    bot = await _auth_bot(session)
+    if bot is None:
+        raise HTTPException(400, "Вход через Telegram не настроен")
+    err = verify_telegram_login(
+        {k: v for k, v in body.model_dump().items() if v is not None}, bot.token)
+    if err:
+        raise HTTPException(400, err)
+
+    busy = (await session.execute(
+        select(User).where(User.tg_id == body.id, User.id != user.id))).scalar_one_or_none()
+    if busy is not None:
+        raise HTTPException(400, f"Этот телеграм уже привязан к «{busy.login}»")
+
+    me = await session.get(User, user.id)
+    me.tg_id = body.id
+    me.tg_username = body.username
+    log.info("Привязан телеграм @%s к пользователю %s", body.username or "—", me.login)
+    return {"ok": True, "tg_id": body.id, "tg_username": body.username}
 
 
 @router.get("/auth/me", dependencies=[Depends(require_auth)])
@@ -282,6 +382,35 @@ async def change_password(body: ChangePwIn, user=Depends(current_user), session=
 
 # ---------- команда (только владелец) ----------
 
+class AuthCfgIn(BaseModel):
+    bot_id: int | None = None
+
+
+@router.get("/auth/telegram/settings", dependencies=[Depends(require_owner)])
+async def tg_auth_settings(session=Depends(get_session)):
+    cfg = await get_auth_cfg(session)
+    bot = await _auth_bot(session)
+    return {"bot_id": cfg.get("bot_id"),
+            "bot_username": bot.tg_username if bot else None}
+
+
+@router.put("/auth/telegram/settings", dependencies=[Depends(require_owner)])
+async def tg_auth_settings_save(body: AuthCfgIn, session=Depends(get_session)):
+    from .models import Setting
+
+    row = (await session.execute(
+        select(Setting).where(Setting.key == AUTH_KEY))).scalar_one_or_none()
+    value = {"bot_id": int(body.bot_id) if body.bot_id else None}
+    if row:
+        row.value = value
+        flag_modified(row, "value")
+    else:
+        session.add(Setting(key=AUTH_KEY, value=value))
+    await session.flush()
+    log.info("Бот для входа через Telegram: #%s", value["bot_id"])
+    return await tg_auth_settings(session)
+
+
 class UserIn(BaseModel):
     login: str
     name: str = ""
@@ -291,6 +420,7 @@ class UserIn(BaseModel):
     funnel_ids: list[int] = []       # пусто = все воронки доступных ботов
     permissions: dict = {}           # {"funnels": "edit", ...}; у владельца не важно
     is_active: bool = True
+    tg_id: int | None = None         # привязанный телеграм (для входа и предпросмотра)
 
 
 @router.get("/users", dependencies=[Depends(require_owner)])
@@ -301,6 +431,7 @@ async def list_users(session=Depends(get_session)):
          "is_active": u.is_active, "bot_ids": u.bot_ids or [],
          "funnel_ids": u.funnel_ids or [],
          "permissions": user_permissions(u),
+         "tg_id": u.tg_id, "tg_username": u.tg_username,
          "last_login_at": u.last_login_at.isoformat() if u.last_login_at else None}
         for u in users
     ]
@@ -318,7 +449,7 @@ async def create_user(body: UserIn, session=Depends(get_session)):
              password_hash=hash_password(body.password),
              role="owner" if body.role == "owner" else "staff",
              bot_ids=body.bot_ids or [], funnel_ids=body.funnel_ids or [],
-             is_active=body.is_active,
+             is_active=body.is_active, tg_id=body.tg_id or None,
              permissions=normalize_permissions(body.permissions))
     session.add(u)
     await session.flush()
@@ -337,6 +468,16 @@ async def update_user(user_id: int, body: UserIn, session=Depends(get_session)):
     u.funnel_ids = body.funnel_ids or []
     u.is_active = body.is_active
     u.permissions = normalize_permissions(body.permissions)
+    # телеграм у каждого свой: не даём случайно отдать чужой доступ
+    if body.tg_id != u.tg_id:
+        if body.tg_id:
+            busy = (await session.execute(select(User).where(
+                User.tg_id == body.tg_id, User.id != u.id))).scalar_one_or_none()
+            if busy is not None:
+                raise HTTPException(400, f"Этот телеграм уже привязан к «{busy.login}»")
+        u.tg_id = body.tg_id or None
+        if not body.tg_id:
+            u.tg_username = None
     if body.password:
         if len(body.password) < 6:
             raise HTTPException(400, "Пароль слишком короткий")
@@ -1847,6 +1988,57 @@ class BroadcastIn(BaseModel):
     include_tags: list[int] = []
     exclude_tags: list[int] = []
     segment: dict | None = None  # если задан — используется вместо include/exclude
+
+
+class BroadcastPreviewIn(BaseModel):
+    bot_id: int
+    text: str = ""
+    media: list = []
+    buttons: list = []
+    text_first: bool = False
+
+
+@router.post("/broadcasts/preview",
+             dependencies=[Depends(require("broadcasts", "edit"))])
+async def broadcast_preview(body: BroadcastPreviewIn, user=Depends(current_user),
+                            session=Depends(get_session)):
+    """Отправить рассылку себе — до того, как она уйдёт на всю базу.
+
+    Заодно это самая честная проверка живости: если предпросмотр дошёл,
+    значит бот принимает апдейты, шлёт сообщения и разметка не сломана.
+    """
+    from .bot.runner import manager
+    from .bot.sender import build_broadcast_keyboard, send_message_content
+
+    await ensure_bot_access(user, body.bot_id)
+    me = await session.get(User, user.id)
+    if not me.tg_id:
+        raise HTTPException(
+            400, "К вашей учётке не привязан телеграм. Привяжите его кнопкой "
+                 "«Привязать Telegram» — тогда предпросмотр будет приходить вам.")
+
+    bot = manager.get(body.bot_id)
+    if bot is None:
+        raise HTTPException(400, "Бот не запущен — включите его в разделе «Боты»")
+
+    # шлём через существующего подписчика: бот вправе писать только тем, кто
+    # ему уже писал, да и подстановки {first_name} нужно на ком-то проверить
+    sub = (await session.execute(select(Subscriber).where(
+        Subscriber.bot_id == body.bot_id, Subscriber.tg_id == me.tg_id
+    ))).scalar_one_or_none()
+    if sub is None:
+        raise HTTPException(
+            400, "Вы ещё не писали этому боту. Откройте его в Telegram, нажмите "
+                 "/start и повторите — раньше бот не имеет права вам написать.")
+
+    kb = build_broadcast_keyboard(_clean_broadcast_buttons(body.buttons), 0, sub)
+    ok = await send_message_content(
+        bot, session, sub, body.text, body.media or [], kb,
+        log_history=False, text_first=bool(body.text_first))
+    if not ok:
+        raise HTTPException(400, "Не удалось отправить — проверьте текст и вложения")
+    log.info("Предпросмотр рассылки отправлен пользователю %s", me.login)
+    return {"ok": True}
 
 
 @router.get("/broadcasts", dependencies=[Depends(require("broadcasts", "view"))])

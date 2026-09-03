@@ -41,6 +41,9 @@ class User(Base):
     # права по разделам: {"funnels": "edit", "analytics": "view", ...}
     # у владельца игнорируются — ему доступно всё
     permissions: Mapped[dict] = mapped_column(JSON, default=dict)
+    # привязанный телеграм-аккаунт: вход через Telegram и предпросмотр рассылок
+    tg_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
+    tg_username: Mapped[str | None] = mapped_column(String(64), nullable=True)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 

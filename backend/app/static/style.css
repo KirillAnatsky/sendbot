@@ -531,3 +531,14 @@ th { background: #f8fafc; color: #7a8499; font-weight: 600; font-size: 12.5px; t
 .props .seg-row { flex-wrap: wrap; gap: 4px; }
 .props .seg-row .seg-field, .props .seg-row .seg-op, .props .seg-row .seg-value { min-width: 0; width: 100%; }
 .props .seg-head { flex-wrap: wrap; gap: 6px; }
+
+/* вход через Telegram на экране логина */
+.tg-login { margin-top: 16px; }
+.tg-or { position: relative; color: #99a3b5; font-size: 12px; margin-bottom: 12px; }
+.tg-or::before, .tg-or::after { content: ''; position: absolute; top: 50%; width: 38%;
+  height: 1px; background: #e3e8f0; }
+.tg-or::before { left: 0; }
+.tg-or::after { right: 0; }
+#tg-login-widget { display: flex; justify-content: center; }
+#tg-link-modal { text-align: left; }
+#tg-link-widget { display: flex; justify-content: center; margin-top: 10px; }

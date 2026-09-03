@@ -29,6 +29,7 @@ function showLogin() {
     const pw = document.getElementById('login-password');
     (login.value.trim() ? pw : login).focus();
   }, 50);
+  setupTelegramLogin();
 }
 function showApp() {
   document.getElementById('login-screen').classList.add('hidden');
@@ -75,6 +76,84 @@ async function doLogin() {
   }
 }
 
+// ---------- вход через Telegram ----------
+// Виджет Telegram — это <script> с параметрами, который сам рисует кнопку и
+// зовёт наш колбэк с подписанными данными. Подпись проверяет сервер.
+async function setupTelegramLogin() {
+  let cfg;
+  try { cfg = await (await fetch('/api/auth/telegram/config')).json(); }
+  catch (e) { return; }
+  if (!cfg.enabled || !cfg.bot_username) return;
+
+  const box = document.getElementById('tg-login');
+  const holder = document.getElementById('tg-login-widget');
+  holder.innerHTML = '';
+  const sc = document.createElement('script');
+  sc.async = true;
+  sc.src = 'https://telegram.org/js/telegram-widget.js?22';
+  sc.setAttribute('data-telegram-login', cfg.bot_username);
+  sc.setAttribute('data-size', 'large');
+  sc.setAttribute('data-userpic', 'false');
+  sc.setAttribute('data-onauth', 'onTelegramAuth(user)');
+  sc.setAttribute('data-request-access', 'write');
+  holder.appendChild(sc);
+  box.classList.remove('hidden');
+}
+
+async function onTelegramAuth(user) {
+  const errEl = document.getElementById('login-error');
+  errEl.textContent = '';
+  try {
+    const r = await fetch('/api/auth/telegram', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(user),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) { errEl.textContent = data.detail || 'Не удалось войти через Telegram'; return; }
+    TOKEN = data.token; ME = data.user;
+    localStorage.setItem('sb_token', TOKEN);
+    applyRoleUI();
+    showApp();
+  } catch (e) {
+    errEl.textContent = 'Сервер недоступен';
+  }
+}
+
+// Та же кнопка, но уже внутри админки: привязать свой телеграм к своей учётке.
+async function linkMyTelegram() {
+  let cfg;
+  try { cfg = await api('/auth/telegram/config'); } catch (e) { return; }
+  if (!cfg.enabled) {
+    alert('Сначала владелец должен выбрать бота для входа в разделе «Команда».');
+    return;
+  }
+  const box = document.getElementById('tg-link-modal');
+  box.innerHTML = `<div class="dl-head"><b>Привязать Telegram</b>
+      <button class="btn" onclick="document.getElementById('tg-link-modal').classList.add('hidden')">✕</button></div>
+    <p style="font-size:13px;color:#7a8499">Нажмите кнопку — Telegram подтвердит, что аккаунт ваш.</p>
+    <div id="tg-link-widget"></div>`;
+  const sc = document.createElement('script');
+  sc.async = true;
+  sc.src = 'https://telegram.org/js/telegram-widget.js?22';
+  sc.setAttribute('data-telegram-login', cfg.bot_username);
+  sc.setAttribute('data-size', 'large');
+  sc.setAttribute('data-userpic', 'false');
+  sc.setAttribute('data-onauth', 'onTelegramLink(user)');
+  sc.setAttribute('data-request-access', 'write');
+  document.getElementById('tg-link-widget').appendChild(sc);
+  box.classList.remove('hidden');
+}
+
+async function onTelegramLink(user) {
+  try {
+    const r = await api('/auth/telegram/link', { method: 'POST', body: user });
+    ME.tg_id = r.tg_id; ME.tg_username = r.tg_username;
+    document.getElementById('tg-link-modal').classList.add('hidden');
+    applyRoleUI();
+    alert('Телеграм привязан: @' + (r.tg_username || r.tg_id));
+  } catch (e) { /* alert показан в api() */ }
+}
+
 // ---------- права текущего пользователя ----------
 const LEVEL_RANK = { none: 0, view: 1, edit: 2 };
 
@@ -118,6 +197,15 @@ function applyRoleUI() {
 
   document.getElementById('side-user-name').textContent =
     ME ? `${ME.name || ME.login}${owner ? ' · владелец' : ''}` : '';
+  const tgLink = document.getElementById('side-tg-link');
+  if (tgLink && ME) {
+    tgLink.textContent = ME.tg_id
+      ? `✅ Telegram: @${ME.tg_username || ME.tg_id}`
+      : '🔗 Привязать Telegram';
+    tgLink.title = ME.tg_id
+      ? 'Предпросмотр рассылок приходит сюда'
+      : 'Нужно для входа через Telegram и предпросмотра рассылок';
+  }
 }
 
 // первая доступная страница — на неё уводим, если на дашборд прав нет
@@ -341,19 +429,39 @@ let EDIT_USER_ID = null;
 
 let PERM_FEATURES = [];
 
+async function saveAuthBot() {
+  const v = document.getElementById('auth-bot').value;
+  try {
+    const r = await api('/auth/telegram/settings', { method: 'PUT',
+      body: { bot_id: v ? +v : null } });
+    document.getElementById('auth-bot-hint').textContent = r.bot_username
+      ? `Домен привязывайте к @${r.bot_username}` : 'Вход через Telegram выключен';
+    alert('Сохранено ✅');
+  } catch (e) { /* alert показан */ }
+}
+
 async function loadUsers() {
   const [users, bots, feats, funnels] = await Promise.all([
     api('/users'), api('/bots'), api('/permissions/features'), api('/funnels'),
   ]);
+  try {
+    const auth = await api('/auth/telegram/settings');
+    const sel = document.getElementById('auth-bot');
+    sel.innerHTML = '<option value="">— вход только по паролю —</option>' +
+      bots.map(b => `<option value="${b.id}" ${String(auth.bot_id) === String(b.id) ? 'selected' : ''}>${esc(b.name)}${b.tg_username ? ' (@' + esc(b.tg_username) + ')' : ''}</option>`).join('');
+    document.getElementById('auth-bot-hint').textContent = auth.bot_username
+      ? `Домен привязывайте к @${auth.bot_username}` : '';
+  } catch (e) { /* не владелец — блока нет */ }
   window._allBots = bots;
   window._allFunnels = funnels;
   PERM_FEATURES = feats;
   document.getElementById('users-list').innerHTML = `<table>
-    <tr><th>Логин</th><th>Имя</th><th>Роль</th><th>Боты</th><th>Доступ к разделам</th><th>Статус</th><th>Последний вход</th><th></th></tr>
+    <tr><th>Логин</th><th>Имя</th><th>Роль</th><th>Телеграм</th><th>Боты</th><th>Доступ к разделам</th><th>Статус</th><th>Последний вход</th><th></th></tr>
     ${users.map(u => `<tr>
       <td><b>${esc(u.login)}</b></td>
       <td>${esc(u.name || '—')}</td>
       <td>${u.role === 'owner' ? 'Владелец' : 'Сотрудник'}</td>
+      <td>${u.tg_id ? `<span class="pill">@${esc(u.tg_username || u.tg_id)}</span>` : '<span style="color:#7a8499;font-size:12px">не привязан</span>'}</td>
       <td>${(u.bot_ids && u.bot_ids.length)
         ? u.bot_ids.map(id => { const b = bots.find(x => x.id === id); return `<span class="pill">${esc(b ? b.name : id)}</span>`; }).join('')
         : '<span style="color:#7a8499;font-size:12px">все</span>'}</td>
@@ -385,6 +493,7 @@ function showUserForm() {
   document.getElementById('u-login').disabled = false;
   document.getElementById('u-name').value = '';
   document.getElementById('u-pass').value = '';
+  document.getElementById('u-tgid').value = '';
   document.getElementById('u-role').value = 'staff';
   renderUserBots([]);
   renderUserFunnels([]);
@@ -480,6 +589,7 @@ function editUser(u) {
   document.getElementById('u-name').value = u.name || '';
   document.getElementById('u-pass').value = '';
   document.getElementById('u-pass').placeholder = 'оставь пустым, чтобы не менять';
+  document.getElementById('u-tgid').value = u.tg_id || '';
   document.getElementById('u-role').value = u.role;
   renderUserBots(u.bot_ids || []);
   renderUserFunnels(u.funnel_ids || []);
@@ -497,6 +607,7 @@ async function saveUser() {
     bot_ids: [...document.querySelectorAll('#u-bots .pill.on')].map(p => +p.dataset.id),
     funnel_ids: [...document.querySelectorAll('#u-funnels .pill.on')].map(p => +p.dataset.id),
     permissions: collectPerms(),
+    tg_id: +document.getElementById('u-tgid').value || null,
     is_active: true,
   };
   if (body.role !== 'owner' && !Object.keys(body.permissions).length &&
@@ -800,6 +911,26 @@ async function countBroadcast() {
     body: { bot_id: botId, filter: BC_SEG.getFilter(), count_only: true } });
   document.getElementById('bc-count').textContent = `Получателей: ${r.total}`;
 }
+// Предпросмотр: то же сообщение, но только себе. Заодно самая честная
+// проверка живости — если дошло, значит бот отвечает и разметка не сломана.
+async function previewBroadcast() {
+  const botId = +document.getElementById('bc-bot').value;
+  if (!botId) { alert('Выберите бота'); return; }
+  const btn = document.getElementById('bc-preview-btn');
+  btn.disabled = true;
+  try {
+    await api('/broadcasts/preview', { method: 'POST', body: {
+      bot_id: botId,
+      text: BC_TEXT ? BC_TEXT.getHtml() : '',
+      media: BC_MEDIA ? BC_MEDIA.getItems() : [],
+      buttons: collectBcButtons(),
+      text_first: document.getElementById('bc-order').value === '1',
+    }});
+    alert('Отправлено вам в Telegram — проверьте, как выглядит.\n\nКнопки в предпросмотре ничего не делают: теги вешаются только в настоящей рассылке.');
+  } catch (e) { /* alert показан в api() */ }
+  finally { btn.disabled = false; }
+}
+
 async function sendBroadcast() {
   const botId = +document.getElementById('bc-bot').value;
   if (!botId) { alert('Выберите бота'); return; }

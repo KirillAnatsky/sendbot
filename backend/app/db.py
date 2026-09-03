@@ -57,6 +57,8 @@ def _migrate(conn):
     add("bots", "source_policy", "source_policy VARCHAR(8) DEFAULT 'last'")
     add("users", "permissions", "permissions JSON")
     add("users", "funnel_ids", "funnel_ids JSON")
+    add("users", "tg_id", "tg_id BIGINT")
+    add("users", "tg_username", "tg_username VARCHAR(64)")
 
     add("subscribers", "last_active_at", "last_active_at TIMESTAMP")
     add("subscribers", "automation_paused_until", "automation_paused_until TIMESTAMP")

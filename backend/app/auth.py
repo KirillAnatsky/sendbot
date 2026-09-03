@@ -115,6 +115,41 @@ def verify_password(password: str, stored: str) -> bool:
         return False
 
 
+# ---------- вход через Telegram ----------
+
+TG_AUTH_MAX_AGE = 24 * 3600   # подпись старше суток не принимаем
+
+
+def verify_telegram_login(data: dict, bot_token: str) -> str | None:
+    """Проверяет подпись виджета Telegram Login. None — всё в порядке.
+
+    Виджет отдаёт поля пользователя и hash. Считаем HMAC от строки
+    «ключ=значение», отсортированной по ключу, на секрете SHA256(токен бота).
+    Совпало — данные действительно от Telegram и никто их не подменил.
+    """
+    got = str(data.get("hash") or "")
+    if not got:
+        return "Нет подписи — данные пришли не от виджета Telegram"
+    if not bot_token:
+        return "Не выбран бот для входа — владелец задаёт его в разделе «Команда»"
+
+    pairs = sorted(f"{k}={v}" for k, v in data.items() if k != "hash" and v is not None)
+    secret = hashlib.sha256(bot_token.encode()).digest()
+    want = hmac.new(secret, "\n".join(pairs).encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(want, got):
+        return "Подпись не сходится — данные подделаны или бот входа другой"
+
+    try:
+        age = time.time() - int(data.get("auth_date") or 0)
+    except (TypeError, ValueError):
+        return "Некорректная дата входа"
+    if age > TG_AUTH_MAX_AGE:
+        return "Данные входа устарели — нажмите кнопку ещё раз"
+    if age < -300:
+        return "Дата входа из будущего — проверьте часы на сервере"
+    return None
+
+
 # ---------- токены сессии ----------
 
 def _sign(payload_b64: str) -> str:
