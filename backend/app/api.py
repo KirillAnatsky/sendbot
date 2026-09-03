@@ -54,16 +54,26 @@ async def health():
     """Проверка живости для деплоя и мониторинга (без авторизации)."""
     from .bot.runner import manager
 
+    expected = 0
     try:
         async with SessionLocal() as s:
-            await s.execute(select(func.count(Bot.id)))
+            expected = (await s.execute(
+                select(func.count(Bot.id)).where(Bot.is_active == True)  # noqa: E712
+            )).scalar() or 0
         db_ok = True
     except Exception:  # noqa: BLE001
         db_ok = False
+
+    running = len(manager.bots)
+    # «ok» только когда включённые боты действительно поллятся. Раньше здесь
+    # хватало живого HTTP, и деплой рапортовал об успехе, даже если все боты
+    # лежали и /start ничего не делал.
+    healthy = db_ok and running >= expected
     return {
-        "status": "ok" if db_ok else "degraded",
+        "status": "ok" if healthy else "degraded",
         "db": db_ok,
-        "bots_running": len(manager.bots),
+        "bots_running": running,
+        "bots_expected": expected,
         "time": datetime.utcnow().isoformat(),
     }
 

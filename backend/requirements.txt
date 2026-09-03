@@ -1,11 +1,18 @@
-fastapi>=0.111
-uvicorn[standard]>=0.30
-aiogram>=3.31        # 3.31 — первая версия с Bot API 9.4 (style у кнопок)
-SQLAlchemy[asyncio]>=2.0
-asyncpg>=0.29
-aiosqlite>=0.20
-pydantic>=2.7
-python-docx>=1.1
-python-multipart>=0.0.9
-websockets>=12
-google-auth>=2.30
+# Версии зафиксированы по рабочему проду от 03.09.2026.
+#
+# Раньше здесь стояло >= без верхней границы. Пока файл не менялся, Docker
+# переиспользовал закэшированный слой pip, и версии годами оставались теми,
+# что встали при первой сборке. Любая правка файла — или сборка на чистой
+# машине — молча ставила совсем другой набор библиотек. Обновлять теперь
+# только осознанно: поднять версию, задеплоить, проверить.
+aiogram==3.31.0
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+SQLAlchemy[asyncio]==2.0.52
+asyncpg==0.31.0
+aiosqlite==0.22.1
+pydantic==2.13.5
+python-docx==1.2.0
+python-multipart==0.0.32
+websockets==17.1
+google-auth==2.57.0
