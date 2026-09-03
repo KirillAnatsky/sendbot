@@ -144,7 +144,7 @@ async function botLoadBroadcasts() {
     ${bcs.map(b => {
       const pct = b.total ? Math.round(100 * (b.sent + b.failed) / b.total) : 0;
       return `<tr>
-        <td><b>${esc(b.name)}</b><br><span style="color:#7a8499;font-size:12px">${esc((b.text || '').slice(0, 60))}</span></td>
+        <td><b>${esc(b.name)}</b><br><span style="color:#7a8499;font-size:12px">${esc(plainText(b.text || '').slice(0, 60))}</span></td>
         <td>${BC_STATUS[b.status] || b.status}</td>
         <td>${b.sent}/${b.total}${b.failed ? ` (не дошло: ${b.failed})` : ''}
           <div class="progress"><i style="width:${pct}%"></i></div></td>

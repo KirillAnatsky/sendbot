@@ -36,7 +36,7 @@ function nodeHtml(type, data) {
     const toggle = text.length > 120
       ? `<span class="df-toggle" onclick="toggleNodeExpand(event, this)">развернуть ▾</span>` : '';
     const textHtml = text
-      ? `<div class="df-sub">${esc(text)}</div>${toggle}`
+      ? `<div class="df-sub">${rtPreview(text)}</div>${toggle}`
       : (media.length ? '' : `<div class="df-sub empty">нет текста</div>`);
     // кнопки — как в Telegram, с номером выхода
     let btnsHtml = '';
@@ -518,8 +518,8 @@ function showProps(id) {
     MEDIA_ITEMS = Array.isArray(d.media) ? d.media.map(m => ({ ...m }))
       : (d.photo_url ? [{ type: 'photo', path: d.photo_url, name: '' }] : []);
     html += `
-      <label>Текст (HTML, {first_name})</label>
-      <textarea id="p-text" rows="6">${esc(d.text || '')}</textarea>
+      <label>Текст — выделите и жмите кнопку, {first_name} подставится</label>
+      <div id="p-text-rt"></div>
       <label>Порядок</label>
       <select id="p-order">
         <option value="" ${d.text_first ? '' : 'selected'}>сначала вложение, текст подписью</option>
@@ -607,7 +607,14 @@ function showProps(id) {
   html += `<button class="btn danger" onclick="deleteSelectedNode()">Удалить блок</button>`;
   props.innerHTML = html;
   props.classList.remove('hidden');
-  if (node.name === 'message') setupImageUploader();
+  if (node.name === 'message') {
+    // редактор монтируем после вставки разметки — ему нужен живой контейнер
+    RT_TEXT = mountRichText(document.getElementById('p-text-rt'), d.text || '',
+                            scheduleAutoApply);
+    setupImageUploader();
+  } else {
+    RT_TEXT = null;
+  }
   // живое превью: любое изменение в панели свойств применяется автоматически
   if (node.name !== 'start') {
     props.oninput = scheduleAutoApply;
@@ -616,6 +623,8 @@ function showProps(id) {
     props.oninput = props.onchange = null;
   }
 }
+
+let RT_TEXT = null;   // визуальный редактор текущего узла «Сообщение»
 
 let _autoApplyTimer = null;
 function scheduleAutoApply() {
@@ -762,7 +771,7 @@ function applyProps() {
   const d = { ...node.data };
 
   if (node.name === 'message') {
-    d.text = document.getElementById('p-text').value;
+    d.text = RT_TEXT ? RT_TEXT.getHtml() : (d.text || '');
     d.text_first = document.getElementById('p-order').value === '1';
     d.media = MEDIA_ITEMS.map(m => ({ type: m.type, path: m.path, name: m.name || '' }));
     d.photo_url = '';  // старое поле больше не используем (медиа в d.media)

@@ -307,7 +307,8 @@
         <label>Бот (кому отправляем):</label>
         <select id="bc-bot" class="inline-input wide"></select>
         <input id="bc-name" class="inline-input wide" placeholder="Название (для себя)">
-        <textarea id="bc-text" rows="5" placeholder="Текст сообщения. Можно {first_name} и HTML: <b>жирный</b>"></textarea>
+        <label>Текст — выделите и жмите кнопку, {first_name} подставится</label>
+        <div id="bc-text-rt"></div>
         <label>Порядок</label>
         <select id="bc-order">
           <option value="">сначала вложение, текст подписью</option>
@@ -614,6 +615,7 @@
 <script src="https://cdn.jsdelivr.net/npm/drawflow@0.0.60/dist/drawflow.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <script src="app.js?v=44"></script>
+<script src="richtext.js?v=44"></script>
 <script src="media.js?v=44"></script>
 <script src="segment.js?v=44"></script>
 <script src="bot.js?v=44"></script>

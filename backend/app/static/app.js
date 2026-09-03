@@ -708,6 +708,7 @@ async function deleteFunnel(id) {
 // ---------- рассылки ----------
 let BC_SEG = null;
 let BC_MEDIA = null;
+let BC_TEXT = null;
 async function showBroadcastForm() {
   await loadTags();
   await loadSegFields();
@@ -718,6 +719,7 @@ async function showBroadcastForm() {
     : '<option value="">нет ботов</option>';
   BC_SEG = makeSegment(document.getElementById('bc-segment'));
   BC_MEDIA = mountMediaUploader(document.getElementById('bc-media'), []);
+  BC_TEXT = mountRichText(document.getElementById('bc-text-rt'), '');
   document.getElementById('bc-buttons').innerHTML = '';
   document.getElementById('bc-order').value = '';
   document.getElementById('bc-count').textContent = '';
@@ -804,7 +806,7 @@ async function sendBroadcast() {
   const body = {
     bot_id: botId,
     name: document.getElementById('bc-name').value || 'Рассылка',
-    text: document.getElementById('bc-text').value,
+    text: BC_TEXT ? BC_TEXT.getHtml() : '',
     media: BC_MEDIA ? BC_MEDIA.getItems() : [],
     buttons: collectBcButtons(),
     text_first: document.getElementById('bc-order').value === '1',
@@ -824,7 +826,7 @@ async function sendBroadcast() {
   if (!confirm(total != null ? `Запустить рассылку? Получателей: ${total}` : 'Запустить рассылку?')) return;
   await api('/broadcasts', { method: 'POST', body });
   hideBroadcastForm();
-  document.getElementById('bc-text').value = '';
+  if (BC_TEXT) BC_TEXT.setHtml('');
   loadBroadcasts();
 }
 const BC_STATUS = { pending: 'в очереди', running: 'отправляется', done: 'завершена', failed: 'ошибка' };
@@ -835,7 +837,7 @@ async function loadBroadcasts() {
     ${bcs.map(b => {
       const pct = b.total ? Math.round(100 * (b.sent + b.failed) / b.total) : 0;
       return `<tr>
-        <td><a href="#" onclick="openBroadcast(${b.id});return false"><b>${esc(b.name)}</b></a><br><span style="color:#7a8499;font-size:12px">${esc(b.text.slice(0, 60))}${b.text.length > 60 ? '…' : ''}</span></td>
+        <td><a href="#" onclick="openBroadcast(${b.id});return false"><b>${esc(b.name)}</b></a><br><span style="color:#7a8499;font-size:12px">${esc(plainText(b.text).slice(0, 60))}${b.text.length > 60 ? '…' : ''}</span></td>
         <td>${esc(b.bot || '—')}</td>
         <td>${BC_STATUS[b.status] || b.status}</td>
         <td>${b.sent}/${b.total}${b.failed ? ` (не дошло: ${b.failed})` : ''}
@@ -875,7 +877,7 @@ async function openBroadcast(id) {
               ${mediaThumbHtml(m)}
               <span>${esc(m.name || m.path.split('/').pop())}</span>
             </div>`).join('')}</div>` : ''}
-          <div class="bc-text">${b.text ? esc(b.text).replace(/\n/g, '<br>') : '<i style="color:#99a">без текста</i>'}</div>
+          <div class="bc-text">${b.text ? rtPreview(b.text) : '<i style="color:#99a">без текста</i>'}</div>
           ${(b.buttons || []).length ? `<div class="df-btns">${b.buttons.map(x => {
             const st = x.style ? ` st-${x.style}` : '';
             const what = x.url ? '🔗 ' + esc(x.url) : 'тег «' + esc(x.tag_name || x.tag_id) + '»';
@@ -1104,7 +1106,7 @@ async function refreshChatMessages() {
       : (m.is_broadcast ? '📣 рассылка «' + esc(m.broadcast_name || '') + '»'
         : (m.is_operator ? 'оператор' : 'бот'));
     return `<div class="msg ${cls}">
-      <div class="msg-bubble">${esc(m.text)}</div>
+      <div class="msg-bubble">${rtPreview(m.text)}</div>
       <div class="msg-meta">${who ? who + ' · ' : ''}${new Date(m.created_at + 'Z').toLocaleTimeString('ru', {hour:'2-digit',minute:'2-digit'})}</div>
     </div>`;
   }).join('') || '<div class="chat-empty">Переписки пока нет.</div>';
