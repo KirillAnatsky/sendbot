@@ -475,3 +475,24 @@ th { background: #f8fafc; color: #7a8499; font-weight: 600; font-size: 12.5px; t
 
 /* рассылка в ленте чата — визуально отличается от личных сообщений бота */
 .msg.out.bc .msg-bubble { background: #fff6e8; border: 1px solid #f0dcbd; color: #6b5636; }
+
+/* кнопки в панели свойств: две строки на кнопку */
+.btn-row { border: 1px solid #eef1f7; border-radius: 8px; padding: 6px; margin-bottom: 8px; background: #fafbfe; }
+.btn-row .btn-row-item { margin-bottom: 4px; }
+.btn-row .btn-row-item:last-child { margin-bottom: 0; }
+.btn-row .p-btn-style { flex: 0 0 auto; max-width: 42%; }
+.btn-off { display: flex; align-items: center; gap: 3px; font-size: 11px; color: #7a8499; white-space: nowrap; }
+.btn-off input { width: auto; }
+
+/* вид кнопки на карточке — как её увидит подписчик */
+.df-btn.st-primary { background: #2e6bff; border-color: #2e6bff; color: #fff; }
+.df-btn.st-success { background: #12a150; border-color: #12a150; color: #fff; }
+.df-btn.st-danger { background: #d33; border-color: #d33; color: #fff; }
+.df-btn.st-off { opacity: .45; text-decoration: line-through; }
+
+/* меню блоков при протягивании связи в пустое место */
+.link-menu { position: fixed; z-index: 950; background: #fff; border: 1px solid #d6dbe6;
+  border-radius: 10px; box-shadow: 0 10px 30px rgba(16,23,40,.18); padding: 6px; min-width: 190px; }
+.link-menu-head { font-size: 11px; text-transform: uppercase; color: #7a8499; padding: 4px 8px 6px; }
+.link-menu-item { padding: 8px 10px; border-radius: 7px; cursor: pointer; font-size: 13.5px; }
+.link-menu-item:hover { background: #eef3ff; color: #2e6bff; }

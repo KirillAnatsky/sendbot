@@ -42,8 +42,10 @@ function nodeHtml(type, data) {
     if (buttons.length) {
       let port = 2;
       btnsHtml = `<div class="df-btns">` + buttons.map(b => {
-        if (b.url) return `<div class="df-btn url">🔗 ${esc(b.label || 'ссылка')}</div>`;
-        return `<div class="df-btn"><span class="df-btn-port">${port++}</span>${esc(b.label || 'кнопка')}</div>`;
+        const st = b.style ? ` st-${b.style}` : '';
+        const off = b.disabled ? ' st-off' : '';
+        if (b.url) return `<div class="df-btn url${st}${off}">🔗 ${esc(b.label || 'ссылка')}</div>`;
+        return `<div class="df-btn${st}${off}"><span class="df-btn-port">${port++}</span>${esc(b.label || 'кнопка')}</div>`;
       }).join('') + `</div>`;
     }
     return `<div class="df-title">${NODE_META.message.title}</div>${mediaHtml}${textHtml}${btnsHtml}` +
@@ -73,6 +75,32 @@ function toggleNodeExpand(ev, el) {
   // перерисовать линии связей и порты под новый размер карточки
   if (editor) editor.updateConnectionNodes(nodeEl.id);
   decoratePorts();
+}
+
+// Список тегов для селекта плюс пункт «создать». Создавать тег, не выходя
+// из редактора воронки, — иначе приходится бросать несохранённую работу,
+// идти в раздел «Теги» и возвращаться.
+function tagOptions(selected, head = '') {
+  return head + TAGS.map(t =>
+    `<option value="${t.id}" ${String(selected) === String(t.id) ? 'selected' : ''}>${esc(t.name)}</option>`
+  ).join('') + '<option value="__new__">+ создать тег…</option>';
+}
+
+async function maybeCreateTag(sel) {
+  if (sel.value !== '__new__') return;
+  const name = (prompt('Название нового тега:') || '').trim();
+  if (!name) { sel.innerHTML = tagOptions('', sel.dataset.head || ''); return; }
+  let tag;
+  try { tag = await api('/tags', { method: 'POST', body: { name } }); }
+  catch (e) { sel.innerHTML = tagOptions('', sel.dataset.head || ''); return; }
+  await loadTags();
+  // новый тег появляется сразу во всех селектах на экране, а в том,
+  // откуда создавали, ещё и выбирается
+  document.querySelectorAll('select.tag-select').forEach(el => {
+    el.innerHTML = tagOptions(el === sel ? tag.id : el.value, el.dataset.head || '');
+  });
+  scheduleAutoApply();
+  flashStatus(`Тег «${name}» создан`);
 }
 
 function tagName(id) {
@@ -328,9 +356,12 @@ function populateTriggerTag(triggerType, value) {
   const tagSel = document.getElementById('funnel-trigger-tag');
   const head = triggerType === 'message'
     ? '<option value="">— срабатывать всегда —</option>' : '';
-  tagSel.innerHTML = head + TAGS.map(t => `<option value="${t.id}">${esc(t.name)}</option>`).join('');
+  tagSel.dataset.head = head;
+  tagSel.classList.add('tag-select');
+  tagSel.onchange = () => maybeCreateTag(tagSel);
+  tagSel.innerHTML = tagOptions(value, head);
   // сохраняем прежний выбор, если он ещё есть в списке
-  tagSel.value = [...tagSel.options].some(o => o.value === String(value)) ? String(value) : '';
+  if (![...tagSel.options].some(o => o.value === String(value))) tagSel.value = '';
 }
 
 function updateTriggerInputs() {
@@ -523,8 +554,7 @@ function showProps(id) {
   } else if (node.name === 'condition') {
     html += `
       <label>Если у подписчика есть тег…</label>
-      <select id="p-tag">${TAGS.map(t =>
-        `<option value="${t.id}" ${String(d.tag) === String(t.id) ? 'selected' : ''}>${esc(t.name)}</option>`).join('')}</select>
+      <select id="p-tag" class="tag-select" onchange="maybeCreateTag(this)">${tagOptions(d.tag)}</select>
       <p style="font-size:12px;color:#7a8499;margin-top:8px">Выход 1 — «да», выход 2 — «нет».</p>`;
   } else if (node.name === 'language') {
     const langs = d.languages || [];
@@ -555,8 +585,7 @@ function showProps(id) {
         <option value="remove_tag" ${d.op === 'remove_tag' ? 'selected' : ''}>Снять тег</option>
       </select>
       <label>Тег</label>
-      <select id="p-tag">${TAGS.map(t =>
-        `<option value="${t.id}" ${String(d.tag) === String(t.id) ? 'selected' : ''}>${esc(t.name)}</option>`).join('')}</select>`;
+      <select id="p-tag" class="tag-select" onchange="maybeCreateTag(this)">${tagOptions(d.tag)}</select>`;
   }
 
   if (node.name !== 'start') {
@@ -685,11 +714,30 @@ function addLangRow(code) {
   if (code) scheduleAutoApply();
 }
 
+// Стили кнопок из Bot API 9.4. Это не палитра, а три готовых вида;
+// клиенты постарше нарисуют обычную кнопку и ничего не сломают.
+const BTN_STYLES = [
+  ['', 'обычная'], ['primary', '🔵 основная'],
+  ['success', '🟢 зелёная'], ['danger', '🔴 красная'],
+];
+
 function btnRow(b, i) {
-  return `<div class="btn-row-item">
-    <input placeholder="Текст кнопки" class="p-btn-label" value="${esc(b.label || '')}">
-    <input placeholder="URL (или пусто)" class="p-btn-url" value="${esc(b.url || '')}">
-    <button class="btn danger" onclick="this.parentElement.remove();scheduleAutoApply()">✕</button>
+  return `<div class="btn-row">
+    <div class="btn-row-item">
+      <input placeholder="Текст кнопки" class="p-btn-label" value="${esc(b.label || '')}">
+      <button class="btn danger" title="убрать кнопку"
+        onclick="this.closest('.btn-row').remove();scheduleAutoApply()">✕</button>
+    </div>
+    <div class="btn-row-item">
+      <input placeholder="URL (пусто = ветка воронки)" class="p-btn-url" value="${esc(b.url || '')}">
+      <select class="p-btn-style" title="вид кнопки">
+        ${BTN_STYLES.map(([v, l]) =>
+          `<option value="${v}" ${(b.style || '') === v ? 'selected' : ''}>${l}</option>`).join('')}
+      </select>
+      <label class="btn-off" title="кнопка видна, но нажать нельзя">
+        <input type="checkbox" class="p-btn-disabled" ${b.disabled ? 'checked' : ''}> выкл
+      </label>
+    </div>
   </div>`;
 }
 function addBtnRow() {
@@ -704,10 +752,16 @@ function applyProps() {
     d.text = document.getElementById('p-text').value;
     d.media = MEDIA_ITEMS.map(m => ({ type: m.type, path: m.path, name: m.name || '' }));
     d.photo_url = '';  // старое поле больше не используем (медиа в d.media)
-    d.buttons = [...document.querySelectorAll('#p-buttons .btn-row-item')].map(row => ({
-      label: row.querySelector('.p-btn-label').value,
-      url: row.querySelector('.p-btn-url').value || undefined,
-    })).filter(b => b.label);
+    d.buttons = [...document.querySelectorAll('#p-buttons .btn-row')].map(row => {
+      const b = {
+        label: row.querySelector('.p-btn-label').value,
+        url: row.querySelector('.p-btn-url').value || undefined,
+      };
+      const style = row.querySelector('.p-btn-style').value;
+      if (style) b.style = style;
+      if (row.querySelector('.p-btn-disabled').checked) b.disabled = true;
+      return b;
+    }).filter(b => b.label);
     // выходы: 1 ("далее") + по одному на каждую callback-кнопку
     const need = 1 + d.buttons.filter(b => !b.url).length;
     const cur = Object.keys(editor.getNodeFromId(selectedNodeId).outputs).length;
@@ -719,7 +773,7 @@ function applyProps() {
     d.amount = +document.getElementById('p-amount').value || 1;
     d.unit = document.getElementById('p-unit').value;
   } else if (node.name === 'condition') {
-    d.tag = document.getElementById('p-tag').value;
+    d.tag = cleanTag(document.getElementById('p-tag').value, d.tag);
   } else if (node.name === 'language') {
     d.languages = [...document.querySelectorAll('#p-langs .p-lang')]
       .map(inp => inp.value.trim()).filter(Boolean);
@@ -730,11 +784,17 @@ function applyProps() {
     for (let i = cur; i > need; i--) editor.removeNodeOutput(selectedNodeId, 'output_' + i);
   } else if (node.name === 'action') {
     d.op = document.getElementById('p-op').value;
-    d.tag = document.getElementById('p-tag').value;
+    d.tag = cleanTag(document.getElementById('p-tag').value, d.tag);
   }
 
   editor.updateNodeDataFromId(selectedNodeId, d);
   refreshNodeHtml(selectedNodeId);
+}
+
+// «__new__» — это пункт меню, а не тег: если пользователь открыл создание и
+// отменил его, в данные должно вернуться прежнее значение
+function cleanTag(value, prev) {
+  return value === '__new__' ? (prev || '') : value;
 }
 
 function deleteSelectedNode() {
@@ -890,10 +950,12 @@ async function saveFunnel() {
   const trigger = document.getElementById('funnel-trigger').value;
   let triggerValue = null;
   if (trigger === 'keyword') triggerValue = document.getElementById('funnel-trigger-value').value.trim();
-  if (trigger === 'tag_added') triggerValue = document.getElementById('funnel-trigger-tag').value;
+  if (trigger === 'tag_added') {
+    triggerValue = cleanTag(document.getElementById('funnel-trigger-tag').value, null);
+  }
   if (trigger === 'message') {
     // необязательный тег «кроме»: пустое значение = срабатывать всегда
-    const v = document.getElementById('funnel-trigger-tag').value;
+    const v = cleanTag(document.getElementById('funnel-trigger-tag').value, null);
     triggerValue = v || null;
   }
   const botIds = [...document.querySelectorAll('#funnel-bots .pill.on')].map(p => +p.dataset.id);
@@ -988,6 +1050,7 @@ function setupClipboard() {
   setupGroupDrag();
   setupPaletteDnD();
   setupMagnetConnections();
+  setupLinkDropMenu();
 
   // вставка картинки из буфера, когда открыт блок «Сообщение» (в любом месте редактора)
   document.addEventListener('paste', e => {
@@ -1190,6 +1253,85 @@ function setupMagnetConnections() {
     }
   });
   container.addEventListener('mouseup', clearHover);
+}
+
+// ---------- связь в пустоту -> меню блоков ----------
+// Тянешь связь от выхода и отпускаешь на пустом холсте: вместо «ничего не
+// произошло» появляется список блоков. Выбранный создаётся под курсором и
+// сразу соединяется — так строить длинные ветки заметно быстрее.
+const LINK_MENU_BLOCKS = [
+  ['message', '💬 Сообщение'], ['delay', '⏱ Задержка'],
+  ['condition', '❓ Условие (тег)'], ['language', '🌐 Язык'],
+  ['action', '🏷 Тег +/−'], ['note', '⚠️ Заметка'],
+];
+
+function closeLinkMenu() {
+  document.getElementById('link-menu')?.remove();
+}
+
+function setupLinkDropMenu() {
+  const container = document.getElementById('drawflow');
+
+  container.addEventListener('mousedown', e => {
+    // порт выхода зажат — запоминаем, откуда потянули
+    const out = e.target.closest('.outputs .output');
+    if (!out) return;
+    const nodeEl = out.closest('.drawflow-node');
+    if (!nodeEl) return;
+    const ports = [...nodeEl.querySelectorAll('.outputs .output')];
+    container._linkFrom = {
+      node: nodeEl.id.replace('node-', ''),
+      port: `output_${ports.indexOf(out) + 1}`,
+    };
+  }, true);
+
+  document.addEventListener('mouseup', e => {
+    const from = container._linkFrom;
+    container._linkFrom = null;
+    if (!from || !editor) return;
+    if (document.getElementById('page-editor').classList.contains('hidden')) return;
+    // отпустили на блоке или на порте — этим занимается сам Drawflow
+    if (e.target.closest('.drawflow-node')) return;
+    if (!e.target.closest('#drawflow')) return;
+
+    const p = canvasPoint(e);
+    closeLinkMenu();
+    const menu = document.createElement('div');
+    menu.id = 'link-menu';
+    menu.className = 'link-menu';
+    menu.style.left = e.clientX + 'px';
+    menu.style.top = e.clientY + 'px';
+    menu.innerHTML = '<div class="link-menu-head">Добавить и соединить</div>' +
+      LINK_MENU_BLOCKS.map(([t, l]) =>
+        `<div class="link-menu-item" data-type="${t}">${l}</div>`).join('');
+    document.body.appendChild(menu);
+
+    // не даём меню уехать за край экрана
+    const r = menu.getBoundingClientRect();
+    if (r.bottom > innerHeight) menu.style.top = Math.max(8, innerHeight - r.height - 8) + 'px';
+    if (r.right > innerWidth) menu.style.left = Math.max(8, innerWidth - r.width - 8) + 'px';
+
+    menu.querySelectorAll('.link-menu-item').forEach(item => {
+      item.onclick = () => {
+        const type = item.dataset.type;
+        const id = addBlockAt(type, p.x, p.y - 20);
+        closeLinkMenu();
+        // «Заметка» без входа — соединять нечем
+        if (type !== 'note') {
+          try { editor.addConnection(from.node, id, from.port, 'input_1'); } catch (err) {}
+        }
+        decoratePorts();
+        onNodeSelected(id);
+        showProps(id);
+      };
+    });
+  });
+
+  // клик мимо меню и Esc закрывают его
+  document.addEventListener('mousedown', e => {
+    if (!e.target.closest('#link-menu')) closeLinkMenu();
+  });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') closeLinkMenu(); });
 }
 
 function copyNodes() {

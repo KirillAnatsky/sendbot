@@ -71,22 +71,46 @@ def personalize(text: str, sub: Subscriber) -> str:
     return text
 
 
+# Оформление кнопок появилось в Bot API 9.4: не произвольный цвет, а три
+# готовых стиля. Клиенты, которые их не знают, рисуют обычную кнопку —
+# поэтому поле безопасно отправлять всегда.
+BUTTON_STYLES = ("primary", "success", "danger")
+
+
+def _button_extras(b: dict) -> dict:
+    """Необязательное оформление кнопки, если задано и допустимо."""
+    extra = {}
+    style = (b.get("style") or "").strip().lower()
+    if style in BUTTON_STYLES:
+        extra["style"] = style
+    emoji_id = (b.get("icon_custom_emoji_id") or "").strip()
+    if emoji_id:
+        extra["icon_custom_emoji_id"] = emoji_id
+    if b.get("disabled"):
+        extra["disabled"] = True
+    return extra
+
+
 def build_keyboard(buttons: list, run_id: int, node_id: str, sub: Subscriber | None = None) -> InlineKeyboardMarkup | None:
     if not buttons:
         return None
     rows = []
     for i, b in enumerate(buttons):
-        label = b.get("label") if isinstance(b, dict) else str(b)
-        url = b.get("url") if isinstance(b, dict) else None
+        if not isinstance(b, dict):
+            b = {"label": str(b)}
+        label = b.get("label")
+        url = b.get("url")
         if sub is not None:
             label = personalize(label or "", sub)
+        extra = _button_extras(b)
         if url:
             if sub is not None:
                 url = personalize(url, sub)  # подставляем {p:...}, {source} в ссылку
-            rows.append([InlineKeyboardButton(text=label, url=url)])
+            rows.append([InlineKeyboardButton(text=label, url=url, **extra)])
         else:
             rows.append([
-                InlineKeyboardButton(text=label, callback_data=f"f:{run_id}:{node_id}:{i}")
+                InlineKeyboardButton(text=label, callback_data=f"f:{run_id}:{node_id}:{i}",
+                                     **extra)
             ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
