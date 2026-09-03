@@ -9,9 +9,11 @@
   action:    output_1 -> дальше
   language:  output_1 -> «остальные» (язык не совпал),
              output_{i+2} -> ветка языка i (0-индекс) — как кнопки у message
+  filter:    output_1 -> подходит, output_2 -> не подходит
 """
 
-NODE_TYPES = {"start", "message", "delay", "condition", "action", "note", "language"}
+NODE_TYPES = {"start", "message", "delay", "condition", "action", "note",
+              "language", "filter"}
 
 
 class GraphError(Exception):
@@ -75,6 +77,12 @@ def _validate(nodes: dict):
         elif n["type"] == "condition":
             if not d.get("tag"):
                 raise GraphError(f"Блок «Условие» ({nid}): не выбран тег")
+        elif n["type"] == "filter":
+            f = d.get("filter") or {}
+            if not f.get("conditions") and not f.get("active_24h"):
+                raise GraphError(
+                    f"Блок «Фильтр» ({nid}): добавьте хотя бы одно условие — "
+                    "иначе он пропускает всех и ни на что не влияет")
         elif n["type"] == "language":
             langs = [str(x).strip() for x in (d.get("languages") or []) if str(x).strip()]
             if not langs:

@@ -121,6 +121,7 @@ th { background: #f8fafc; color: #7a8499; font-weight: 600; font-size: 12.5px; t
 .drawflow .drawflow-node.condition { border-color: #9a5df0; }
 .drawflow .drawflow-node.action { border-color: #e05c9a; }
 .drawflow .drawflow-node.language { border-color: #39b0d2; }
+.drawflow .drawflow-node.filter { border-color: #7a8499; }
 .drawflow .drawflow-node.note { border-color: #e8a13c; background: #fff8ec; border-style: dashed; }
 .drawflow .drawflow-node.note .df-sub { color: #8a6d3b; }
 .drawflow .drawflow-node.multi-sel { box-shadow: 0 0 0 3px rgba(46,107,255,.35); }
@@ -525,3 +526,8 @@ th { background: #f8fafc; color: #7a8499; font-weight: 600; font-size: 12.5px; t
 .rt-area .tg-spoiler { background: #444; color: transparent; border-radius: 3px; }
 .rt-area .tg-spoiler:hover { color: inherit; background: #e8eefc; }
 .props .rt-area { min-height: 90px; }
+
+/* конструктор условий в узкой панели свойств — в столбик */
+.props .seg-row { flex-wrap: wrap; gap: 4px; }
+.props .seg-row .seg-field, .props .seg-row .seg-op, .props .seg-row .seg-value { min-width: 0; width: 100%; }
+.props .seg-head { flex-wrap: wrap; gap: 6px; }

@@ -186,7 +186,7 @@ def _summary(ntype: str, d: dict, tag_names: dict) -> str:
 NODE_TITLES = {
     "start": "▶️ Старт", "message": "💬 Сообщение", "delay": "⏱ Задержка",
     "condition": "❓ Условие", "action": "🏷 Тег", "note": "⚠️ Заметка",
-    "language": "🌐 Язык",
+    "language": "🌐 Язык", "filter": "🔎 Фильтр",
 }
 
 

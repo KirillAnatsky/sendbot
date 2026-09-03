@@ -6,8 +6,16 @@ async function loadSegFields() {
 }
 
 // Создаёт конструктор внутри containerEl. Возвращает { getFilter, reset }.
-function makeSegment(containerEl) {
-  const state = { match: 'all', active_24h: false, rows: [] };
+// initial — уже сохранённый фильтр (нода «Фильтр» открывается со своими
+// условиями, а не пустой).
+function makeSegment(containerEl, initial) {
+  const state = {
+    match: (initial && initial.match) || 'all',
+    active_24h: !!(initial && initial.active_24h),
+    rows: ((initial && initial.conditions) || []).map(c => ({
+      field: c.field, op: c.op, value: c.value,
+    })),
+  };
 
   const fieldDef = key => SEG_FIELDS.find(f => f.key === key) || SEG_FIELDS[0];
 

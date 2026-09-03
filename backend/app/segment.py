@@ -109,6 +109,19 @@ def _cond(c):
     raise SegmentError(f"Неизвестное поле фильтра: {field}")
 
 
+async def matches(session, sub_id: int, filt: dict) -> bool:
+    """Подходит ли конкретный подписчик под фильтр.
+
+    Тот же движок, что в рассылках и в разделе подписчиков: условия в ноде
+    «Фильтр» и в сегменте рассылки значат одно и то же, и добавленное поле
+    сразу доступно везде.
+    """
+    if not (filt or {}).get("conditions") and not (filt or {}).get("active_24h"):
+        return True   # пустой фильтр никого не отсеивает
+    q = build_query(None, filt).where(Subscriber.id == sub_id).limit(1)
+    return (await session.execute(q)).first() is not None
+
+
 def build_query(bot_id: int | None, filt: dict, allowed_bot_ids: list[int] | None = None):
     """Возвращает select(Subscriber) с применённым сегментом.
 

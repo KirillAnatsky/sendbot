@@ -114,6 +114,12 @@ async def advance(
             has = await _has_tag(session, sub.id, data["tag"])
             node_id = next_node(graph, node_id, "output_1" if has else "output_2")
 
+        elif ntype == "filter":
+            from .. import segment as seg
+
+            ok = await seg.matches(session, sub.id, data.get("filter") or {})
+            node_id = next_node(graph, node_id, "output_1" if ok else "output_2")
+
         elif ntype == "language":
             # авто-роутинг по языку Telegram-профиля: юзера ни о чём не спрашиваем
             node_id = next_node(graph, node_id, _language_port(data, sub))

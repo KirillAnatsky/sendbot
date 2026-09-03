@@ -10,6 +10,7 @@ const NODE_META = {
   condition: { title: '❓ Условие',    inputs: 1, outputs: 2 },
   action:    { title: '🏷 Тег',       inputs: 1, outputs: 1 },
   language:  { title: '🌐 Язык',      inputs: 1, outputs: 2 },
+  filter:    { title: '🔎 Фильтр',    inputs: 1, outputs: 2 },
   note:      { title: '⚠️ Заметка',   inputs: 0, outputs: 0 },
 };
 
@@ -82,6 +83,27 @@ function toggleNodeExpand(ev, el) {
 // Список тегов для селекта плюс пункт «создать». Создавать тег, не выходя
 // из редактора воронки, — иначе приходится бросать несохранённую работу,
 // идти в раздел «Теги» и возвращаться.
+// Короткое описание фильтра для карточки. Названия полей и операций берём
+// из того же справочника, что и конструктор, — чтобы подписи не разъезжались.
+function segSummaryText(filter) {
+  const conds = (filter && filter.conditions) || [];
+  if (!conds.length && !(filter && filter.active_24h)) return 'условия не заданы';
+  const fields = (typeof SEG_FIELDS !== 'undefined' && SEG_FIELDS) || [];
+  const parts = conds.map(c => {
+    const fd = fields.find(f => f.key === c.field);
+    const label = fd ? fd.label : c.field;
+    const op = (fd && (fd.ops.find(o => o[0] === c.op) || [])[1]) || c.op;
+    let val = c.value;
+    if (fd && (fd.type === 'choice' || fd.type === 'select')) {
+      const o = (fd.options || []).find(x => String(x.v) === String(c.value));
+      if (o) val = o.l;
+    }
+    return `${label} ${op}${val === '' || val == null ? '' : ' ' + val}`;
+  });
+  if (filter && filter.active_24h) parts.unshift('активен за 24 часа');
+  return parts.join((filter && filter.match) === 'any' ? ' ИЛИ ' : ' И ');
+}
+
 function tagOptions(selected, head = '') {
   return head + TAGS.map(t =>
     `<option value="${t.id}" ${String(selected) === String(t.id) ? 'selected' : ''}>${esc(t.name)}</option>`
@@ -124,6 +146,7 @@ function summary(type, d) {
   }
   if (type === 'condition') return `Есть тег «${tagName(d.tag)}»?`;
   if (type === 'language') return `Язык: ${(d.languages || []).join(' / ') || '?'} / остальные`;
+  if (type === 'filter') return segSummaryText(d.filter);
   if (type === 'note') return d.text || 'пустая заметка';
   if (type === 'action') return (d.op === 'remove_tag' ? 'Снять тег: ' : 'Добавить тег: ') + tagName(d.tag);
   return '';
@@ -176,6 +199,7 @@ async function openEditor(id) {
   // запоминаем, откуда пришли (список воронок или экран бота)
   editorReturnTo = !document.getElementById('page-bot').classList.contains('hidden') ? 'bot' : 'funnels';
   await loadTags();
+  await loadSegFields();      // нужны ноде «Фильтр»: и конструктор, и подписи
   currentFunnelId = id;
   const [f, bots] = await Promise.all([api('/funnels/' + id), api('/bots')]);
 
@@ -385,6 +409,7 @@ function blockDefaults(type) {
     delay: { amount: 1, unit: 'hours' },
     condition: { tag: TAGS[0] ? String(TAGS[0].id) : '' },
     language: { languages: ['ru'] },
+    filter: { filter: { match: 'all', active_24h: false, conditions: [] } },
     action: { op: 'add_tag', tag: TAGS[0] ? String(TAGS[0].id) : '' },
     note: { text: '' },
   }[type];
@@ -463,9 +488,11 @@ function decoratePorts() {
     const outs = nodeEl.querySelectorAll('.outputs .output');
     if (!outs.length) return;
 
-    if (n.name === 'condition') {
-      if (outs[0]) { outs[0].textContent = '✓'; outs[0].classList.add('port-yes'); outs[0].title = 'да — тег есть'; }
-      if (outs[1]) { outs[1].textContent = '✕'; outs[1].classList.add('port-no'); outs[1].title = 'нет — тега нет'; }
+    if (n.name === 'condition' || n.name === 'filter') {
+      const yes = n.name === 'filter' ? 'подходит под условия' : 'да — тег есть';
+      const no = n.name === 'filter' ? 'не подходит' : 'нет — тега нет';
+      if (outs[0]) { outs[0].textContent = '✓'; outs[0].classList.add('port-yes'); outs[0].title = yes; }
+      if (outs[1]) { outs[1].textContent = '✕'; outs[1].classList.add('port-no'); outs[1].title = no; }
       return;
     }
     if (n.name !== 'message' && n.name !== 'language') return;
@@ -569,6 +596,13 @@ function showProps(id) {
       <label>Если у подписчика есть тег…</label>
       <select id="p-tag" class="tag-select" onchange="maybeCreateTag(this)">${tagOptions(d.tag)}</select>
       <p style="font-size:12px;color:#7a8499;margin-top:8px">Выход 1 — «да», выход 2 — «нет».</p>`;
+  } else if (node.name === 'filter') {
+    html += `
+      <p style="font-size:12.5px;color:#7a8499;margin-bottom:8px">
+        Выход 1 — подходит под условия, выход 2 — не подходит.
+        Условия те же, что в сегментах рассылок.
+      </p>
+      <div id="p-filter"></div>`;
   } else if (node.name === 'language') {
     const langs = d.languages || [];
     html += `
@@ -615,6 +649,11 @@ function showProps(id) {
   } else {
     RT_TEXT = null;
   }
+  if (node.name === 'filter') {
+    NODE_SEG = makeSegment(document.getElementById('p-filter'), d.filter);
+  } else {
+    NODE_SEG = null;
+  }
   // живое превью: любое изменение в панели свойств применяется автоматически
   if (node.name !== 'start') {
     props.oninput = scheduleAutoApply;
@@ -625,6 +664,7 @@ function showProps(id) {
 }
 
 let RT_TEXT = null;   // визуальный редактор текущего узла «Сообщение»
+let NODE_SEG = null;  // конструктор условий текущего узла «Фильтр»
 
 let _autoApplyTimer = null;
 function scheduleAutoApply() {
@@ -797,6 +837,8 @@ function applyProps() {
     d.unit = document.getElementById('p-unit').value;
   } else if (node.name === 'condition') {
     d.tag = cleanTag(document.getElementById('p-tag').value, d.tag);
+  } else if (node.name === 'filter') {
+    if (NODE_SEG) d.filter = NODE_SEG.getFilter();
   } else if (node.name === 'language') {
     d.languages = [...document.querySelectorAll('#p-langs .p-lang')]
       .map(inp => inp.value.trim()).filter(Boolean);
@@ -1284,7 +1326,7 @@ function setupMagnetConnections() {
 // сразу соединяется — так строить длинные ветки заметно быстрее.
 const LINK_MENU_BLOCKS = [
   ['message', '💬 Сообщение'], ['delay', '⏱ Задержка'],
-  ['condition', '❓ Условие (тег)'], ['language', '🌐 Язык'],
+  ['condition', '❓ Условие (тег)'], ['filter', '🔎 Фильтр'], ['language', '🌐 Язык'],
   ['action', '🏷 Тег +/−'], ['note', '⚠️ Заметка'],
 ];
 
