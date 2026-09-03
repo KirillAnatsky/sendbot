@@ -279,8 +279,16 @@ async def _auth_bot(session):
 async def tg_auth_config(session=Depends(get_session)):
     """Публично: показывать ли кнопку входа через Telegram и от какого бота."""
     bot = await _auth_bot(session)
-    return {"enabled": bool(bot and bot.tg_username),
-            "bot_username": bot.tg_username if bot else None}
+    if bot is None:
+        reason = "Владелец ещё не выбрал бота для входа в разделе «Команда»."
+    elif not bot.tg_username:
+        reason = (f"У бота «{bot.name}» не определён юзернейм. Откройте "
+                  "«Команда», выберите его заново и нажмите «Сохранить».")
+    else:
+        reason = None
+    return {"enabled": reason is None,
+            "bot_username": bot.tg_username if bot else None,
+            "reason": reason}
 
 
 class TgAuthIn(BaseModel):
@@ -398,9 +406,34 @@ async def tg_auth_settings(session=Depends(get_session)):
 async def tg_auth_settings_save(body: AuthCfgIn, session=Depends(get_session)):
     from .models import Setting
 
+    bot_id = int(body.bot_id) if body.bot_id else None
+    if bot_id:
+        bot = await session.get(Bot, bot_id)
+        if bot is None:
+            raise HTTPException(400, "Бот не найден")
+        if not bot.tg_username:
+            # Юзернейм записывается при запуске бота. Для входа часто берут
+            # отдельного бота, который никогда не включался, — тогда в базе
+            # пусто и виджет не отрисовать. Спрашиваем у Telegram сразу.
+            from aiogram import Bot as AioBot
+
+            tg = AioBot(token=bot.token)
+            try:
+                me = await tg.get_me()
+                bot.tg_username = me.username
+                log.info("Юзернейм бота #%s определён: @%s", bot.id, me.username)
+            except Exception as e:  # noqa: BLE001
+                raise HTTPException(
+                    400, f"Не удалось спросить юзернейм у Telegram: {e}. "
+                         "Проверьте токен бота.")
+            finally:
+                await tg.session.close()
+        if not bot.tg_username:
+            raise HTTPException(400, "У бота нет юзернейма — вход через него невозможен")
+
     row = (await session.execute(
         select(Setting).where(Setting.key == AUTH_KEY))).scalar_one_or_none()
-    value = {"bot_id": int(body.bot_id) if body.bot_id else None}
+    value = {"bot_id": bot_id}
     if row:
         row.value = value
         flag_modified(row, "value")

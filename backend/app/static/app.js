@@ -83,7 +83,7 @@ async function setupTelegramLogin() {
   let cfg;
   try { cfg = await (await fetch('/api/auth/telegram/config')).json(); }
   catch (e) { return; }
-  if (!cfg.enabled || !cfg.bot_username) return;
+  if (!cfg.enabled || !cfg.bot_username) return;   // причина — в cfg.reason
 
   const box = document.getElementById('tg-login');
   const holder = document.getElementById('tg-login-widget');
@@ -124,7 +124,7 @@ async function linkMyTelegram() {
   let cfg;
   try { cfg = await api('/auth/telegram/config'); } catch (e) { return; }
   if (!cfg.enabled) {
-    alert('Сначала владелец должен выбрать бота для входа в разделе «Команда».');
+    alert(cfg.reason || 'Вход через Telegram не настроен.');
     return;
   }
   const box = document.getElementById('tg-link-modal');
@@ -435,8 +435,10 @@ async function saveAuthBot() {
     const r = await api('/auth/telegram/settings', { method: 'PUT',
       body: { bot_id: v ? +v : null } });
     document.getElementById('auth-bot-hint').textContent = r.bot_username
-      ? `Домен привязывайте к @${r.bot_username}` : 'Вход через Telegram выключен';
-    alert('Сохранено ✅');
+      ? `@${r.bot_username} — этому боту и привязывайте домен` : 'Вход через Telegram выключен';
+    alert(r.bot_username
+      ? `Сохранено ✅\n\nБот: @${r.bot_username}\nТеперь у @BotFather: /setdomain → этот бот → funnels.win`
+      : 'Сохранено ✅ Вход через Telegram выключен.');
   } catch (e) { /* alert показан */ }
 }
 

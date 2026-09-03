@@ -1077,6 +1077,17 @@ function paintSelection() {
   });
 }
 
+// Печатает ли человек прямо сейчас. Кроме полей ввода сюда обязан попадать
+// contenteditable: визуальный редактор текста живёт в нём, и без этой
+// проверки пробел уходил на панорамирование холста, Backspace удалял
+// выделенный блок вместо буквы, а Ctrl+C копировал узлы вместо текста.
+function isTypingIn(el) {
+  if (!el) return false;
+  if (/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName || '')) return true;
+  if (el.isContentEditable) return true;
+  return !!(el.closest && el.closest('[contenteditable="true"]'));
+}
+
 function setupClipboard() {
   document.getElementById('drawflow').addEventListener('mousedown', e => {
     lastClickCtrl = e.ctrlKey || e.metaKey;
@@ -1085,7 +1096,7 @@ function setupClipboard() {
     shiftHeld = e.shiftKey;
     // работаем только когда открыт редактор и фокус не в поле ввода
     if (document.getElementById('page-editor').classList.contains('hidden')) return;
-    const inField = /^(INPUT|TEXTAREA|SELECT)$/.test((e.target.tagName || ''));
+    const inField = isTypingIn(e.target);
     const mod = e.ctrlKey || e.metaKey;
     // Ctrl/⌘+S сохраняет даже из поля ввода — рука сама тянется
     if (mod && e.key.toLowerCase() === 's') { e.preventDefault(); saveFunnel(); return; }
@@ -1173,7 +1184,7 @@ function setupCanvasNav() {
 
   // пробел = временный режим «рука»
   document.addEventListener('keydown', e => {
-    if (e.code === 'Space' && !/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName || '')) {
+    if (e.code === 'Space' && !isTypingIn(e.target)) {
       if (!document.getElementById('page-editor').classList.contains('hidden')) {
         spaceHeld = true;
         container.classList.add('grabbing');
