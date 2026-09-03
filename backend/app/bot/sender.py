@@ -4,7 +4,7 @@ import logging
 from aiogram import Bot
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import DisabledButton, InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import Subscriber
@@ -87,8 +87,29 @@ def _button_extras(b: dict) -> dict:
     if emoji_id:
         extra["icon_custom_emoji_id"] = emoji_id
     if b.get("disabled"):
-        extra["disabled"] = True
+        # это не флаг, а объект: можно приложить причину, которую Telegram
+        # покажет при нажатии на выключенную кнопку
+        reason = (b.get("disabled_reason") or "").strip()
+        extra["disabled"] = DisabledButton(reason=reason) if reason else DisabledButton()
     return extra
+
+
+def _make_button(**kwargs) -> InlineKeyboardButton:
+    """Кнопка с оформлением, а если оно не принято — простая кнопка.
+
+    Стиль, эмодзи и «выключена» — украшение. Оно не должно мочь сорвать
+    отправку: клавиатура строится внутри обработчика /start, и падение здесь
+    роняет обработку апдейта целиком — подписчик не создаётся, воронка не
+    идёт. Один раз так и вышло: поле `disabled` ждало объект, а получало
+    True, и любая кнопка с галкой «выкл» убивала бота наглухо.
+    """
+    try:
+        return InlineKeyboardButton(**kwargs)
+    except Exception as e:  # noqa: BLE001
+        plain = {k: v for k, v in kwargs.items()
+                 if k in ("text", "url", "callback_data")}
+        log.warning("Кнопка «%s»: оформление отброшено (%s)", kwargs.get("text"), e)
+        return InlineKeyboardButton(**plain)
 
 
 def build_keyboard(buttons: list, run_id: int, node_id: str, sub: Subscriber | None = None) -> InlineKeyboardMarkup | None:
@@ -106,11 +127,10 @@ def build_keyboard(buttons: list, run_id: int, node_id: str, sub: Subscriber | N
         if url:
             if sub is not None:
                 url = personalize(url, sub)  # подставляем {p:...}, {source} в ссылку
-            rows.append([InlineKeyboardButton(text=label, url=url, **extra)])
+            rows.append([_make_button(text=label, url=url, **extra)])
         else:
             rows.append([
-                InlineKeyboardButton(text=label, callback_data=f"f:{run_id}:{node_id}:{i}",
-                                     **extra)
+                _make_button(text=label, callback_data=f"f:{run_id}:{node_id}:{i}", **extra)
             ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
