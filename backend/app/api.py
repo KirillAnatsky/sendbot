@@ -957,6 +957,7 @@ async def list_subscribers(
             "first_name": s.first_name,
             "last_name": s.last_name,
             "is_active": s.is_active,
+            "is_subscribed": s.is_subscribed is not False,
             "created_at": s.created_at.isoformat(),
             "tags": tag_map.get(s.id, []),
         }
@@ -1029,6 +1030,8 @@ async def get_subscriber(sub_id: int, user=Depends(current_user),
         "first_source": s.first_source,
         "params": s.params or {},
         "is_active": s.is_active,
+        # у записей до появления колонки стоит NULL — это «подписан»
+        "is_subscribed": s.is_subscribed is not False,
         "bot_id": s.bot_id, "bot_name": bot.name if bot else "—",
         "bot_running": manager.get(s.bot_id) is not None,
         "created_at": s.created_at.isoformat(),
@@ -1172,6 +1175,8 @@ class SegmentSearchIn(BaseModel):
     filter: dict = {}
     limit: int = 500
     count_only: bool = False
+    # «сколько человек реально получит рассылку»: те же отсечки, что в рассыльщике
+    deliverable: bool = False
 
 
 async def _tags_of(session, sub_ids: list[int]) -> dict[int, list]:
@@ -1206,6 +1211,11 @@ async def subscribers_search(body: SegmentSearchIn, user=Depends(current_user),
                                 await allowed_bot_ids(user, session))
     except segment.SegmentError as e:
         raise HTTPException(400, str(e))
+    if body.deliverable:
+        # иначе перед стартом показывалось бы число больше реального: тех, кто
+        # заблокировал бота или отписался, рассыльщик всё равно пропустит
+        q = q.where(Subscriber.is_active == True,  # noqa: E712
+                    Subscriber.is_subscribed.isnot(False))
     total = (await session.execute(
         select(func.count()).select_from(q.subquery())
     )).scalar()
@@ -1224,6 +1234,7 @@ async def subscribers_search(body: SegmentSearchIn, user=Depends(current_user),
                 "username": s.username, "first_name": s.first_name, "last_name": s.last_name,
                 "language_code": s.language_code, "source": s.source,
                 "is_active": s.is_active,
+                "is_subscribed": s.is_subscribed is not False,
                 "created_at": s.created_at.isoformat(),
                 "last_active_at": s.last_active_at.isoformat() if s.last_active_at else None,
                 "tags": tag_map.get(s.id, []),

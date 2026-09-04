@@ -13,6 +13,7 @@ from ..models import (
     FunnelRun,
     NodeVisit,
     ScheduledJob,
+    SentMessage,
     Subscriber,
     SubscriberTag,
     Tag,
@@ -91,7 +92,8 @@ async def advance(
             if not media and data.get("photo_url"):  # обратная совместимость
                 media = [{"type": "photo", "path": data["photo_url"]}]
             await send_message_content(bot, session, sub, data.get("text", ""), media, kb,
-                                       text_first=bool(data.get("text_first")))
+                                       text_first=bool(data.get("text_first")),
+                                       track=(funnel.id, node_id))
             has_branchy_buttons = any(
                 node["outputs"].get(f"output_{i + 2}") for i in range(len(buttons))
             )
@@ -125,11 +127,25 @@ async def advance(
             node_id = next_node(graph, node_id, _language_port(data, sub))
 
         elif ntype == "action":
-            if data["op"] == "add_tag":
+            op = data.get("op")
+            port = "output_1"  # у всех операций один выход, кроме проверки подписки
+            if op == "add_tag":
                 await _add_tag(session, sub.id, data["tag"])
-            else:
+            elif op == "remove_tag":
                 await _remove_tag(session, sub.id, data["tag"])
-            node_id = next_node(graph, node_id, "output_1")
+            elif op == "unsubscribe":
+                await _unsubscribe(session, sub)
+                log.info("Подписчик #%s отписан блоком %s воронки #%s",
+                         sub.id, node_id, funnel.id)
+                run.status = "done"
+                await session.flush()
+                return  # дальше по воронке не идём: человек отписался
+            elif op == "delete_message":
+                await _delete_message(bot, session, funnel, sub, data.get("target"), node_id)
+            elif op == "check_subscription":
+                ok = await _is_channel_member(bot, data.get("channel"), sub)
+                port = "output_1" if ok else "output_2"
+            node_id = next_node(graph, node_id, port)
 
         else:  # start
             node_id = next_node(graph, node_id, "output_1")
@@ -211,7 +227,8 @@ async def run_due_jobs(session: AsyncSession, get_bot):
             continue
         funnel = await session.get(Funnel, run.funnel_id)
         sub = await session.get(Subscriber, run.subscriber_id)
-        if funnel is None or sub is None or not funnel.is_active or not sub.is_active:
+        if (funnel is None or sub is None or not funnel.is_active
+                or not sub.is_active or not sub.is_subscribed):
             continue
         # пауза автоматизации — переносим шаг: вернём job в pending на минуту вперёд
         if sub.automation_paused_until and sub.automation_paused_until > datetime.utcnow():
@@ -225,6 +242,103 @@ async def run_due_jobs(session: AsyncSession, get_bot):
             await advance(bot, session, run, funnel, sub, job.node_id, "output_1")
         except Exception:  # noqa: BLE001
             log.exception("Ошибка выполнения отложенного шага job=%s", job.id)
+
+
+async def _unsubscribe(session: AsyncSession, sub: Subscriber):
+    """Снять с рассылок: флаг + отмена всего запланированного.
+
+    Отложенные шаги надо гасить именно здесь. Иначе человек, нажавший
+    «отписаться», всё равно получит сообщение из задержки, поставленной
+    до отписки, — и это выглядит как игнор его решения.
+    """
+    sub.is_subscribed = False
+    runs = await session.execute(
+        select(FunnelRun.id).where(
+            FunnelRun.subscriber_id == sub.id, FunnelRun.status == "active"
+        )
+    )
+    run_ids = [r for (r,) in runs.all()]
+    if run_ids:
+        jobs = await session.execute(
+            select(ScheduledJob).where(
+                ScheduledJob.run_id.in_(run_ids), ScheduledJob.status == "pending"
+            )
+        )
+        for j in jobs.scalars():
+            j.status = "cancelled"
+    await session.flush()
+
+
+async def _is_channel_member(bot: Bot, channel, sub: Subscriber) -> bool:
+    """Подписан ли человек на канал. Ошибку считаем «не подписан».
+
+    Бот должен быть админом канала — иначе Telegram не отдаёт участников,
+    и все уходят в ветку «не подписан». Пишем это в лог явно: без подсказки
+    такую настройку ищут часами.
+    """
+    chat = str(channel or "").strip()
+    if not chat:
+        return False
+    if not chat.startswith("@") and not chat.lstrip("-").isdigit():
+        chat = "@" + chat
+    if chat.lstrip("-").isdigit():
+        chat = int(chat)
+    try:
+        m = await bot.get_chat_member(chat, sub.tg_id)
+    except Exception as e:  # noqa: BLE001
+        log.warning(
+            "Проверка подписки на %s не удалась (%s). Убедитесь, что бот — "
+            "администратор этого канала. Подписчик #%s уходит в ветку «не подписан»",
+            chat, e, sub.id,
+        )
+        return False
+    status = getattr(m, "status", "")
+    if status in ("creator", "administrator", "member"):
+        return True
+    # «restricted» — в канале/группе, но с ограничениями: участник, если is_member
+    return status == "restricted" and bool(getattr(m, "is_member", False))
+
+
+async def _delete_message(bot: Bot, session: AsyncSession, funnel: Funnel,
+                          sub: Subscriber, target, node_id: str):
+    """Удалить сообщение, отправленное ранее указанным блоком воронки.
+
+    target — id блока «Сообщение» или "last" (последнее, что бот отправил
+    этому человеку в этой воронке). Telegram разрешает боту удалять свои
+    сообщения только 48 часов, поэтому неудача — норма, а не сбой воронки.
+    """
+    target = str(target or "").strip()
+    q = select(SentMessage).where(
+        SentMessage.subscriber_id == sub.id, SentMessage.funnel_id == funnel.id
+    )
+    if target and target != "last":
+        q = q.where(SentMessage.node_id == target)
+        rows = (await session.execute(q.order_by(SentMessage.id))).scalars().all()
+    else:
+        # «последнее» — это весь последний отправленный блок целиком: у альбома
+        # несколько message_id, и удалить надо все, иначе останутся обрывки
+        last = (await session.execute(
+            q.order_by(SentMessage.id.desc()).limit(1)
+        )).scalars().first()
+        if last is None:
+            rows = []
+        else:
+            rows = (await session.execute(
+                q.where(SentMessage.node_id == last.node_id).order_by(SentMessage.id)
+            )).scalars().all()
+
+    if not rows:
+        log.info("Блок %s: удалять нечего — подписчику #%s это сообщение не отправлялось",
+                 node_id, sub.id)
+        return
+    for row in rows:
+        try:
+            await bot.delete_message(sub.tg_id, row.message_id)
+        except Exception as e:  # noqa: BLE001
+            log.info("Не удалось удалить сообщение %s подписчика #%s: %s",
+                     row.message_id, sub.id, e)
+        await session.delete(row)
+    await session.flush()
 
 
 async def _tag_id_by_ref(session: AsyncSession, tag_ref) -> int | None:

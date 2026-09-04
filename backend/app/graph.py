@@ -7,6 +7,7 @@
   delay:     output_1 -> дальше (после паузы)
   condition: output_1 -> да (тег есть), output_2 -> нет
   action:    output_1 -> дальше
+             (кроме «проверка подписки»: output_1 -> подписан, output_2 -> нет)
   language:  output_1 -> «остальные» (язык не совпал),
              output_{i+2} -> ветка языка i (0-индекс) — как кнопки у message
   filter:    output_1 -> подходит, output_2 -> не подходит
@@ -14,6 +15,11 @@
 
 NODE_TYPES = {"start", "message", "delay", "condition", "action", "note",
               "language", "filter"}
+
+# Операции блока «Действие». Первые две — исторические (раньше блок так
+# и назывался «Тег»), поэтому старые воронки продолжают работать без миграции.
+ACTION_OPS = ("add_tag", "remove_tag", "unsubscribe", "check_subscription",
+              "delete_message")
 
 
 class GraphError(Exception):
@@ -88,10 +94,29 @@ def _validate(nodes: dict):
             if not langs:
                 raise GraphError(f"Блок «Язык» ({nid}): добавьте хотя бы один язык")
         elif n["type"] == "action":
-            if d.get("op") not in ("add_tag", "remove_tag"):
+            op = d.get("op")
+            if op not in ACTION_OPS:
                 raise GraphError(f"Блок «Действие» ({nid}): некорректная операция")
-            if not d.get("tag"):
+            if op in ("add_tag", "remove_tag") and not d.get("tag"):
                 raise GraphError(f"Блок «Действие» ({nid}): не выбран тег")
+            if op == "check_subscription":
+                channel = str(d.get("channel") or "").strip()
+                if not channel:
+                    raise GraphError(
+                        f"Блок «Действие» ({nid}): укажите канал — @имя или числовой id")
+                if not (channel.startswith("@") or channel.lstrip("-").isdigit()):
+                    raise GraphError(
+                        f"Блок «Действие» ({nid}): канал пишется как @имя "
+                        f"или числовой id (-100…), а не «{channel}»")
+            if op == "delete_message":
+                target = str(d.get("target") or "").strip()
+                if not target:
+                    raise GraphError(
+                        f"Блок «Действие» ({nid}): выберите, какое сообщение удалить")
+                if target != "last" and nodes.get(target, {}).get("type") != "message":
+                    raise GraphError(
+                        f"Блок «Действие» ({nid}): блок, чьё сообщение нужно удалить, "
+                        "больше не существует — выберите другой")
 
 
 def next_node(graph: dict, node_id: str, port: str = "output_1") -> str | None:

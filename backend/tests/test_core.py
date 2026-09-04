@@ -214,6 +214,241 @@ async def test_funnel_engine_flow_and_tracking(session):
     assert dict(visits) == {"2": 1, "3": 1}
 
 
+def test_action_node_validation():
+    """Блок «Действие»: каждая операция требует своих полей."""
+    from app.graph import GraphError, compile_graph
+
+    def gui(data):
+        return _gui({
+            "1": {"id": 1, "name": "start", "data": {}, "inputs": {},
+                  "outputs": {"output_1": {"connections": [{"node": "2", "output": "input_1"}]}}},
+            "2": {"id": 2, "name": "action", "data": data,
+                  "inputs": {"input_1": {"connections": []}},
+                  "outputs": {"output_1": {"connections": []}}},
+            "3": {"id": 3, "name": "message", "data": {"text": "Привет"},
+                  "inputs": {"input_1": {"connections": []}},
+                  "outputs": {"output_1": {"connections": []}}},
+        })
+
+    # старый формат «Тег» продолжает компилироваться
+    compile_graph(gui({"op": "add_tag", "tag": "1"}))
+    compile_graph(gui({"op": "unsubscribe"}))
+    compile_graph(gui({"op": "check_subscription", "channel": "@ch"}))
+    compile_graph(gui({"op": "check_subscription", "channel": "-1001234567890"}))
+    compile_graph(gui({"op": "delete_message", "target": "last"}))
+    compile_graph(gui({"op": "delete_message", "target": "3"}))
+
+    for bad, hint in [
+        ({"op": "whatever"}, "операция"),
+        ({"op": "add_tag"}, "тег"),
+        ({"op": "check_subscription"}, "канал"),
+        ({"op": "check_subscription", "channel": "t.me/ch"}, "@имя"),
+        ({"op": "delete_message"}, "какое сообщение"),
+        ({"op": "delete_message", "target": "99"}, "не существует"),
+        # нельзя удалять по ссылке на блок, который сообщений не шлёт
+        ({"op": "delete_message", "target": "1"}, "не существует"),
+    ]:
+        with pytest.raises(GraphError) as e:
+            compile_graph(gui(bad))
+        assert hint in str(e.value), (bad, str(e.value))
+
+
+@pytest.mark.asyncio
+async def test_unsubscribe_stops_delays_and_broadcasts(session):
+    """Отписка гасит отложенные шаги и убирает человека из аудитории рассылок."""
+    from sqlalchemy import select
+
+    from app.bot import engine as fx
+    from app.models import Bot, Funnel, FunnelRun, ScheduledJob, Subscriber
+    from app import segment as seg
+
+    b = Bot(name="B", token="t", is_active=True)
+    session.add(b)
+    await session.flush()
+    f = Funnel(name="F", is_active=True, trigger_type="start", graph_ui={}, graph={})
+    session.add(f)
+    sub = Subscriber(bot_id=b.id, tg_id=10, first_name="X", is_active=True)
+    session.add(sub)
+    await session.flush()
+    run = FunnelRun(funnel_id=f.id, subscriber_id=sub.id, current_node="1", status="active")
+    session.add(run)
+    await session.flush()
+    session.add(ScheduledJob(run_id=run.id, node_id="2",
+                             execute_at=datetime.utcnow() + timedelta(hours=1)))
+    await session.flush()
+
+    await fx._unsubscribe(session, sub)
+
+    assert sub.is_subscribed is False
+    job = (await session.execute(select(ScheduledJob))).scalar_one()
+    assert job.status == "cancelled"
+
+    # в сегментах отписавшегося не видно, а «отписался» — видно
+    q = seg.build_query(b.id, {"conditions": [
+        {"field": "subscribed", "op": "equals", "value": "yes"}]})
+    assert (await session.execute(q)).scalars().all() == []
+    q = seg.build_query(b.id, {"conditions": [
+        {"field": "subscribed", "op": "equals", "value": "no"}]})
+    assert [s.id for s in (await session.execute(q)).scalars()] == [sub.id]
+
+
+@pytest.mark.asyncio
+async def test_action_node_runs_in_funnel(session):
+    """Прогон через движок: развилка по подписке и остановка воронки отпиской."""
+    from sqlalchemy import select
+
+    from app.bot import engine as fx
+    from app.bot import runner
+    from app.graph import compile_graph
+    from app.models import Bot, Funnel, FunnelBot, FunnelRun, Subscriber
+
+    class MockBot:
+        def __init__(self, member=True):
+            self.sent = []
+            self.member = member
+
+        async def send_message(self, cid, text, **kw):
+            self.sent.append(text)
+            return type("M", (), {"photo": [], "message_id": 100 + len(self.sent)})()
+
+        async def get_chat_member(self, chat, uid):
+            if self.member is None:
+                raise RuntimeError("бот не админ канала")
+            return type("CM", (), {"status": "member" if self.member else "left"})()
+
+    # старт -> проверка подписки -> (да: «Спасибо», нет: «Подпишись» -> отписать)
+    gui = _gui({
+        "1": {"id": 1, "name": "start", "data": {}, "inputs": {},
+              "outputs": {"output_1": {"connections": [{"node": "2", "output": "input_1"}]}}},
+        "2": {"id": 2, "name": "action",
+              "data": {"op": "check_subscription", "channel": "@ch"},
+              "inputs": {"input_1": {"connections": []}},
+              "outputs": {"output_1": {"connections": [{"node": "3", "output": "input_1"}]},
+                          "output_2": {"connections": [{"node": "4", "output": "input_1"}]}}},
+        "3": {"id": 3, "name": "message", "data": {"text": "Спасибо"},
+              "inputs": {"input_1": {"connections": []}},
+              "outputs": {"output_1": {"connections": []}}},
+        "4": {"id": 4, "name": "message", "data": {"text": "Подпишись"},
+              "inputs": {"input_1": {"connections": []}},
+              "outputs": {"output_1": {"connections": [{"node": "5", "output": "input_1"}]}}},
+        "5": {"id": 5, "name": "action", "data": {"op": "unsubscribe"},
+              "inputs": {"input_1": {"connections": []}},
+              "outputs": {"output_1": {"connections": [{"node": "6", "output": "input_1"}]}}},
+        "6": {"id": 6, "name": "message", "data": {"text": "Это уже не должно уйти"},
+              "inputs": {"input_1": {"connections": []}},
+              "outputs": {"output_1": {"connections": []}}},
+    })
+    b = Bot(name="B", token="t", is_active=True)
+    session.add(b)
+    await session.flush()
+    f = Funnel(name="F", is_active=True, trigger_type="start",
+               graph_ui=gui, graph=compile_graph(gui))
+    session.add(f)
+    await session.flush()
+    session.add(FunnelBot(funnel_id=f.id, bot_id=b.id))
+
+    # подписан на канал -> первая ветка
+    bot = MockBot(member=True)
+    runner.manager.bots = {b.id: bot}
+    sub = Subscriber(bot_id=b.id, tg_id=10, first_name="A", is_active=True)
+    session.add(sub)
+    await session.flush()
+    await fx.start_funnel(bot, session, f, sub)
+    assert bot.sent == ["Спасибо"]
+    assert sub.is_subscribed is not False
+
+    # не подписан -> вторая ветка, и отписка обрывает воронку
+    bot2 = MockBot(member=False)
+    sub2 = Subscriber(bot_id=b.id, tg_id=11, first_name="B", is_active=True)
+    session.add(sub2)
+    await session.flush()
+    await fx.start_funnel(bot2, session, f, sub2)
+    assert bot2.sent == ["Подпишись"]          # «Это уже не должно уйти» не отправлено
+    assert sub2.is_subscribed is False
+    run2 = (await session.execute(select(FunnelRun).where(
+        FunnelRun.subscriber_id == sub2.id))).scalar_one()
+    assert run2.status == "done"
+
+    # бот не админ канала -> ошибка = «не подписан», воронка не падает
+    bot3 = MockBot(member=None)
+    sub3 = Subscriber(bot_id=b.id, tg_id=12, first_name="C", is_active=True)
+    session.add(sub3)
+    await session.flush()
+    await fx.start_funnel(bot3, session, f, sub3)
+    assert bot3.sent == ["Подпишись"]
+
+
+@pytest.mark.asyncio
+async def test_deliverable_count_matches_who_actually_gets_it(session):
+    """Число «Получателей» = то, что реально уйдёт: без блока и без отписавшихся."""
+    from sqlalchemy import func, select
+
+    from app import segment as seg
+    from app.models import Bot, Subscriber
+
+    b = Bot(name="B", token="t", is_active=True)
+    session.add(b)
+    await session.flush()
+    for tg, active, subscribed in [(1, True, True), (2, True, False), (3, False, True)]:
+        s_ = Subscriber(bot_id=b.id, tg_id=tg, first_name="X", is_active=active)
+        s_.is_subscribed = subscribed
+        session.add(s_)
+    await session.flush()
+
+    q = seg.build_query(b.id, {})
+    assert (await session.execute(
+        select(func.count()).select_from(q.subquery()))).scalar() == 3
+
+    # та же отсечка, что в api.subscribers_search(deliverable=True) и в рассыльщике
+    q = q.where(Subscriber.is_active == True,  # noqa: E712
+                Subscriber.is_subscribed.isnot(False))
+    assert (await session.execute(
+        select(func.count()).select_from(q.subquery()))).scalar() == 1
+
+
+@pytest.mark.asyncio
+async def test_delete_message_removes_what_the_node_sent(session):
+    """Блок «Удалить сообщение» удаляет ровно то, что отправил указанный блок."""
+    from sqlalchemy import select
+
+    from app.bot import engine as fx
+    from app.models import Bot, Funnel, SentMessage, Subscriber
+
+    deleted = []
+
+    class MockBot:
+        async def delete_message(self, cid, mid):
+            deleted.append(mid)
+
+    b = Bot(name="B", token="t", is_active=True)
+    session.add(b)
+    await session.flush()
+    f = Funnel(name="F", is_active=True, trigger_type="start", graph_ui={}, graph={})
+    session.add(f)
+    sub = Subscriber(bot_id=b.id, tg_id=10, first_name="X", is_active=True)
+    session.add(sub)
+    await session.flush()
+    # узел «2» отправил альбом из двух сообщений, узел «3» — одно
+    for node_id, mid in [("2", 100), ("2", 101), ("3", 200)]:
+        session.add(SentMessage(subscriber_id=sub.id, funnel_id=f.id,
+                                node_id=node_id, message_id=mid))
+    await session.flush()
+
+    await fx._delete_message(MockBot(), session, f, sub, "2", "9")
+    assert deleted == [100, 101]
+
+    # «last» берёт последний блок целиком, а не одно сообщение
+    deleted.clear()
+    await fx._delete_message(MockBot(), session, f, sub, "last", "9")
+    assert deleted == [200]
+
+    # ничего не осталось — блок отрабатывает молча, воронка не падает
+    deleted.clear()
+    await fx._delete_message(MockBot(), session, f, sub, "last", "9")
+    assert deleted == []
+    assert (await session.execute(select(SentMessage))).scalars().all() == []
+
+
 @pytest.mark.asyncio
 async def test_subscribers_isolated_per_bot(session):
     from app.bot import runner
@@ -530,6 +765,8 @@ def test_every_endpoint_is_protected():
     ALLOWED_OPEN = {
         "/api/health",          # публичная проверка живости (нужна деплою)
         "/api/auth/login",      # вход
+        "/api/auth/telegram",   # вход через Telegram: подпись проверяется внутри
+        "/api/auth/telegram/config",  # какой бот на кнопке входа — видно и так на странице
         "/api/logs/ws",         # сокет: право проверяется внутри по токену
     }
     unprotected = []

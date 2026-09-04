@@ -227,6 +227,27 @@ KIND_LABEL = {
 }
 
 
+async def _remember_sent(session, sub, track, result):
+    """Запоминает message_id отправленного узлом воронки.
+
+    track — (funnel_id, node_id) или None, если запоминать нечего (рассылка,
+    ответ оператора). Альбом возвращает список сообщений — храним все, иначе
+    удалится только первое, а остальные останутся висеть.
+    """
+    if not track or result is None:
+        return
+    from ..models import SentMessage
+
+    funnel_id, node_id = track
+    items = result if isinstance(result, (list, tuple)) else [result]
+    for m in items:
+        mid = getattr(m, "message_id", None)
+        if mid:
+            session.add(SentMessage(subscriber_id=sub.id, funnel_id=funnel_id,
+                                    node_id=str(node_id), message_id=int(mid)))
+    await session.flush()
+
+
 async def _deliver(coro_factory, bot, session, sub) -> bool:
     """Выполнить отправку с обработкой RetryAfter/Forbidden."""
     import asyncio
@@ -356,7 +377,7 @@ def _input_media(mtype: str, arg, caption):
     return cls(media=arg)
 
 
-async def _send_one(bot, session, sub, kind, items, caption, markup) -> bool:
+async def _send_one(bot, session, sub, kind, items, caption, markup, track=None) -> bool:
     """Отправить одну единицу плана. Кэширует полученные file_id по (бот, файл)."""
     bot_id = sub.bot_id
 
@@ -382,6 +403,7 @@ async def _send_one(bot, session, sub, kind, items, caption, markup) -> bool:
                 fid = _extract_file_id(res[gi], mtype)
                 if fid:
                     await _store_file_id(session, bot_id, cache_path, fid)
+        await _remember_sent(session, sub, track, res)
         return True
 
     m = items[0]
@@ -409,6 +431,7 @@ async def _send_one(bot, session, sub, kind, items, caption, markup) -> bool:
         fid = _extract_file_id(res, t)
         if fid:
             await _store_file_id(session, bot_id, cache_path, fid)
+    await _remember_sent(session, sub, track, res)
     return True
 
 
@@ -418,6 +441,7 @@ async def send_message_content(
     is_operator: bool = False,
     log_history: bool = True,
     text_first: bool = False,
+    track: tuple | None = None,
 ) -> bool:
     """Отправка сообщения воронки: текст + любое число вложений + кнопки.
     Правила: одиночное вложение несёт подпись+кнопки; при нескольких —
@@ -433,10 +457,12 @@ async def send_message_content(
     if not media:
         if not text and keyboard is None:
             return True
-        ok = await _deliver(
+        res = await _deliver_result(
             lambda: bot.send_message(sub.tg_id, text or "", reply_markup=keyboard, parse_mode=ParseMode.HTML),
             bot, session, sub,
         )
+        ok = res is not None
+        await _remember_sent(session, sub, track, res)
         if ok and log_history:
             await _log_out(session, sub, text, is_operator)
         return ok
@@ -452,11 +478,12 @@ async def send_message_content(
     # есть визуально идёт после неё. Кнопки в этом режиме остаются на потом,
     # чтобы оказаться внизу, под последним вложением.
     if text_first and text:
-        ok = await _deliver(
+        res = await _deliver_result(
             lambda: bot.send_message(sub.tg_id, text, parse_mode=ParseMode.HTML),
             bot, session, sub,
         )
-        delivered = delivered or ok
+        await _remember_sent(session, sub, track, res)
+        delivered = delivered or res is not None
         caption_used = True   # текст уже ушёл, подписью его не дублируем
 
     for kind, fam, items in sends:
@@ -470,7 +497,7 @@ async def send_message_content(
         elif keyboard is None and not caption_used and items[0]["type"] in CAPTION_CAPABLE:
             # нет кнопок — вешаем подпись на первое подходящее вложение
             cap, caption_used = text or None, True
-        ok = await _send_one(bot, session, sub, kind, items, cap, markup)
+        ok = await _send_one(bot, session, sub, kind, items, cap, markup, track)
         delivered = delivered or ok
 
     # финальное текстовое сообщение: если кнопки ещё не прикреплены или текст не отправлен
@@ -478,11 +505,12 @@ async def send_message_content(
     if need_final:
         body = text or "⠀"  # send_message требует непустой текст
         kb_final = None if kb_used else keyboard
-        ok = await _deliver(
+        res = await _deliver_result(
             lambda: bot.send_message(sub.tg_id, body, reply_markup=kb_final, parse_mode=ParseMode.HTML),
             bot, session, sub,
         )
-        delivered = delivered or ok
+        await _remember_sent(session, sub, track, res)
+        delivered = delivered or res is not None
 
     if log_history:
         summary = text or ("📎 " + ", ".join(KIND_LABEL.get(m["type"], m["type"]) for m in media))

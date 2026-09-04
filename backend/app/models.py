@@ -86,6 +86,9 @@ class Subscriber(Base):
     last_active_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     # пауза автоматизации (воронки/автоответы) до указанного времени — для ручного диалога
     automation_paused_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # отписался от рассылок и автоматики. Не путать с is_active: там «нас
+    # заблокировали», здесь — «сам попросил больше не писать»
+    is_subscribed: Mapped[bool] = mapped_column(Boolean, default=True)
 
     tags = relationship("SubscriberTag", back_populates="subscriber", cascade="all, delete-orphan")
 
@@ -202,6 +205,24 @@ class BroadcastRecipient(Base):
     subscriber_id: Mapped[int] = mapped_column(ForeignKey("subscribers.id", ondelete="CASCADE"), index=True)
     delivered: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class SentMessage(Base):
+    """Что бот отправил и каким узлом воронки — чтобы потом это удалить.
+
+    В истории переписки лежит только текст; message_id, без которого Telegram
+    не даст ничего удалить, раньше нигде не сохранялся. Альбом даёт несколько
+    строк на один узел — удалять надо все.
+    """
+    __tablename__ = "sent_messages"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    subscriber_id: Mapped[int] = mapped_column(
+        ForeignKey("subscribers.id", ondelete="CASCADE"), index=True)
+    funnel_id: Mapped[int] = mapped_column(Integer, index=True)
+    node_id: Mapped[str] = mapped_column(String(32), index=True)
+    message_id: Mapped[int] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
 
 
 class MediaFileId(Base):

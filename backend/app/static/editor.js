@@ -8,7 +8,7 @@ const NODE_META = {
   message:   { title: '💬 Сообщение', inputs: 1, outputs: 1 },
   delay:     { title: '⏱ Задержка',   inputs: 1, outputs: 1 },
   condition: { title: '❓ Условие',    inputs: 1, outputs: 2 },
-  action:    { title: '🏷 Тег',       inputs: 1, outputs: 1 },
+  action:    { title: '⚡️ Действие',  inputs: 1, outputs: 1 },
   language:  { title: '🌐 Язык',      inputs: 1, outputs: 2 },
   filter:    { title: '🔎 Фильтр',    inputs: 1, outputs: 2 },
   note:      { title: '⚠️ Заметка',   inputs: 0, outputs: 0 },
@@ -148,13 +148,55 @@ function summary(type, d) {
   if (type === 'language') return `Язык: ${(d.languages || []).join(' / ') || '?'} / остальные`;
   if (type === 'filter') return segSummaryText(d.filter);
   if (type === 'note') return d.text || 'пустая заметка';
-  if (type === 'action') return (d.op === 'remove_tag' ? 'Снять тег: ' : 'Добавить тег: ') + tagName(d.tag);
+  if (type === 'action') return actionSummary(d);
   return '';
+}
+
+// Операции блока «Действие». Порядок = порядок в выпадающем списке.
+const ACTION_OPS = [
+  ['add_tag',            'Добавить тег',            1],
+  ['remove_tag',         'Снять тег',               1],
+  ['unsubscribe',        'Отписать от рассылок',    1],
+  ['check_subscription', 'Проверить подписку на канал', 2],
+  ['delete_message',     'Удалить прошлое сообщение',   1],
+];
+const ACTION_OUTPUTS = Object.fromEntries(ACTION_OPS.map(([op, , n]) => [op, n]));
+
+function actionSummary(d) {
+  switch (d.op) {
+    case 'remove_tag':         return 'Снять тег: ' + tagName(d.tag);
+    case 'unsubscribe':        return 'Отписать от рассылок';
+    case 'check_subscription': return 'Подписан на ' + (d.channel || '?') + '?';
+    case 'delete_message':     return 'Удалить сообщение: ' + msgNodeName(d.target);
+    default:                   return 'Добавить тег: ' + tagName(d.tag);
+  }
+}
+
+// Список блоков «Сообщение» текущей воронки — чтобы выбрать, что удалять.
+function messageNodes() {
+  const out = [];
+  if (!editor) return out;
+  const data = editor.export().drawflow.Home.data;
+  Object.keys(data).forEach(id => {
+    if (data[id].name !== 'message') return;
+    // текст берём через plainText: он снимает разметку так же, как её видит
+    // подписчик («<b>Привет</b>, друг» -> «Привет, друг», а не «Привет , друг»)
+    const t = plainText((data[id].data || {}).text || '').replace(/\s+/g, ' ').trim();
+    out.push({ id: String(id), label: '#' + id + ' · ' + (t.slice(0, 40) || 'без текста') });
+  });
+  return out;
+}
+
+function msgNodeName(target) {
+  if (!target || target === 'last') return 'последнее';
+  const n = messageNodes().find(m => m.id === String(target));
+  return n ? n.label : '#' + target + ' (блок удалён)';
 }
 
 function portsHint(type, d) {
   d = d || {};
   if (type === 'condition') return '1: да  •  2: нет';
+  if (type === 'action' && d.op === 'check_subscription') return '1: подписан  •  2: нет';
   if (type === 'message') {
     const btns = d.buttons || [];
     let s = '1: далее';
@@ -415,6 +457,58 @@ function blockDefaults(type) {
   }[type];
 }
 
+// Смена операции меняет и набор полей, и число выходов. Сначала сохраняем
+// выбор, потом перерисовываем панель — иначе перерисовка возьмёт старые данные
+// узла и вернёт список к прежнему значению.
+function onActionOpChange() {
+  const id = selectedNodeId;
+  applyProps();
+  showProps(id);
+}
+
+// Поля, зависящие от выбранной операции блока «Действие».
+function actionBody(op, d) {
+  if (op === 'add_tag' || op === 'remove_tag') {
+    return `<label>Тег</label>
+      <select id="p-tag" class="tag-select" onchange="maybeCreateTag(this)">${tagOptions(d.tag)}</select>`;
+  }
+  if (op === 'unsubscribe') {
+    return `<div class="hint-box">
+      Человек перестанет получать рассылки и отложенные шаги воронок.
+      Диалог с ботом остаётся — если он снова нажмёт <code>/start</code>,
+      подписка вернётся. Обычно этот блок вешают на кнопку «Отписаться».
+    </div>`;
+  }
+  if (op === 'check_subscription') {
+    return `<label>Канал</label>
+      <input id="p-channel" placeholder="@mychannel или -1001234567890"
+             value="${esc(d.channel || '')}">
+      <div class="hint-box">
+        <b>Бот должен быть администратором этого канала</b> — иначе Telegram
+        не отдаёт список участников и все уходят в выход «не подписан».<br>
+        Выход 1 — подписан, выход 2 — нет.
+      </div>`;
+  }
+  if (op === 'delete_message') {
+    const nodes = messageNodes().filter(n => String(n.id) !== String(selectedNodeId));
+    const cur = String(d.target || 'last');
+    const missing = cur !== 'last' && !nodes.some(n => n.id === cur);
+    return `<label>Какое сообщение удалить</label>
+      <select id="p-target">
+        <option value="last" ${cur === 'last' ? 'selected' : ''}>последнее отправленное</option>
+        ${nodes.map(n =>
+          `<option value="${n.id}" ${cur === n.id ? 'selected' : ''}>${esc(n.label)}</option>`).join('')}
+        ${missing ? `<option value="${esc(cur)}" selected>#${esc(cur)} — блок удалён</option>` : ''}
+      </select>
+      <div class="hint-box">
+        Удаляется то, что этот бот отправил конкретному человеку выбранным
+        блоком. Telegram разрешает боту удалять свои сообщения
+        <b>только 48 часов</b> — что старше, останется в чате.
+      </div>`;
+  }
+  return '';
+}
+
 function addBlockAt(type, x, y) {
   const m = NODE_META[type];
   const defaults = blockDefaults(type);
@@ -625,14 +719,14 @@ function showProps(id) {
         в выход «остальные» (∗).
       </div>`;
   } else if (node.name === 'action') {
+    const op = d.op || 'add_tag';
     html += `
-      <label>Операция</label>
-      <select id="p-op">
-        <option value="add_tag" ${d.op !== 'remove_tag' ? 'selected' : ''}>Добавить тег</option>
-        <option value="remove_tag" ${d.op === 'remove_tag' ? 'selected' : ''}>Снять тег</option>
+      <label>Что сделать</label>
+      <select id="p-op" onchange="onActionOpChange()">
+        ${ACTION_OPS.map(([v, l]) =>
+          `<option value="${v}" ${op === v ? 'selected' : ''}>${l}</option>`).join('')}
       </select>
-      <label>Тег</label>
-      <select id="p-tag" class="tag-select" onchange="maybeCreateTag(this)">${tagOptions(d.tag)}</select>`;
+      <div id="p-action-body">${actionBody(op, d)}</div>`;
   }
 
   if (node.name !== 'start') {
@@ -849,7 +943,17 @@ function applyProps() {
     for (let i = cur; i > need; i--) editor.removeNodeOutput(selectedNodeId, 'output_' + i);
   } else if (node.name === 'action') {
     d.op = document.getElementById('p-op').value;
-    d.tag = cleanTag(document.getElementById('p-tag').value, d.tag);
+    const tagSel = document.getElementById('p-tag');
+    if (tagSel) d.tag = cleanTag(tagSel.value, d.tag);
+    const chan = document.getElementById('p-channel');
+    if (chan) d.channel = chan.value.trim();
+    const target = document.getElementById('p-target');
+    if (target) d.target = target.value;
+    // «проверить подписку» — развилка на два выхода, остальные операции — один
+    const need = ACTION_OUTPUTS[d.op] || 1;
+    const cur = Object.keys(editor.getNodeFromId(selectedNodeId).outputs).length;
+    for (let i = cur; i < need; i++) editor.addNodeOutput(selectedNodeId);
+    for (let i = cur; i > need; i--) editor.removeNodeOutput(selectedNodeId, 'output_' + i);
   }
 
   editor.updateNodeDataFromId(selectedNodeId, d);
@@ -1338,7 +1442,7 @@ function setupMagnetConnections() {
 const LINK_MENU_BLOCKS = [
   ['message', '💬 Сообщение'], ['delay', '⏱ Задержка'],
   ['condition', '❓ Условие (тег)'], ['filter', '🔎 Фильтр'], ['language', '🌐 Язык'],
-  ['action', '🏷 Тег +/−'], ['note', '⚠️ Заметка'],
+  ['action', '⚡️ Действие'], ['note', '⚠️ Заметка'],
 ];
 
 function closeLinkMenu() {

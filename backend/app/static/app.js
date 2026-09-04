@@ -661,6 +661,15 @@ function subsDebounce() {           // поиск не дёргает серве
   _subsTimer = setTimeout(loadSubscribers, 300);
 }
 
+
+// Три разных состояния, которые легко перепутать: «заблокировал бота» —
+// написать ему уже нельзя; «отписался» — диалог жив, но рассылки не идут.
+function subStatusHtml(s) {
+  if (!s.is_active) return '<span class="status-off">блок</span>';
+  if (s.is_subscribed === false) return '<span class="status-off">отписался</span>';
+  return '<span class="status-active">активен</span>';
+}
+
 function currentSubFilter() {
   const botId = +document.getElementById('sub-bot-filter').value || null;
   const search = document.getElementById('sub-search').value.trim();
@@ -706,7 +715,7 @@ async function loadSubscribers() {
       <td>${s.username ? '@' + esc(s.username) : '—'}</td>
       <td>${esc(s.language_code || '—')}</td>
       <td>${s.last_active_at ? new Date(s.last_active_at + 'Z').toLocaleDateString('ru') : '—'}</td>
-      <td>${s.is_active ? '<span class="status-active">активен</span>' : '<span class="status-off">блок</span>'}</td>
+      <td>${subStatusHtml(s)}</td>
       <td>${s.tags.map(t => `<span class="pill">${esc(t.name)}${can('subscribers', 'edit')
         ? `<span class="x" onclick="removeSubTag(${s.id},${t.id})">✕</span>` : ''}</span>`).join('')}</td>
       <td>${can('subscribers', 'edit') ? `<select onchange="addSubTag(${s.id}, this.value); this.value=''">
@@ -910,7 +919,7 @@ async function countBroadcast() {
   const botId = +document.getElementById('bc-bot').value;
   if (!botId) { alert('Выберите бота'); return; }
   const r = await api('/subscribers/search', { method: 'POST',
-    body: { bot_id: botId, filter: BC_SEG.getFilter(), count_only: true } });
+    body: { bot_id: botId, filter: BC_SEG.getFilter(), count_only: true, deliverable: true } });
   document.getElementById('bc-count').textContent = `Получателей: ${r.total}`;
 }
 // Предпросмотр: то же сообщение, но только себе. Заодно самая честная
@@ -952,7 +961,7 @@ async function sendBroadcast() {
   let total = null;
   try {
     const r = await api('/subscribers/search', { method: 'POST',
-      body: { bot_id: botId, filter: body.segment, count_only: true } });
+      body: { bot_id: botId, filter: body.segment, count_only: true, deliverable: true } });
     total = r.total;
   } catch (e) { /* не посчиталось — спросим без числа */ }
   if (total === 0) { alert('Под выбранный сегмент не попадает ни один подписчик.'); return; }
@@ -1197,7 +1206,9 @@ async function refreshChatInfo() {
 
   const paused = s.paused_until && new Date(s.paused_until + 'Z') > new Date();
   document.getElementById('chat-info').innerHTML = `
-    <div class="chat-info-row"><span>Статус</span><b>${s.is_active ? 'Подписан' : 'Заблокировал'}</b></div>
+    <div class="chat-info-row"><span>Статус</span><b>${
+      !s.is_active ? 'Заблокировал бота'
+        : s.is_subscribed === false ? 'Отписался от рассылок' : 'Подписан'}</b></div>
     <div class="chat-info-row"><span>Добавлен</span><b>${new Date(s.created_at + 'Z').toLocaleString('ru')}</b></div>
     <div class="chat-info-row"><span>Активность</span><b>${s.last_active_at ? new Date(s.last_active_at + 'Z').toLocaleString('ru') : '—'}</b></div>
     <div class="chat-info-row"><span>Язык</span><b>${esc(s.language_code || '—')}</b></div>

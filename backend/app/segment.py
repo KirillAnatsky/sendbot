@@ -9,6 +9,7 @@
      {"field": "username",      "op": "contains"|"equals",       "value": "текст"},
      {"field": "language",      "op": "equals"|"not_equals",     "value": "ru"},
      {"field": "status",        "op": "equals",                  "value": "active"|"blocked"},
+     {"field": "subscribed",    "op": "equals",                  "value": "yes"|"no"},
      {"field": "source",        "op": "equals"|"contains",       "value": "текст"},
      {"field": "in_funnel",     "op": "yes"|"no",                "value": <funnel_id>},
      {"field": "in_broadcast",  "op": "yes"|"no",                "value": <broadcast_id>},
@@ -73,6 +74,12 @@ def _cond(c):
 
     if field == "status":
         return Subscriber.is_active == (val == "active")
+
+    if field == "subscribed":
+        # у старых записей колонки не было -> NULL, и это «подписан»
+        if val == "no":
+            return Subscriber.is_subscribed.is_(False)
+        return (Subscriber.is_subscribed.is_(True)) | (Subscriber.is_subscribed.is_(None))
 
     if field == "source":
         if op == "equals":
@@ -141,7 +148,7 @@ def build_query(bot_id: int | None, filt: dict, allowed_bot_ids: list[int] | Non
     for c in filt.get("conditions", []):
         if c.get("field") and c.get("op") is not None:
             if c.get("value") in (None, "") and c["field"] not in (
-                "status", "active_24h"
+                "status", "subscribed", "active_24h"
             ) and c["op"] not in ("yes", "no"):
                 continue  # пустое значение — пропускаем условие
             conds.append(_cond(c))
@@ -165,6 +172,9 @@ def fields_meta(tags, funnels, broadcasts):
         {"key": "status", "label": "Статус", "type": "choice",
          "options": [{"v": "active", "l": "активен"}, {"v": "blocked", "l": "заблокировал"}],
          "ops": [["equals", "="]]},
+        {"key": "subscribed", "label": "Подписан на рассылки", "type": "choice",
+         "options": [{"v": "yes", "l": "да"}, {"v": "no", "l": "отписался"}],
+         "ops": [["equals", "="]]},
         {"key": "source", "label": "Источник (deep-link)", "type": "text",
          "ops": [["equals", "="], ["contains", "содержит"]]},
         {"key": "in_funnel", "label": "Был в воронке", "type": "select", "options": funnels,
@@ -183,7 +193,8 @@ def fields_meta(tags, funnels, broadcasts):
 
 _FIELD_LABEL = {
     "tag": "тег", "name": "имя", "username": "@username", "language": "язык",
-    "status": "статус", "source": "источник (deep-link)",
+    "status": "статус", "subscribed": "подписан на рассылки",
+    "source": "источник (deep-link)",
     "in_funnel": "был в воронке", "in_broadcast": "был в рассылке",
     "signup": "дата подписки", "last_activity": "последняя активность",
 }
@@ -213,6 +224,8 @@ def describe(filt: dict, tag_names: dict, funnel_names: dict, bc_names: dict) ->
             val = bc_names.get(int(val), f"#{val}") if str(val).isdigit() else val
         elif field == "status":
             val = _STATUS_LABEL.get(val, val)
+        elif field == "subscribed":
+            val = {"yes": "да", "no": "отписался"}.get(val, val)
         label = _FIELD_LABEL.get(field, field)
         op_l = _OP_LABEL.get(op, op)
         out.append(f"{label}: {op_l} {val}".strip() if val not in (None, "") else f"{label}: {op_l}")

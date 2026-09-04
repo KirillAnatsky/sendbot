@@ -197,6 +197,8 @@ async def upsert_subscriber(session, bot_id: int, tg_user, source: str | None = 
             sub.source = source
             sub.params = params
         sub.is_active = True
+        # нажал /start снова — значит вернулся; блок «Отписать» больше не в силе
+        sub.is_subscribed = True
         sub.last_active_at = datetime.utcnow()
     return sub
 
@@ -480,13 +482,15 @@ async def _process_broadcast(session, bot, bc: Broadcast):
     # новый формат — сегмент; старый — include_tags/exclude_tags (обратная совместимость)
     if filters.get("segment") is not None:
         q = seg.build_query(bc.bot_id, filters["segment"]).where(
-            Subscriber.is_active == True  # noqa: E712
+            Subscriber.is_active == True,  # noqa: E712
+            Subscriber.is_subscribed == True,  # noqa: E712
         )
     else:
         include = [int(t) for t in filters.get("include_tags") or []]
         exclude = [int(t) for t in filters.get("exclude_tags") or []]
         q = select(Subscriber).where(
             Subscriber.is_active == True,  # noqa: E712
+            Subscriber.is_subscribed == True,  # noqa: E712
             Subscriber.bot_id == bc.bot_id,
         )
         if include:

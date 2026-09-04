@@ -62,6 +62,7 @@ def _migrate(conn):
 
     add("subscribers", "last_active_at", "last_active_at TIMESTAMP")
     add("subscribers", "automation_paused_until", "automation_paused_until TIMESTAMP")
+    add("subscribers", "is_subscribed", "is_subscribed BOOLEAN DEFAULT TRUE")
     add("broadcasts", "bot_id", "bot_id INTEGER DEFAULT 0")
     add("broadcasts", "media", "media JSON")
     add("broadcasts", "buttons", "buttons JSON")
@@ -109,6 +110,8 @@ def _migrate(conn):
         "CREATE INDEX IF NOT EXISTS ix_bc_recipients_bc ON broadcast_recipients (broadcast_id, delivered)",
         "CREATE INDEX IF NOT EXISTS ix_scheduled_jobs_status_at ON scheduled_jobs (status, execute_at)",
         "CREATE INDEX IF NOT EXISTS ix_runs_funnel_sub ON funnel_runs (funnel_id, subscriber_id)",
+        # под удаление сообщения узла: ищем по (подписчик, воронка, узел)
+        "CREATE INDEX IF NOT EXISTS ix_sent_sub_node ON sent_messages (subscriber_id, funnel_id, node_id)",
     ):
         try:
             ex(ddl)
