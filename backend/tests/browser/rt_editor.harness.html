@@ -1,0 +1,52 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  .rt-area { min-height: 80px; border: 1px solid #ccc; padding: 8px; }
+  .tg-spoiler { background: #444; color: transparent; }
+  .rt-btn.on { background: #cfe3ff; }
+</style>
+<div id="host"></div>
+<script>
+  // esc() живёт в app.js — в стенде подменяем той же реализацией
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"]/g,
+      c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  }
+</script>
+<script src="richtext.js"></script>
+<script>
+  window.RT = mountRichText(document.getElementById('host'), '', () => {});
+  window.rtArea = document.querySelector('.rt-area');
+  // помощник для тестов: выделить текст по подстроке внутри области
+  window.selectText = function (needle) {
+    const walker = document.createTreeWalker(rtArea, NodeFilter.SHOW_TEXT);
+    let n;
+    while ((n = walker.nextNode())) {
+      const i = n.nodeValue.indexOf(needle);
+      if (i < 0) continue;
+      const r = document.createRange();
+      r.setStart(n, i);
+      r.setEnd(n, i + needle.length);
+      const sel = getSelection();
+      sel.removeAllRanges();
+      sel.addRange(r);
+      rtArea.focus();
+      return true;
+    }
+    return false;
+  };
+  // поставить каретку в самый конец содержимого
+  window.caretToEnd = function () {
+    const r = document.createRange();
+    r.selectNodeContents(rtArea);
+    r.collapse(false);
+    const sel = getSelection();
+    sel.removeAllRanges();
+    sel.addRange(r);
+    rtArea.focus();
+  };
+  window.clickBtn = function (cmd) {
+    const b = document.querySelector(`.rt-btn[data-cmd="${cmd}"]`);
+    b.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+  };
+</script>
