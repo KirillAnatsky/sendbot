@@ -11,6 +11,7 @@ const NODE_META = {
   action:    { title: '⚡️ Действие',  inputs: 1, outputs: 1 },
   language:  { title: '🌐 Язык',      inputs: 1, outputs: 2 },
   filter:    { title: '🔎 Фильтр',    inputs: 1, outputs: 2 },
+  chain:     { title: '⛓ Цепочка',   inputs: 1, outputs: 1 },
   note:      { title: '⚠️ Заметка',   inputs: 0, outputs: 0 },
 };
 
@@ -149,7 +150,26 @@ function summary(type, d) {
   if (type === 'filter') return segSummaryText(d.filter);
   if (type === 'note') return d.text || 'пустая заметка';
   if (type === 'action') return actionSummary(d);
+  if (type === 'chain') return chainName(d.funnel_id);
   return '';
+}
+
+// Цепочки, доступные для вызова. Грузятся вместе с редактором: список
+// короткий, а без него блок «Цепочка» нечем заполнить.
+let CHAINS = [];
+let IS_CHAIN = false;   // открытая сейчас воронка — на самом деле цепочка
+
+async function loadChains() {
+  try {
+    const all = await api('/funnels');
+    CHAINS = all.filter(f => f.is_chain && f.id !== currentFunnelId);
+  } catch (e) { CHAINS = []; }
+}
+
+function chainName(id) {
+  const c = CHAINS.find(c => String(c.id) === String(id));
+  if (c) return 'Цепочка: ' + c.name;
+  return id ? 'Цепочка #' + id + ' — удалена' : 'Цепочка не выбрана';
 }
 
 // Операции блока «Действие». Порядок = порядок в выпадающем списке.
@@ -244,6 +264,8 @@ async function openEditor(id) {
   await loadSegFields();      // нужны ноде «Фильтр»: и конструктор, и подписи
   currentFunnelId = id;
   const [f, bots] = await Promise.all([api('/funnels/' + id), api('/bots')]);
+  await loadChains();
+  IS_CHAIN = !!f.is_chain;
 
   document.querySelectorAll('.page').forEach(p => p.classList.add('hidden'));
   document.getElementById('page-editor').classList.remove('hidden');
@@ -253,6 +275,14 @@ async function openEditor(id) {
   if (f.trigger_type === 'keyword') document.getElementById('funnel-trigger-value').value = f.trigger_value || '';
   populateTriggerTag(f.trigger_type, f.trigger_value || '');
   updateTriggerInputs();
+
+  // У цепочки нет ни триггера, ни своих ботов: она идёт под ботом той
+  // воронки, которая её вызвала. Показывать пустые настройки — врать.
+  document.getElementById('funnel-trigger').classList.toggle('hidden', IS_CHAIN);
+  document.getElementById('chain-hint').classList.toggle('hidden', !IS_CHAIN);
+  document.querySelector('.editor-subbar').classList.toggle('hidden', IS_CHAIN);
+  document.getElementById('funnel-name').placeholder =
+    IS_CHAIN ? 'Название цепочки' : 'Название воронки';
 
   // привязка к ботам
   const fbEl = document.getElementById('funnel-bots');
@@ -434,6 +464,12 @@ function populateTriggerTag(triggerType, value) {
 
 function updateTriggerInputs() {
   const t = document.getElementById('funnel-trigger').value;
+  if (IS_CHAIN) {
+    // у цепочки триггера нет — прячем всё, что к нему относится
+    ['funnel-trigger-value', 'funnel-trigger-tag', 'trigger-msg-hint', 'trigger-tag-hint']
+      .forEach(id => document.getElementById(id)?.classList.add('hidden'));
+    return;
+  }
   document.getElementById('funnel-trigger-value').classList.toggle('hidden', t !== 'keyword');
   const tagSel = document.getElementById('funnel-trigger-tag');
   tagSel.classList.toggle('hidden', t !== 'tag_added' && t !== 'message');
@@ -453,6 +489,7 @@ function blockDefaults(type) {
     language: { languages: ['ru'] },
     filter: { filter: { match: 'all', active_24h: false, conditions: [] } },
     action: { op: 'add_tag', tag: TAGS[0] ? String(TAGS[0].id) : '' },
+    chain: { funnel_id: CHAINS[0] ? String(CHAINS[0].id) : '' },
     note: { text: '' },
   }[type];
 }
@@ -718,6 +755,27 @@ function showProps(id) {
         <code>ru, uk, be</code>. Кто не совпал ни с одной веткой — уходит
         в выход «остальные» (∗).
       </div>`;
+  } else if (node.name === 'chain') {
+    const cur = String(d.funnel_id || '');
+    const missing = cur && !CHAINS.some(c => String(c.id) === cur);
+    html += `
+      <label>Какую цепочку запустить</label>
+      <select id="p-chain">
+        <option value="">— выберите цепочку —</option>
+        ${CHAINS.map(c =>
+          `<option value="${c.id}" ${cur === String(c.id) ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}
+        ${missing ? `<option value="${esc(cur)}" selected>#${esc(cur)} — цепочка удалена</option>` : ''}
+      </select>
+      ${cur && !missing
+        ? `<button class="btn" onclick="openChainEditor('${esc(cur)}')">Открыть цепочку →</button>` : ''}
+      ${CHAINS.length ? '' :
+        `<div class="hint-box">Цепочек пока нет. Создайте её кнопкой
+         «+ Цепочка» в списке воронок — там же, где создаёте воронки.</div>`}
+      <div class="hint-box">
+        Человек проходит цепочку целиком и возвращается сюда, на выход блока.
+        Если цепочка заканчивается ожиданием кнопки — вернётся после нажатия.
+        Цепочка идёт под тем же ботом, что и эта воронка.
+      </div>`;
   } else if (node.name === 'action') {
     const op = d.op || 'add_tag';
     html += `
@@ -941,6 +999,8 @@ function applyProps() {
     const cur = Object.keys(editor.getNodeFromId(selectedNodeId).outputs).length;
     for (let i = cur; i < need; i++) editor.addNodeOutput(selectedNodeId);
     for (let i = cur; i > need; i--) editor.removeNodeOutput(selectedNodeId, 'output_' + i);
+  } else if (node.name === 'chain') {
+    d.funnel_id = document.getElementById('p-chain').value;
   } else if (node.name === 'action') {
     d.op = document.getElementById('p-op').value;
     const tagSel = document.getElementById('p-tag');
@@ -1112,6 +1172,17 @@ function arrangeVertical() {
   Object.keys(df).forEach(id => { try { editor.updateConnectionNodes('node-' + id); } catch (e) {} });
   decoratePorts();
   flashStatus('Разложено сверху вниз');
+}
+
+// Переход внутрь цепочки — это уход с текущего холста, поэтому сначала
+// разбираемся с несохранёнными правками: молча их потерять хуже всего.
+async function openChainEditor(id) {
+  if (editorDirty()) {
+    const answer = confirm('В воронке есть несохранённые правки. Сохранить перед переходом?');
+    if (answer) await saveFunnel();
+    else if (!confirm('Перейти и потерять правки?')) return;
+  }
+  openEditor(+id);
 }
 
 // ---------- сохранение ----------
@@ -1442,7 +1513,7 @@ function setupMagnetConnections() {
 const LINK_MENU_BLOCKS = [
   ['message', '💬 Сообщение'], ['delay', '⏱ Задержка'],
   ['condition', '❓ Условие (тег)'], ['filter', '🔎 Фильтр'], ['language', '🌐 Язык'],
-  ['action', '⚡️ Действие'], ['note', '⚠️ Заметка'],
+  ['action', '⚡️ Действие'], ['chain', '⛓ Цепочка'], ['note', '⚠️ Заметка'],
 ];
 
 function closeLinkMenu() {

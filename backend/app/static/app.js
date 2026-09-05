@@ -800,29 +800,54 @@ async function deleteSubscriber(subId) {
 // ---------- воронки: список ----------
 const TRIGGER_LABEL = { start: '/start', keyword: 'слово', tag_added: 'тег', message: 'сообщение' };
 async function loadFunnels() {
-  const funnels = await api('/funnels');
-  document.getElementById('funnels-list').innerHTML = funnels.length ? `<table>
-    <tr><th>Название</th><th>Триггер</th><th>Боты</th><th>Статус</th><th>Запусков</th><th></th></tr>
-    ${funnels.map(f => `<tr>
+  const all = await api('/funnels');
+  const funnels = all.filter(f => !f.is_chain);
+  const chains = all.filter(f => f.is_chain);
+  document.getElementById('funnels-list').innerHTML =
+    funnelsTable(funnels, false) + (chains.length ? funnelsTable(chains, true) : '');
+}
+
+// Цепочки живут в том же списке, но отдельной таблицей: у них нет ни
+// триггера, ни собственных ботов, и включать их нечего — колонки, которые
+// в их строках всегда пустые, только путали бы.
+function funnelsTable(list, isChain) {
+  if (!list.length) {
+    return isChain ? '' : '<div class="panel">Пока нет воронок — создайте первую.</div>';
+  }
+  const head = isChain
+    ? `<h3 class="list-title">⛓ Цепочки</h3>
+       <p class="list-note">Кусок воронки, вынесенный отдельно. Одну цепочку можно
+       вызвать из нескольких воронок и править в одном месте.</p>
+       <table><tr><th>Название</th><th>Где вызывается</th><th>Запусков</th><th></th></tr>`
+    : `<table><tr><th>Название</th><th>Триггер</th><th>Боты</th><th>Статус</th><th>Запусков</th><th></th></tr>`;
+  return head + list.map(f => `<tr>
       <td><a href="#" onclick="openEditor(${f.id});return false"><b>${esc(f.name)}</b></a></td>
-      <td>${TRIGGER_LABEL[f.trigger_type] || f.trigger_type}${f.trigger_value ? ': ' + esc(f.trigger_value) : ''}</td>
-      <td>${(f.bots && f.bots.length) ? f.bots.map(b => `<span class="pill">${esc(b)}</span>`).join('') : '<span style="color:#c33;font-size:12px">не назначена</span>'}</td>
-      <td>${f.is_active ? '<span class="status-active">включена</span>' : '<span class="status-off">выключена</span>'}</td>
+      ${isChain
+        ? `<td>${(f.used_by && f.used_by.length)
+             ? f.used_by.map(n => `<span class="pill">${esc(n)}</span>`).join('')
+             : '<span style="color:#c33;font-size:12px">никем — цепочка не работает</span>'}</td>`
+        : `<td>${TRIGGER_LABEL[f.trigger_type] || f.trigger_type}${f.trigger_value ? ': ' + esc(f.trigger_value) : ''}</td>
+           <td>${(f.bots && f.bots.length) ? f.bots.map(b => `<span class="pill">${esc(b)}</span>`).join('') : '<span style="color:#c33;font-size:12px">не назначена</span>'}</td>
+           <td>${f.is_active ? '<span class="status-active">включена</span>' : '<span class="status-off">выключена</span>'}</td>`}
       <td>${f.runs}</td>
       <td>
-        ${can('funnels', 'edit') ? `<button class="btn" onclick="toggleFunnel(${f.id})">${f.is_active ? 'Выключить' : 'Включить'}</button>` : ''}
+        ${!isChain && can('funnels', 'edit') ? `<button class="btn" onclick="toggleFunnel(${f.id})">${f.is_active ? 'Выключить' : 'Включить'}</button>` : ''}
         ${can('funnels', 'edit') && canDelete() ? `<button class="btn danger" onclick="deleteFunnel(${f.id})">Удалить</button>` : ''}
       </td>
-    </tr>`).join('')}
-  </table>` : '<div class="panel">Пока нет воронок — создайте первую.</div>';
+    </tr>`).join('') + '</table>';
 }
+
 async function createFunnel() {
   const r = await api('/funnels', { method: 'POST', body: { name: 'Новая воронка', graph_ui: {} } });
   openEditor(r.id);
 }
+async function createChain() {
+  const r = await api('/funnels', { method: 'POST', body: { name: 'Новая цепочка', graph_ui: {}, is_chain: true } });
+  openEditor(r.id);
+}
 async function toggleFunnel(id) { await api(`/funnels/${id}/toggle`, { method: 'POST' }); loadFunnels(); }
 async function deleteFunnel(id) {
-  if (!confirm('Удалить воронку?')) return;
+  if (!confirm('Удалить? Отменить это будет нельзя.')) return;
   await api('/funnels/' + id, { method: 'DELETE' });
   loadFunnels();
 }

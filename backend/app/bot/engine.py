@@ -24,6 +24,11 @@ log = logging.getLogger("sendbot.engine")
 
 MAX_STEPS = 100  # защита от циклов
 
+# Насколько глубоко цепочки могут звать друг друга. Круговые вызовы ловятся
+# ещё при сохранении воронки, это — страховка на случай, если граф уже лежит
+# в базе с прошлых версий.
+MAX_CHAIN_DEPTH = 5
+
 UNIT_SECONDS = {"seconds": 1, "minutes": 60, "hours": 3600, "days": 86400}
 
 
@@ -42,16 +47,10 @@ async def start_funnel(bot: Bot, session: AsyncSession, funnel: Funnel, sub: Sub
         )
     )
     for r in old.scalars():
-        r.status = "cancelled"
-        jobs = await session.execute(
-            select(ScheduledJob).where(
-                ScheduledJob.run_id == r.id, ScheduledJob.status == "pending"
-            )
-        )
-        for j in jobs.scalars():
-            j.status = "cancelled"
+        await cancel_run(session, r)
 
-    run = FunnelRun(funnel_id=funnel.id, subscriber_id=sub.id, current_node=graph["start"])
+    run = FunnelRun(funnel_id=funnel.id, subscriber_id=sub.id, current_node=graph["start"],
+                    depth=0)
     session.add(run)
     await session.flush()
     await advance(bot, session, run, funnel, sub, graph["start"], "output_1")
@@ -147,6 +146,11 @@ async def advance(
                 port = "output_1" if ok else "output_2"
             node_id = next_node(graph, node_id, port)
 
+        elif ntype == "chain":
+            if await _enter_chain(bot, session, run, sub, data, node_id):
+                return  # продолжим этот узел, когда цепочка пройдёт до конца
+            node_id = next_node(graph, node_id, "output_1")
+
         else:  # start
             node_id = next_node(graph, node_id, "output_1")
 
@@ -160,6 +164,75 @@ async def advance(
         if pending.first() is None:
             run.status = "done"
     await session.flush()
+
+    # цепочка пройдена целиком — возвращаем человека в вызвавшую воронку
+    if run.status == "done" and run.parent_run_id:
+        await _resume_parent(bot, session, run, sub)
+
+
+async def cancel_run(session: AsyncSession, run: FunnelRun):
+    """Отменить запуск вместе с отложенными шагами и запущенными цепочками.
+
+    Дочерние запуски гасим обязательно: иначе человек, которого перезапустили
+    с начала воронки, продолжал бы получать сообщения из цепочки прошлого
+    прохода — двумя потоками сразу.
+    """
+    run.status = "cancelled"
+    jobs = await session.execute(
+        select(ScheduledJob).where(
+            ScheduledJob.run_id == run.id, ScheduledJob.status == "pending"
+        )
+    )
+    for j in jobs.scalars():
+        j.status = "cancelled"
+    children = await session.execute(
+        select(FunnelRun).where(
+            FunnelRun.parent_run_id == run.id, FunnelRun.status == "active"
+        )
+    )
+    for child in children.scalars():
+        await cancel_run(session, child)
+    await session.flush()
+
+
+async def _enter_chain(bot: Bot, session: AsyncSession, run: FunnelRun,
+                       sub: Subscriber, data: dict, node_id: str) -> bool:
+    """Запустить цепочку как отдельный запуск. False — идти дальше без неё."""
+    try:
+        fid = int(data.get("funnel_id") or 0)
+    except (TypeError, ValueError):
+        fid = 0
+    chain = await session.get(Funnel, fid) if fid > 0 else None
+    if chain is None or not (chain.graph or {}).get("start"):
+        # молча вставать посреди воронки нельзя: человек остался бы без
+        # продолжения и без следа в логах, почему
+        log.warning("Блок «Цепочка» %s: цепочка #%s не найдена или пуста — идём дальше",
+                    node_id, fid)
+        return False
+    if run.depth + 1 > MAX_CHAIN_DEPTH:
+        log.warning("Блок «Цепочка» %s: вложенность больше %s — цепочка #%s пропущена",
+                    node_id, MAX_CHAIN_DEPTH, fid)
+        return False
+
+    child = FunnelRun(
+        funnel_id=chain.id, subscriber_id=sub.id, current_node=chain.graph["start"],
+        parent_run_id=run.id, return_node=node_id, depth=run.depth + 1,
+    )
+    session.add(child)
+    await session.flush()
+    await advance(bot, session, child, chain, sub, chain.graph["start"], "output_1")
+    return True
+
+
+async def _resume_parent(bot: Bot, session: AsyncSession, run: FunnelRun, sub: Subscriber):
+    parent = await session.get(FunnelRun, run.parent_run_id)
+    if parent is None or parent.status == "cancelled" or not run.return_node:
+        return
+    funnel = await session.get(Funnel, parent.funnel_id)
+    if funnel is None:
+        return
+    parent.status = "active"
+    await advance(bot, session, parent, funnel, sub, run.return_node, "output_1")
 
 
 def _language_port(data: dict, sub: Subscriber) -> str:
@@ -227,8 +300,10 @@ async def run_due_jobs(session: AsyncSession, get_bot):
             continue
         funnel = await session.get(Funnel, run.funnel_id)
         sub = await session.get(Subscriber, run.subscriber_id)
-        if (funnel is None or sub is None or not funnel.is_active
-                or not sub.is_active or not sub.is_subscribed):
+        # у цепочки своего выключателя нет: она работает, пока её зовут —
+        # иначе отложенный шаг внутри цепочки завис бы навсегда
+        runnable = funnel is not None and (funnel.is_active or funnel.is_chain)
+        if not runnable or sub is None or not sub.is_active or not sub.is_subscribed:
             continue
         # пауза автоматизации — переносим шаг: вернём job в pending на минуту вперёд
         if sub.automation_paused_until and sub.automation_paused_until > datetime.utcnow():

@@ -211,6 +211,8 @@ async def _funnels_for_bot(session, bot_id: int, trigger_type: str):
             .where(
                 FunnelBot.bot_id == bot_id,
                 Funnel.is_active == True,  # noqa: E712
+                # цепочки сами не запускаются — только по вызову из воронки
+                Funnel.is_chain == False,  # noqa: E712
                 Funnel.trigger_type == trigger_type,
             )
         )
@@ -340,6 +342,7 @@ async def trigger_tag_added(session, sub: Subscriber, tag_id: int):
             .where(
                 FunnelBot.bot_id == sub.bot_id,
                 Funnel.is_active == True,  # noqa: E712
+                Funnel.is_chain == False,  # noqa: E712
                 Funnel.trigger_type == "tag_added",
                 Funnel.trigger_value == str(tag_id),
             )

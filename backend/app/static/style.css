@@ -545,3 +545,7 @@ th { background: #f8fafc; color: #7a8499; font-weight: 600; font-size: 12.5px; t
 #tg-login-widget { display: flex; justify-content: center; }
 #tg-link-modal { text-align: left; }
 #tg-link-widget { display: flex; justify-content: center; margin-top: 10px; }
+
+/* заголовок и пояснение над отдельной таблицей (цепочки в списке воронок) */
+.list-title { margin: 22px 0 4px; font-size: 15px; }
+.list-note { margin: 0 0 10px; font-size: 12.5px; color: #7a8499; max-width: 620px; }

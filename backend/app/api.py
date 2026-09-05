@@ -15,7 +15,7 @@ from .auth import (
     user_can_bot, user_funnel_ids, user_permissions, verify_password,
 )
 from .db import SessionLocal
-from .graph import GraphError, compile_graph
+from .graph import GraphError, chain_ids, check_no_cycles, compile_graph
 from .models import (
     AIRequest,
     Bot,
@@ -808,7 +808,9 @@ def _node_label(ntype: str, data: dict) -> str:
     if ntype == "condition":
         return "❓ условие"
     if ntype == "action":
-        return "🏷 тег"
+        return "⚡️ действие"
+    if ntype == "chain":
+        return "⛓ цепочка"
     if ntype == "start":
         return "▶️ старт"
     return ntype
@@ -826,7 +828,7 @@ async def analysis_options(user=Depends(current_user), session=Depends(get_sessi
     for f in funnels:
         nodes = []
         for nid, n in (f.graph.get("nodes") or {}).items():
-            if n.get("type") in ("message", "delay", "condition", "action"):
+            if n.get("type") in ("message", "delay", "condition", "action", "chain"):
                 item = {"id": nid, "label": _node_label(n["type"], n.get("data") or {})}
                 if n["type"] == "message":
                     item["buttons"] = [
@@ -1349,6 +1351,15 @@ class FunnelIn(BaseModel):
     trigger_value: str | None = None
     graph_ui: dict = {}
     bot_ids: list[int] = []
+    is_chain: bool = False
+
+
+async def _chain_graphs(session) -> dict:
+    """Графы всех цепочек: {id: (имя, граф)} — для проверки круговых вызовов."""
+    rows = (await session.execute(
+        select(Funnel.id, Funnel.name, Funnel.graph).where(Funnel.is_chain == True)  # noqa: E712
+    )).all()
+    return {fid: (name, graph or {}) for fid, name, graph in rows}
 
 
 async def _bot_ids_for_funnel(session, funnel_id: int) -> list[int]:
@@ -1393,15 +1404,23 @@ async def list_funnels(bot_id: int | None = None, user=Depends(current_user),
     bots_map: dict[int, list] = {}
     for fid, bname in fb:
         bots_map.setdefault(fid, []).append(bname)
+    # «где вызывается» для цепочек: цепочка, которую никто не зовёт, не
+    # работает вообще — это надо видеть в списке, а не выяснять потом
+    used_by: dict[int, list] = {}
+    for f in funnels:
+        for cid in chain_ids(f.graph or {}):
+            used_by.setdefault(cid, []).append(f.name)
     return [
         {
             "id": f.id,
             "name": f.name,
             "is_active": f.is_active,
+            "is_chain": f.is_chain,
             "trigger_type": f.trigger_type,
             "trigger_value": f.trigger_value,
             "runs": run_counts.get(f.id, 0),
             "bots": bots_map.get(f.id, []),
+            "used_by": used_by.get(f.id, []),
             "updated_at": f.updated_at.isoformat(),
         }
         for f in funnels
@@ -1414,7 +1433,8 @@ async def create_funnel(body: FunnelIn, user=Depends(current_user),
     for bid in body.bot_ids:
         await ensure_bot_access(user, bid)
     funnel = Funnel(
-        name=body.name or "Новая воронка",
+        name=body.name or ("Новая цепочка" if body.is_chain else "Новая воронка"),
+        is_chain=body.is_chain,
         trigger_type=body.trigger_type,
         trigger_value=body.trigger_value,
         graph_ui=body.graph_ui or {},
@@ -1438,6 +1458,7 @@ async def get_funnel(funnel_id: int, user=Depends(current_user),
         "id": f.id,
         "name": f.name,
         "is_active": f.is_active,
+        "is_chain": f.is_chain,
         "trigger_type": f.trigger_type,
         "trigger_value": f.trigger_value,
         "graph_ui": f.graph_ui,
@@ -1456,6 +1477,11 @@ async def update_funnel(funnel_id: int, body: FunnelIn, user=Depends(current_use
         raise HTTPException(404, "Воронка не найдена")
     try:
         compiled = compile_graph(body.graph_ui)
+        # цепочка, которая через другие цепочки зовёт сама себя, слала бы
+        # сообщения без остановки — ловим до сохранения, а не у подписчика
+        graphs = await _chain_graphs(session)
+        graphs[funnel_id] = (body.name, compiled)
+        check_no_cycles(funnel_id, body.name, compiled, graphs.get)
     except GraphError as e:
         raise HTTPException(400, str(e))
     f.name = body.name
@@ -1475,6 +1501,9 @@ async def toggle_funnel(funnel_id: int, user=Depends(current_user),
     f = await session.get(Funnel, funnel_id)
     if f is None:
         raise HTTPException(404, "Воронка не найдена")
+    if f.is_chain:
+        raise HTTPException(400,
+            "Цепочка не включается сама — она работает, когда её вызывает воронка")
     if not f.is_active and not f.graph:
         raise HTTPException(400, "Сначала сохраните воронку с корректным графом")
     if not f.is_active and not await _bot_ids_for_funnel(session, funnel_id):
@@ -1489,6 +1518,18 @@ async def toggle_funnel(funnel_id: int, user=Depends(current_user),
 async def delete_funnel(funnel_id: int, user=Depends(current_user),
                         session=Depends(get_session)):
     await _my_funnel(user, session, funnel_id)
+    f = await session.get(Funnel, funnel_id)
+    if f is not None and f.is_chain:
+        # иначе воронки, которые её зовут, тихо потеряли бы кусок сценария
+        callers = [
+            name for name, graph in (await session.execute(
+                select(Funnel.name, Funnel.graph).where(Funnel.id != funnel_id)
+            )).all() if funnel_id in chain_ids(graph or {})
+        ]
+        if callers:
+            raise HTTPException(400,
+                "Цепочку зовут: " + ", ".join(f"«{c}»" for c in callers)
+                + ". Сначала уберите из них блок «Цепочка».")
     await session.execute(delete(Funnel).where(Funnel.id == funnel_id))
     return {"ok": True}
 

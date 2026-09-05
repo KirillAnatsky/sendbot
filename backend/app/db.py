@@ -68,6 +68,10 @@ def _migrate(conn):
     add("broadcasts", "buttons", "buttons JSON")
     add("broadcasts", "text_first", "text_first BOOLEAN DEFAULT FALSE")
     add("broadcast_recipients", "created_at", "created_at TIMESTAMP")
+    add("funnels", "is_chain", "is_chain BOOLEAN DEFAULT FALSE")
+    add("funnel_runs", "parent_run_id", "parent_run_id INTEGER")
+    add("funnel_runs", "return_node", "return_node VARCHAR(32)")
+    add("funnel_runs", "depth", "depth INTEGER DEFAULT 0")
 
     if "subscribers" not in tables:
         return
@@ -112,6 +116,8 @@ def _migrate(conn):
         "CREATE INDEX IF NOT EXISTS ix_runs_funnel_sub ON funnel_runs (funnel_id, subscriber_id)",
         # под удаление сообщения узла: ищем по (подписчик, воронка, узел)
         "CREATE INDEX IF NOT EXISTS ix_sent_sub_node ON sent_messages (subscriber_id, funnel_id, node_id)",
+        # возврат из цепочки: по завершении дочернего запуска ищем родителя
+        "CREATE INDEX IF NOT EXISTS ix_runs_parent ON funnel_runs (parent_run_id)",
     ):
         try:
             ex(ddl)

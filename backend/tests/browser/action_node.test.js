@@ -1,5 +1,6 @@
-// Проверка блока «Действие» в редакторе воронок: набор полей, число выходов
-// и то, что applyProps читает ровно то, что нарисовал actionBody.
+// Чистые функции редактора воронок: блоки «Действие» и «Цепочка» —
+// какие поля показываются, сколько у блока выходов, что видит пользователь,
+// когда выбранная цепочка или блок-адресат уже удалены.
 const fs = require('fs');
 const { JSDOM } = require('jsdom');
 
@@ -30,7 +31,7 @@ const ctx = { esc: s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt
 // выполняем файл в песочнице и достаём нужные функции
 const vm = require('vm');
 vm.createContext(ctx);
-vm.runInContext(src + '\n;__api = {ACTION_OPS, ACTION_OUTPUTS, actionSummary, actionBody, messageNodes, msgNodeName, portsHint, summary, NODE_META};', ctx);
+vm.runInContext(src + '\n;__api = {ACTION_OPS, ACTION_OUTPUTS, actionSummary, actionBody, messageNodes, msgNodeName, portsHint, summary, NODE_META, chainName};', ctx);
 const A = ctx.__api;
 
 let failed = 0;
@@ -116,6 +117,25 @@ check('канал экранируется, а не подставляется �
 check('блок в палитре называется «Действие»', () => {
   has(A.NODE_META.action.title, 'Действие');
   has(A.summary('action', { op: 'unsubscribe' }), 'Отписать');
+});
+
+// ---------- блок «Цепочка» ----------
+vm.runInContext("CHAINS = [{id: 5, name: 'Прогрев', is_chain: true}];", ctx);
+
+check('цепочка есть в палитре и в меню связи', () => {
+  has(A.NODE_META.chain.title, 'Цепочка');
+  eq(A.NODE_META.chain.outputs, 1);   // один выход: «после цепочки»
+  eq(A.NODE_META.chain.inputs, 1);
+});
+
+check('подпись блока — имя цепочки', () => {
+  eq(A.chainName('5'), 'Цепочка: Прогрев');
+  eq(A.summary('chain', { funnel_id: '5' }), 'Цепочка: Прогрев');
+});
+
+check('удалённая и невыбранная цепочка видны как проблема', () => {
+  has(A.chainName('77'), 'удалена');
+  has(A.chainName(''), 'не выбрана');
 });
 
 console.log(failed ? `\n${failed} проверок упало` : '\nвсе проверки прошли');

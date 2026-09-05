@@ -185,8 +185,8 @@ def _summary(ntype: str, d: dict, tag_names: dict) -> str:
 
 NODE_TITLES = {
     "start": "▶️ Старт", "message": "💬 Сообщение", "delay": "⏱ Задержка",
-    "condition": "❓ Условие", "action": "🏷 Тег", "note": "⚠️ Заметка",
-    "language": "🌐 Язык", "filter": "🔎 Фильтр",
+    "condition": "❓ Условие", "action": "⚡️ Действие", "note": "⚠️ Заметка",
+    "language": "🌐 Язык", "filter": "🔎 Фильтр", "chain": "⛓ Цепочка",
 }
 
 
@@ -563,6 +563,19 @@ spec = null, если менять нечего (просто вопрос). Е�
 async def chat_edit_funnel(session, funnel, tags_list, user_messages: list, provider, api_key, model):
     """-> (reply_text, new_fields | None, in_tokens, out_tokens)"""
     import json as _json
+
+    # Блоки, которых нет в языке спеки. Модель вернула бы воронку без них —
+    # и «Цепочка» или «Фильтр» тихо исчезли бы вместе со всей веткой.
+    # Лучше честно отказаться, чем молча уничтожить кусок сценария.
+    UNSUPPORTED = {"chain": "Цепочка", "filter": "Фильтр"}
+    present = {n.get("type") for n in (funnel.graph or {}).get("nodes", {}).values()}
+    blocked = [title for t, title in UNSUPPORTED.items() if t in present]
+    if blocked:
+        raise AIError(
+            "В воронке есть блоки, которые AI-помощник пока не умеет: "
+            + ", ".join(f"«{b}»" for b in blocked)
+            + ". Он переписывает воронку целиком и потерял бы их. "
+            "Правьте такую воронку руками.")
 
     # входной контекст: текущая спека с именами тегов вместо id
     id2name = {str(t.id): t.name for t in tags_list}

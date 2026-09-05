@@ -201,6 +201,7 @@
     <section id="page-funnels" class="page hidden">
       <div class="page-head">
         <h2>Воронки</h2>
+        <button class="btn" onclick="createChain()">+ Цепочка</button>
         <button class="btn primary" onclick="createFunnel()">+ Новая воронка</button>
       </div>
       <div id="funnels-list"></div>
@@ -221,6 +222,7 @@
         <select id="funnel-trigger-tag" class="hidden"></select>
         <span id="trigger-msg-hint" class="hint-inline hidden">срабатывает на любое сообщение (кроме /start и ключевых слов). Тег справа — необязательный фильтр: НЕ запускать тех, у кого этот тег уже есть.</span>
         <span id="trigger-tag-hint" class="hint-inline hidden">запускать воронку, когда подписчику добавляют этот тег</span>
+        <span id="chain-hint" class="hint-inline hidden">Цепочка. Сама не запускается — работает, когда её вызывает блок «Цепочка» в воронке, под её ботом.</span>
         <span class="spacer"></span>
         <button class="btn" onclick="arrangeVertical()">🧹 Разложить</button>
         <button class="btn" onclick="toggleStepsDrawer()">📊 Шаги</button>
@@ -258,6 +260,7 @@
           <div class="palette-item" data-block="filter" onclick="addBlock('filter')">🔎 Фильтр</div>
           <div class="palette-item" data-block="language" onclick="addBlock('language')">🌐 Язык</div>
           <div class="palette-item" data-block="action" onclick="addBlock('action')">⚡️ Действие</div>
+          <div class="palette-item" data-block="chain" onclick="addBlock('chain')">⛓ Цепочка</div>
           <div class="palette-item" data-block="note" onclick="addBlock('note')">⚠️ Заметка</div>
           <div class="palette-hint">
             Перетащи блок на холст (или кликни). Клик по блоку — настройки.<br>

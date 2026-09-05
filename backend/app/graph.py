@@ -11,10 +11,11 @@
   language:  output_1 -> «остальные» (язык не совпал),
              output_{i+2} -> ветка языка i (0-индекс) — как кнопки у message
   filter:    output_1 -> подходит, output_2 -> не подходит
+  chain:     output_1 -> дальше (после того, как цепочка пройдена целиком)
 """
 
 NODE_TYPES = {"start", "message", "delay", "condition", "action", "note",
-              "language", "filter"}
+              "language", "filter", "chain"}
 
 # Операции блока «Действие». Первые две — исторические (раньше блок так
 # и назывался «Тег»), поэтому старые воронки продолжают работать без миграции.
@@ -93,6 +94,12 @@ def _validate(nodes: dict):
             langs = [str(x).strip() for x in (d.get("languages") or []) if str(x).strip()]
             if not langs:
                 raise GraphError(f"Блок «Язык» ({nid}): добавьте хотя бы один язык")
+        elif n["type"] == "chain":
+            try:
+                if int(d.get("funnel_id") or 0) <= 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                raise GraphError(f"Блок «Цепочка» ({nid}): не выбрана цепочка")
         elif n["type"] == "action":
             op = d.get("op")
             if op not in ACTION_OPS:
@@ -117,6 +124,56 @@ def _validate(nodes: dict):
                     raise GraphError(
                         f"Блок «Действие» ({nid}): блок, чьё сообщение нужно удалить, "
                         "больше не существует — выберите другой")
+
+
+def chain_ids(graph: dict) -> list[int]:
+    """Цепочки, которые вызывает этот граф (в порядке появления, без повторов)."""
+    out = []
+    for n in (graph.get("nodes") or {}).values():
+        if n.get("type") != "chain":
+            continue
+        try:
+            fid = int((n.get("data") or {}).get("funnel_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if fid > 0 and fid not in out:
+            out.append(fid)
+    return out
+
+
+def check_no_cycles(funnel_id: int, name: str, graph: dict, funnel_by_id) -> None:
+    """Убедиться, что цепочки не зовут друг друга по кругу.
+
+    Без этой проверки воронка, которая (через несколько цепочек) вызывает
+    сама себя, сохранится молча, а поймает её подписчик — бесконечным потоком
+    сообщений. Обычный обход в глубину: узел, который встретился повторно,
+    пока мы ещё внутри него, и есть цикл. funnel_by_id(id) -> (имя, граф).
+    """
+    DONE, INSIDE = 1, 0
+    state, path = {}, []
+
+    def title(fid, fname):
+        return f"«{fname}»" if fname else f"#{fid}"
+
+    def visit(fid, fname, g):
+        state[fid] = INSIDE
+        path.append(title(fid, fname))
+        for nxt in chain_ids(g):
+            found = funnel_by_id(nxt)
+            nxt_name = found[0] if found else None
+            if state.get(nxt) == INSIDE:
+                raise GraphError(
+                    "Цепочки зациклены: "
+                    + " → ".join(path + [title(nxt, nxt_name)])
+                    + ". Такая воронка слала бы сообщения без остановки.")
+            if state.get(nxt) == DONE or not found:
+                state[nxt] = DONE
+                continue
+            visit(nxt, nxt_name, found[1])
+        path.pop()
+        state[fid] = DONE
+
+    visit(funnel_id, name, graph)
 
 
 def next_node(graph: dict, node_id: str, port: str = "output_1") -> str | None:

@@ -131,6 +131,10 @@ class Funnel(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(128))
     is_active: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Цепочка — та же воронка, но сама не запускается: только по вызову из
+    # блока «Цепочка» другой воронки. Отдельной сущности нет намеренно —
+    # так у цепочки бесплатно есть свой редактор, статистика и анализ.
+    is_chain: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     # start | keyword | tag_added | message
     trigger_type: Mapped[str] = mapped_column(String(32), default="start")
     trigger_value: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -161,6 +165,13 @@ class FunnelRun(Base):
     current_node: Mapped[str | None] = mapped_column(String(32), nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="active")  # active | done | cancelled
     started_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    # Заход в цепочку — это отдельный запуск дочерней воронки. Так задержки,
+    # кнопки и статистика внутри цепочки работают ровно как в обычной воронке,
+    # а по её завершении родитель продолжается с узла return_node.
+    parent_run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("funnel_runs.id", ondelete="CASCADE"), nullable=True, index=True)
+    return_node: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    depth: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class ScheduledJob(Base):

@@ -449,6 +449,296 @@ async def test_delete_message_removes_what_the_node_sent(session):
     assert (await session.execute(select(SentMessage))).scalars().all() == []
 
 
+def test_chain_cycles_are_caught_on_save():
+    """Цепочка, которая через другие цепочки зовёт себя, не должна сохраниться."""
+    from app.graph import GraphError, check_no_cycles, chain_ids, compile_graph
+
+    def gui(calls):
+        nodes = {"1": {"id": 1, "name": "start", "data": {}, "inputs": {},
+                       "outputs": {"output_1": {"connections": []}}}}
+        for i, fid in enumerate(calls):
+            nid = str(i + 2)
+            nodes[nid] = {"id": i + 2, "name": "chain", "data": {"funnel_id": fid},
+                          "inputs": {"input_1": {"connections": []}},
+                          "outputs": {"output_1": {"connections": []}}}
+        return compile_graph(_gui(nodes))
+
+    a, b, c = gui([2]), gui([3]), gui([1])
+    assert chain_ids(a) == [2]
+
+    book = {1: ("A", a), 2: ("B", b), 3: ("C", c)}
+    with pytest.raises(GraphError) as e:
+        check_no_cycles(1, "A", a, book.get)
+    assert "зациклены" in str(e.value)
+    assert "«A»" in str(e.value) and "«C»" in str(e.value)
+
+    # ромб — не цикл: две воронки зовут одну и ту же цепочку
+    d = gui([])
+    book = {1: ("A", gui([2, 3])), 2: ("B", gui([4])), 3: ("C", gui([4])), 4: ("D", d)}
+    check_no_cycles(1, "A", book[1][1], book.get)
+
+    # цепочка сама на себя
+    book = {1: ("A", gui([1]))}
+    with pytest.raises(GraphError):
+        check_no_cycles(1, "A", book[1][1], book.get)
+
+
+@pytest.mark.asyncio
+async def test_chain_runs_and_returns(session):
+    """Заход в цепочку и возврат наружу — в том числе через задержку и кнопку."""
+    from sqlalchemy import select
+
+    from app.bot import engine as fx
+    from app.graph import compile_graph
+    from app.models import Bot, Funnel, FunnelRun, ScheduledJob, Subscriber
+
+    class MockBot:
+        def __init__(self):
+            self.sent = []
+
+        async def send_message(self, cid, text, **kw):
+            self.sent.append(text)
+            return type("M", (), {"photo": [], "message_id": len(self.sent)})()
+
+    def msg(nid, text, nxt=None, buttons=None):
+        outs = {"output_1": {"connections": [{"node": nxt, "output": "input_1"}] if nxt else []}}
+        if buttons:
+            outs["output_2"] = {"connections": [{"node": buttons, "output": "input_1"}]}
+        return {"id": int(nid), "name": "message",
+                "data": {"text": text, "buttons": [{"label": "Да"}] if buttons else []},
+                "inputs": {"input_1": {"connections": []}}, "outputs": outs}
+
+    bot = MockBot()
+    b = Bot(name="B", token="t", is_active=True)
+    session.add(b)
+    await session.flush()
+
+    # цепочка: одно сообщение
+    chain_gui = _gui({
+        "1": {"id": 1, "name": "start", "data": {}, "inputs": {},
+              "outputs": {"output_1": {"connections": [{"node": "2", "output": "input_1"}]}}},
+        "2": msg("2", "из цепочки"),
+    })
+    chain = Funnel(name="Цепочка", is_chain=True, is_active=False,
+                   graph_ui=chain_gui, graph=compile_graph(chain_gui))
+    session.add(chain)
+    await session.flush()
+
+    # воронка: до цепочки -> цепочка -> после цепочки
+    main_gui = _gui({
+        "1": {"id": 1, "name": "start", "data": {}, "inputs": {},
+              "outputs": {"output_1": {"connections": [{"node": "2", "output": "input_1"}]}}},
+        "2": msg("2", "до", nxt="3"),
+        "3": {"id": 3, "name": "chain", "data": {"funnel_id": chain.id},
+              "inputs": {"input_1": {"connections": []}},
+              "outputs": {"output_1": {"connections": [{"node": "4", "output": "input_1"}]}}},
+        "4": msg("4", "после"),
+    })
+    main = Funnel(name="Воронка", is_active=True, trigger_type="start",
+                  graph_ui=main_gui, graph=compile_graph(main_gui))
+    session.add(main)
+    sub = Subscriber(bot_id=b.id, tg_id=10, first_name="X", is_active=True)
+    session.add(sub)
+    await session.flush()
+
+    await fx.start_funnel(bot, session, main, sub)
+    assert bot.sent == ["до", "из цепочки", "после"]
+
+    runs = (await session.execute(select(FunnelRun))).scalars().all()
+    parent = [r for r in runs if r.funnel_id == main.id][0]
+    child = [r for r in runs if r.funnel_id == chain.id][0]
+    assert child.parent_run_id == parent.id and child.return_node == "3"
+    assert child.depth == 1 and parent.depth == 0
+    assert parent.status == "done" and child.status == "done"
+
+    # задержка внутри цепочки: воронка ждёт, пока цепочка не дойдёт до конца
+    chain2_gui = _gui({
+        "1": {"id": 1, "name": "start", "data": {}, "inputs": {},
+              "outputs": {"output_1": {"connections": [{"node": "2", "output": "input_1"}]}}},
+        "2": {"id": 2, "name": "delay", "data": {"amount": 1, "unit": "hours"},
+              "inputs": {"input_1": {"connections": []}},
+              "outputs": {"output_1": {"connections": [{"node": "3", "output": "input_1"}]}}},
+        "3": msg("3", "после паузы"),
+    })
+    chain2 = Funnel(name="С паузой", is_chain=True, is_active=False,
+                    graph_ui=chain2_gui, graph=compile_graph(chain2_gui))
+    session.add(chain2)
+    await session.flush()
+    main2_gui = _gui({
+        "1": {"id": 1, "name": "start", "data": {}, "inputs": {},
+              "outputs": {"output_1": {"connections": [{"node": "2", "output": "input_1"}]}}},
+        "2": {"id": 2, "name": "chain", "data": {"funnel_id": chain2.id},
+              "inputs": {"input_1": {"connections": []}},
+              "outputs": {"output_1": {"connections": [{"node": "3", "output": "input_1"}]}}},
+        "3": msg("3", "хвост воронки"),
+    })
+    main2 = Funnel(name="Воронка 2", is_active=True, trigger_type="start",
+                   graph_ui=main2_gui, graph=compile_graph(main2_gui))
+    session.add(main2)
+    sub2 = Subscriber(bot_id=b.id, tg_id=11, first_name="Y", is_active=True)
+    session.add(sub2)
+    await session.flush()
+
+    bot.sent.clear()
+    await fx.start_funnel(bot, session, main2, sub2)
+    assert bot.sent == []                      # ждём паузу внутри цепочки
+
+    job = (await session.execute(select(ScheduledJob).where(
+        ScheduledJob.status == "pending"))).scalars().one()
+    job.execute_at = datetime.utcnow() - timedelta(minutes=1)
+    await session.flush()
+    await fx.run_due_jobs(session, lambda bot_id: bot)
+    # цепочка досталась до конца и вернула человека в воронку
+    assert bot.sent == ["после паузы", "хвост воронки"]
+
+
+@pytest.mark.asyncio
+async def test_chain_with_button_returns_after_click(session):
+    """Цепочка ждёт нажатия — воронка продолжается только после него."""
+    from sqlalchemy import select
+
+    from app.bot import engine as fx
+    from app.graph import compile_graph
+    from app.models import Bot, Funnel, FunnelRun, Subscriber
+
+    class MockBot:
+        def __init__(self):
+            self.sent = []
+
+        async def send_message(self, cid, text, **kw):
+            self.sent.append(text)
+            return type("M", (), {"photo": [], "message_id": len(self.sent)})()
+
+    bot = MockBot()
+    b = Bot(name="B", token="t", is_active=True)
+    session.add(b)
+    await session.flush()
+
+    # цепочка: вопрос с кнопкой -> ответ
+    chain_gui = _gui({
+        "1": {"id": 1, "name": "start", "data": {}, "inputs": {},
+              "outputs": {"output_1": {"connections": [{"node": "2", "output": "input_1"}]}}},
+        "2": {"id": 2, "name": "message",
+              "data": {"text": "вопрос", "buttons": [{"label": "Да"}]},
+              "inputs": {"input_1": {"connections": []}},
+              "outputs": {"output_1": {"connections": []},
+                          "output_2": {"connections": [{"node": "3", "output": "input_1"}]}}},
+        "3": {"id": 3, "name": "message", "data": {"text": "ответ", "buttons": []},
+              "inputs": {"input_1": {"connections": []}},
+              "outputs": {"output_1": {"connections": []}}},
+    })
+    chain = Funnel(name="Опрос", is_chain=True, graph_ui=chain_gui,
+                   graph=compile_graph(chain_gui))
+    session.add(chain)
+    await session.flush()
+    main_gui = _gui({
+        "1": {"id": 1, "name": "start", "data": {}, "inputs": {},
+              "outputs": {"output_1": {"connections": [{"node": "2", "output": "input_1"}]}}},
+        "2": {"id": 2, "name": "chain", "data": {"funnel_id": chain.id},
+              "inputs": {"input_1": {"connections": []}},
+              "outputs": {"output_1": {"connections": [{"node": "3", "output": "input_1"}]}}},
+        "3": {"id": 3, "name": "message", "data": {"text": "хвост", "buttons": []},
+              "inputs": {"input_1": {"connections": []}},
+              "outputs": {"output_1": {"connections": []}}},
+    })
+    main = Funnel(name="Воронка", is_active=True, trigger_type="start",
+                  graph_ui=main_gui, graph=compile_graph(main_gui))
+    session.add(main)
+    sub = Subscriber(bot_id=b.id, tg_id=10, first_name="X", is_active=True)
+    session.add(sub)
+    await session.flush()
+
+    await fx.start_funnel(bot, session, main, sub)
+    assert bot.sent == ["вопрос"]          # воронка стоит и ждёт кнопку в цепочке
+
+    child = (await session.execute(select(FunnelRun).where(
+        FunnelRun.funnel_id == chain.id))).scalar_one()
+    await fx.handle_button(bot, session, child.id, "2", 0)
+    assert bot.sent == ["вопрос", "ответ", "хвост"]
+
+    parent = (await session.execute(select(FunnelRun).where(
+        FunnelRun.funnel_id == main.id))).scalar_one()
+    assert parent.status == "done"
+
+
+@pytest.mark.asyncio
+async def test_chain_restart_cancels_nested_run(session):
+    """Перезапуск воронки гасит и запущенную из неё цепочку."""
+    from sqlalchemy import func, select
+
+    from app.bot import engine as fx
+    from app.graph import compile_graph
+    from app.models import Bot, Funnel, FunnelRun, ScheduledJob, Subscriber
+
+    class MockBot:
+        async def send_message(self, cid, text, **kw):
+            return type("M", (), {"photo": [], "message_id": 1})()
+
+    bot = MockBot()
+    b = Bot(name="B", token="t", is_active=True)
+    session.add(b)
+    await session.flush()
+
+    chain_gui = _gui({
+        "1": {"id": 1, "name": "start", "data": {}, "inputs": {},
+              "outputs": {"output_1": {"connections": [{"node": "2", "output": "input_1"}]}}},
+        "2": {"id": 2, "name": "delay", "data": {"amount": 2, "unit": "days"},
+              "inputs": {"input_1": {"connections": []}},
+              "outputs": {"output_1": {"connections": []}}},
+    })
+    chain = Funnel(name="Долгая", is_chain=True, graph_ui=chain_gui,
+                   graph=compile_graph(chain_gui))
+    session.add(chain)
+    await session.flush()
+    main_gui = _gui({
+        "1": {"id": 1, "name": "start", "data": {}, "inputs": {},
+              "outputs": {"output_1": {"connections": [{"node": "2", "output": "input_1"}]}}},
+        "2": {"id": 2, "name": "chain", "data": {"funnel_id": chain.id},
+              "inputs": {"input_1": {"connections": []}},
+              "outputs": {"output_1": {"connections": []}}},
+    })
+    main = Funnel(name="Воронка", is_active=True, trigger_type="start",
+                  graph_ui=main_gui, graph=compile_graph(main_gui))
+    session.add(main)
+    sub = Subscriber(bot_id=b.id, tg_id=10, first_name="X", is_active=True)
+    session.add(sub)
+    await session.flush()
+
+    await fx.start_funnel(bot, session, main, sub)
+    assert (await session.execute(select(func.count()).select_from(
+        ScheduledJob.__table__).where(ScheduledJob.status == "pending"))).scalar() == 1
+
+    # человек снова нажал /start — прошлый проход целиком отменяется
+    await fx.start_funnel(bot, session, main, sub)
+    runs = (await session.execute(select(FunnelRun).order_by(FunnelRun.id))).scalars().all()
+    assert [r.status for r in runs[:2]] == ["cancelled", "cancelled"]
+    jobs = (await session.execute(select(ScheduledJob).order_by(ScheduledJob.id))).scalars().all()
+    assert jobs[0].status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_chain_never_starts_on_its_own(session):
+    """Цепочка не должна запускаться триггером, даже если включена."""
+    from app.bot import runner
+    from app.models import Bot, Funnel, FunnelBot
+
+    b = Bot(name="B", token="t", is_active=True)
+    session.add(b)
+    await session.flush()
+    chain = Funnel(name="Цепочка", is_chain=True, is_active=True,
+                   trigger_type="start", graph_ui={}, graph={})
+    normal = Funnel(name="Воронка", is_chain=False, is_active=True,
+                    trigger_type="start", graph_ui={}, graph={})
+    session.add_all([chain, normal])
+    await session.flush()
+    session.add_all([FunnelBot(funnel_id=chain.id, bot_id=b.id),
+                     FunnelBot(funnel_id=normal.id, bot_id=b.id)])
+    await session.flush()
+
+    found = await runner._funnels_for_bot(session, b.id, "start")
+    assert [f.name for f in found] == ["Воронка"]
+
+
 @pytest.mark.asyncio
 async def test_subscribers_isolated_per_bot(session):
     from app.bot import runner
