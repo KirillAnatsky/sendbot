@@ -4,6 +4,7 @@
 в граф Drawflow (тот же формат, что редактор в админке).
 """
 import json
+import logging
 import re
 
 import aiohttp
@@ -13,10 +14,67 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .graph import GraphError, compile_graph
 from .models import Setting, Tag
 
+log = logging.getLogger("sendbot.ai")
+
 DEFAULT_MODELS = {
     "anthropic": "claude-sonnet-4-5",
     "openai": "gpt-4o",
 }
+
+# Заглушка вместо картинок, которых на скриншоте не достать. Лежит в репозитории
+# и копируется в media при старте: путь должен быть валидным ещё до того, как
+# кто-то что-то загрузит, иначе воронка соберётся с битой картинкой.
+PLACEHOLDER_PATH = "media/ai-placeholder.png"
+
+
+def ensure_placeholder() -> str:
+    """Положить заглушку в media, если её там ещё нет. Возвращает путь для photo_url."""
+    import shutil
+    from pathlib import Path
+
+    from .config import settings
+
+    src = Path(__file__).parent / "assets" / "ai-placeholder.png"
+    dst = Path(settings.media_dir) / "ai-placeholder.png"
+    try:
+        if src.is_file() and not dst.is_file():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, dst)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Не скопировалась заглушка картинки: %s", e)
+    return PLACEHOLDER_PATH
+
+
+# Дополнение к промпту, когда на вход дали скриншоты чужого конструктора.
+# Главное здесь — не «собери похоже», а «не придумывай того, чего не видно»:
+# правдоподобная, но выдуманная воронка хуже честно пустого места.
+SCREENSHOT_PROMPT = """
+
+СБОРКА ПО СКРИНШОТАМ.
+Тебе дали картинки — снимки конструктора воронок другого сервиса (SendPulse
+и подобных). Это части одного холста, они могут перекрываться и идти в любом
+порядке. Собери из них нашу воронку.
+
+- Главное — структура: какие блоки есть и какими стрелками соединены.
+  Порядок и ветвления важнее красоты текстов.
+- Тексты переноси ДОСЛОВНО, ровно как видно на картинке. Если текст в карточке
+  обрезан («…», «показать больше», «ещё N символов») — перенеси видимую часть
+  и обязательно поставь note: текст обрезан, нужно дописать вручную.
+- Чужие типы блоков переводи в наши: сообщение -> message; пауза, задержка,
+  таймер -> delay; условие, фильтр по тегу -> condition; действие с тегом
+  -> action; кнопки сообщения -> buttons.
+- Блок, которому у нас нет аналога (рандомизатор, вебхук, запрос к API,
+  оплата, ИИ-ответ, передача оператору), НЕ выдумывай. Поставь на его месте
+  note с описанием того, что там было, и проведи ветку дальше.
+- Если картинка в сообщении есть, но самого файла у тебя нет — поставь
+  photo_url "%s" и note: какую картинку сюда вернуть.
+- Если не видно, куда ведёт стрелка (уходит за край, теряется, непонятно
+  к какому блоку) — НЕ ГАДАЙ. Поставь next: null и note с тем, что связь
+  оборвана и её нужно провести руками.
+- Не добавляй блоки, которых на картинках нет. Пустое место с пометкой лучше
+  выдуманного шага: выдуманный уйдёт живым людям, и заметят это они.
+""" % PLACEHOLDER_PATH
+
 
 SYSTEM_PROMPT = """Ты — конструктор воронок для телеграм-бота. По ТЗ пользователя собери воронку и верни ТОЛЬКО JSON без пояснений и без markdown-ограждений, по схеме:
 
@@ -83,9 +141,41 @@ class AIError(Exception):
     pass
 
 
-async def call_llm(provider: str, api_key: str, model: str, spec_text: str):
-    """-> (text, input_tokens, output_tokens)"""
-    timeout = aiohttp.ClientTimeout(total=180)
+def _anthropic_content(spec_text: str, images: list | None):
+    """Картинки идут ПЕРЕД текстом: так модель сначала смотрит, потом читает
+    задание, а не наоборот."""
+    if not images:
+        return spec_text
+    parts = [
+        {"type": "image",
+         "source": {"type": "base64", "media_type": im["media_type"], "data": im["data"]}}
+        for im in images
+    ]
+    parts.append({"type": "text", "text": spec_text})
+    return parts
+
+
+def _openai_content(spec_text: str, images: list | None):
+    if not images:
+        return spec_text
+    parts = [
+        {"type": "image_url",
+         "image_url": {"url": f"data:{im['media_type']};base64,{im['data']}"}}
+        for im in images
+    ]
+    parts.append({"type": "text", "text": spec_text})
+    return parts
+
+
+async def call_llm(provider: str, api_key: str, model: str, spec_text: str,
+                   images: list | None = None):
+    """-> (text, input_tokens, output_tokens)
+
+    images — [{media_type, data(base64)}]; если они есть, к системному промпту
+    добавляются правила чтения скриншотов чужого конструктора.
+    """
+    system = SYSTEM_PROMPT + (SCREENSHOT_PROMPT if images else "")
+    timeout = aiohttp.ClientTimeout(total=300 if images else 180)
     async with aiohttp.ClientSession(timeout=timeout) as http:
         if provider == "anthropic":
             r = await http.post(
@@ -98,8 +188,9 @@ async def call_llm(provider: str, api_key: str, model: str, spec_text: str):
                 json={
                     "model": model,
                     "max_tokens": 8000,
-                    "system": SYSTEM_PROMPT,
-                    "messages": [{"role": "user", "content": spec_text}],
+                    "system": system,
+                    "messages": [{"role": "user",
+                                  "content": _anthropic_content(spec_text, images)}],
                 },
             )
             data = await r.json()
@@ -116,8 +207,8 @@ async def call_llm(provider: str, api_key: str, model: str, spec_text: str):
                 json={
                     "model": model,
                     "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": spec_text},
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": _openai_content(spec_text, images)},
                     ],
                 },
             )

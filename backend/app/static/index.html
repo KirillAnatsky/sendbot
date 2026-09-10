@@ -542,10 +542,12 @@
       </div>
 
       <div class="panel">
-        <h3 style="margin-bottom:8px">Собрать воронку из ТЗ</h3>
+        <h3 style="margin-bottom:8px">Собрать воронку из ТЗ или скриншотов</h3>
         <p style="font-size:13px;color:#7a8499;margin-bottom:10px">
-          Вставь текст ТЗ (этапы, сообщения, задержки, условия, сегменты) — модель соберёт
-          черновик воронки. После генерации проверь её в редакторе и включи вручную.
+          Вставь текст ТЗ (этапы, сообщения, задержки, условия, сегменты) — или загрузи
+          скриншоты воронки из другого сервиса. Можно и то и другое сразу: текстом
+          удобно дописать то, что на картинке не видно. Собранная воронка выключена —
+          проверь её в редакторе и включи вручную.
         </p>
         <textarea id="ai-spec" rows="12" placeholder="Например:
 Этап 1: приветствие с 3 кнопками (сегментация: новичок / опытный / просто смотрю), каждая кнопка вешает свой тег.
@@ -554,9 +556,22 @@
 Этап 4: оффер со ссылкой и кнопкой «Интересно» (вешает тег hot).
 Этап 5: через день, если тега hot нет — напоминание."></textarea>
         <input type="file" id="ai-docx" accept=".docx" class="hidden" onchange="aiUploadDocx(this)">
+        <input type="file" id="ai-screens" accept="image/*" multiple class="hidden" onchange="aiUploadScreens(this)">
         <button class="btn" onclick="document.getElementById('ai-docx').click()">📄 Загрузить .docx с ТЗ</button>
+        <button class="btn" onclick="document.getElementById('ai-screens').click()">🖼 Скриншоты воронки</button>
         <button class="btn primary" id="ai-generate-btn" onclick="aiGenerate()">✨ Собрать воронку</button>
         <span id="ai-status" style="margin-left:10px;font-size:13px;color:#7a8499"></span>
+        <div id="ai-screens-list" class="ai-screens hidden"></div>
+        <div id="ai-screens-hint" class="hint-box hidden">
+          Годятся снимки конструктора из другого сервиса (SendPulse и похожих) —
+          хоть несколько кусков одного холста. Модель разберёт блоки и связи между
+          ними; тексты перенесёт как есть.<br>
+          <b>Снимайте на таком масштабе, где читаются тексты</b>, и с нахлёстом,
+          чтобы не потерялись стрелки на стыках. Всё, что не удалось разобрать —
+          обрезанный текст, оборванная стрелка, чужой тип блока, — придёт
+          в воронку жёлтой заметкой ⚠️, а не выдуманным шагом. Картинки внутри
+          сообщений заменятся заглушкой: их надо будет вернуть руками.
+        </div>
       </div>
 
       <div class="panel">

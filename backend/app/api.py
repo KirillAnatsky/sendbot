@@ -2,7 +2,7 @@ import json
 import re
 from datetime import datetime, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import case, delete, func, select
 from sqlalchemy.orm.attributes import flag_modified
@@ -1957,14 +1957,74 @@ async def extract_docx(file: UploadFile):
     return {"text": text, "chars": len(text), "images": saved_images}
 
 
+# Скриншоты чужого конструктора: снимки холста, по которым собираем воронку.
+AI_SCREEN_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                   ".webp": "image/webp", ".gif": "image/gif"}
+AI_SCREEN_MAX_MB = 5
+AI_SCREEN_MAX_COUNT = 8
+
+
+@router.post("/ai/screens", dependencies=[Depends(require("ai", "edit"))])
+async def ai_upload_screens(files: list[UploadFile] = File(...)):
+    """Принять скриншоты воронки и сложить в media. Возвращает пути для генерации."""
+    import uuid
+    from pathlib import Path
+
+    from .config import settings
+
+    if len(files) > AI_SCREEN_MAX_COUNT:
+        raise HTTPException(400, f"Не больше {AI_SCREEN_MAX_COUNT} картинок за раз")
+    media = Path(settings.media_dir)
+    media.mkdir(parents=True, exist_ok=True)
+    out = []
+    for f in files:
+        ext = Path(f.filename or "").suffix.lower()
+        if ext not in AI_SCREEN_TYPES:
+            raise HTTPException(400,
+                f"«{f.filename}» — не картинка. Нужен png, jpg, webp или gif.")
+        blob = await f.read()
+        if len(blob) > AI_SCREEN_MAX_MB * 1024 * 1024:
+            raise HTTPException(400,
+                f"«{f.filename}» больше {AI_SCREEN_MAX_MB} МБ — уменьшите картинку")
+        name = f"screen_{uuid.uuid4().hex[:8]}{ext}"
+        (media / name).write_bytes(blob)
+        out.append({"path": f"media/{name}", "name": f.filename, "bytes": len(blob)})
+    return {"images": out}
+
+
+def _load_screens(paths: list[str]) -> list[dict]:
+    """Прочитать сохранённые скриншоты в base64 для отправки модели."""
+    import base64
+    from pathlib import Path
+
+    from .config import settings
+
+    media = Path(settings.media_dir).resolve()
+    images = []
+    for raw in paths[:AI_SCREEN_MAX_COUNT]:
+        rel = str(raw)[len("media/"):] if str(raw).startswith("media/") else str(raw)
+        p = (media / rel).resolve()
+        # тот же запрет на «..», что и при отправке вложений: путь приходит
+        # с фронта, и вылезать из media ему нельзя
+        if media not in p.parents or not p.is_file():
+            raise HTTPException(400, f"Картинка не найдена: {raw}")
+        mt = AI_SCREEN_TYPES.get(p.suffix.lower())
+        if not mt:
+            raise HTTPException(400, f"Неподдерживаемый формат картинки: {raw}")
+        images.append({"media_type": mt,
+                       "data": base64.b64encode(p.read_bytes()).decode()})
+    return images
+
+
 class GenerateIn(BaseModel):
-    spec_text: str
+    spec_text: str = ""
+    image_paths: list[str] = []
 
 
 @router.post("/ai/generate", dependencies=[Depends(require("ai", "edit"))])
 async def ai_generate(body: GenerateIn, session=Depends(get_session)):
-    if not body.spec_text.strip():
-        raise HTTPException(400, "Пустое ТЗ")
+    if not body.spec_text.strip() and not body.image_paths:
+        raise HTTPException(400, "Пустое ТЗ: вставьте текст или загрузите скриншоты")
     s = await ai.get_ai_settings(session)
     if not s.get("api_key"):
         raise HTTPException(400, "Сначала укажите API-ключ в настройках AI")
@@ -1975,7 +2035,14 @@ async def ai_generate(body: GenerateIn, session=Depends(get_session)):
     session.add(req)
     await session.flush()
     try:
-        text, tin, tout = await ai.call_llm(provider, s["api_key"], model, body.spec_text)
+        images = _load_screens(body.image_paths) if body.image_paths else None
+        if images:
+            ai.ensure_placeholder()
+        spec_text = body.spec_text.strip() or (
+            "Собери воронку по этим скриншотам конструктора."
+            if images else body.spec_text)
+        text, tin, tout = await ai.call_llm(provider, s["api_key"], model,
+                                            spec_text, images)
         req.input_tokens, req.output_tokens = tin, tout
         spec = ai.parse_llm_json(text)
         tag_ids = await ai.ensure_tags(session, spec)

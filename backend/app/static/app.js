@@ -1162,15 +1162,23 @@ async function saveAISettings() {
 }
 async function aiGenerate() {
   const spec = document.getElementById('ai-spec').value.trim();
-  if (!spec) { alert('Вставь ТЗ'); return; }
+  const paths = AI_SCREENS.map(im => im.path);
+  if (!spec && !paths.length) { alert('Вставь ТЗ или загрузи скриншоты воронки'); return; }
   const btn = document.getElementById('ai-generate-btn');
   const status = document.getElementById('ai-status');
   btn.disabled = true;
-  status.textContent = 'Генерирую… (обычно 20–60 сек)';
+  status.textContent = paths.length
+    ? `Разбираю ${paths.length} скриншот(ов)… (обычно 40–90 сек)`
+    : 'Генерирую… (обычно 20–60 сек)';
   try {
-    const r = await api('/ai/generate', { method: 'POST', body: { spec_text: spec } });
+    const r = await api('/ai/generate', {
+      method: 'POST', body: { spec_text: spec, image_paths: paths },
+    });
     status.textContent = `Готово: «${r.name}» (${r.input_tokens}+${r.output_tokens} токенов)`;
-    if (confirm(`Воронка «${r.name}» собрана (выключена). Открыть в редакторе?`)) {
+    const note = paths.length
+      ? '\n\nПроверьте жёлтые заметки ⚠️ на холсте: туда попало всё, что не удалось разобрать.'
+      : '';
+    if (confirm(`Воронка «${r.name}» собрана (выключена). Открыть в редакторе?` + note)) {
       openEditor(r.funnel_id);
     }
   } catch (e) {
@@ -1204,6 +1212,52 @@ async function aiUploadDocx(input) {
     status.textContent = '';
     alert(e.message);
   }
+}
+
+// ---------- скриншоты воронки для AI-сборки ----------
+let AI_SCREENS = [];   // [{path, name, bytes}]
+
+async function aiUploadScreens(input) {
+  const files = [...(input.files || [])];
+  input.value = '';
+  if (!files.length) return;
+  const status = document.getElementById('ai-status');
+  status.textContent = `Загружаю картинки (${files.length})…`;
+  const fd = new FormData();
+  files.forEach(f => fd.append('files', f));
+  try {
+    const r = await fetch('/api/ai/screens', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + TOKEN },
+      body: fd,
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.detail || 'Не удалось загрузить картинки');
+    AI_SCREENS = AI_SCREENS.concat(data.images);
+    status.textContent = '';
+    renderAiScreens();
+  } catch (e) {
+    status.textContent = '';
+    alert(e.message);
+  }
+}
+
+function renderAiScreens() {
+  const box = document.getElementById('ai-screens-list');
+  const hint = document.getElementById('ai-screens-hint');
+  box.classList.toggle('hidden', !AI_SCREENS.length);
+  hint.classList.toggle('hidden', !AI_SCREENS.length);
+  box.innerHTML = AI_SCREENS.map((im, i) => `
+    <div class="ai-screen">
+      <img src="/${esc(im.path)}" alt="">
+      <span class="ai-screen-x" onclick="aiRemoveScreen(${i})" title="убрать">✕</span>
+      <div class="ai-screen-name">${esc(im.name || '')}</div>
+    </div>`).join('');
+}
+
+function aiRemoveScreen(i) {
+  AI_SCREENS.splice(i, 1);
+  renderAiScreens();
 }
 
 async function loadAIUsage() {

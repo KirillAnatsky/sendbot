@@ -968,6 +968,85 @@ def test_timezone_setting_survives_nonsense():
     tz.set_timezone(tz.DEFAULT_TZ)
 
 
+def test_ai_screenshot_request_shape():
+    """Скриншоты уходят модели картинками, а не описанием картинок."""
+    from app import ai
+
+    images = [{"media_type": "image/png", "data": "AAAA"},
+              {"media_type": "image/jpeg", "data": "BBBB"}]
+
+    a = ai._anthropic_content("собери воронку", images)
+    assert [p["type"] for p in a] == ["image", "image", "text"]
+    assert a[0]["source"] == {"type": "base64", "media_type": "image/png", "data": "AAAA"}
+    assert a[-1]["text"] == "собери воронку"      # текст идёт последним
+
+    o = ai._openai_content("собери воронку", images)
+    assert [p["type"] for p in o] == ["image_url", "image_url", "text"]
+    assert o[0]["image_url"]["url"] == "data:image/png;base64,AAAA"
+
+    # без картинок формат запроса не меняется — обычный текст
+    assert ai._anthropic_content("текст", None) == "текст"
+    assert ai._openai_content("текст", []) == "текст"
+
+
+def test_ai_screenshot_prompt_forbids_guessing():
+    """Промпт для скриншотов должен запрещать выдумывать, а не поощрять «похоже»."""
+    from app import ai
+
+    p = ai.SCREENSHOT_PROMPT
+    for must in ["НЕ ГАДАЙ", "note", "ДОСЛОВНО", ai.PLACEHOLDER_PATH]:
+        assert must in p, must
+    # заглушка — реальный файл в репозитории, иначе воронка соберётся с битой картинкой
+    from pathlib import Path
+    assert (Path(ai.__file__).parent / "assets" / "ai-placeholder.png").is_file()
+
+
+@pytest.mark.asyncio
+async def test_ai_screens_upload_and_load(tmp_path, monkeypatch):
+    """Загрузка скриншотов: чужие форматы и пути наружу из media не проходят."""
+    from fastapi import HTTPException
+
+    from app import api as api_mod
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "media_dir", str(tmp_path))
+    (tmp_path / "screen_ok.png").write_bytes(b"\x89PNG\r\n\x1a\nfake")
+
+    loaded = api_mod._load_screens(["media/screen_ok.png"])
+    assert loaded[0]["media_type"] == "image/png"
+    assert loaded[0]["data"]                     # base64 непустой
+
+    # выход за media — отказ, а не чтение чужого файла
+    for bad in ["../../etc/passwd", "media/../../etc/passwd", "media/нет.png"]:
+        with pytest.raises(HTTPException) as e:
+            api_mod._load_screens([bad])
+        assert e.value.status_code == 400
+
+    # чужое расширение внутри media тоже не читаем
+    (tmp_path / "doc.pdf").write_bytes(b"%PDF")
+    with pytest.raises(HTTPException):
+        api_mod._load_screens(["media/doc.pdf"])
+
+
+def test_ai_placeholder_lands_in_media(tmp_path, monkeypatch):
+    """Заглушка появляется в media сама — до того, как её попросит воронка."""
+    from pathlib import Path
+
+    from app import ai
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "media_dir", str(tmp_path))
+    path = ai.ensure_placeholder()
+    assert path == ai.PLACEHOLDER_PATH
+    assert (Path(tmp_path) / "ai-placeholder.png").is_file()
+
+    # повторный вызов ничего не ломает и не перезаписывает
+    mine = "уже заменили".encode()
+    (Path(tmp_path) / "ai-placeholder.png").write_bytes(mine)
+    ai.ensure_placeholder()
+    assert (Path(tmp_path) / "ai-placeholder.png").read_bytes() == mine
+
+
 @pytest.mark.asyncio
 async def test_subscribers_isolated_per_bot(session):
     from app.bot import runner
