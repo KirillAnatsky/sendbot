@@ -60,12 +60,21 @@ SCREENSHOT_PROMPT = """
 - Тексты переноси ДОСЛОВНО, ровно как видно на картинке. Если текст в карточке
   обрезан («…», «показать больше», «ещё N символов») — перенеси видимую часть
   и обязательно поставь note: текст обрезан, нужно дописать вручную.
-- Чужие типы блоков переводи в наши: сообщение -> message; пауза, задержка,
-  таймер -> delay; условие, фильтр по тегу -> condition; действие с тегом
-  -> action; кнопки сообщения -> buttons.
+- Чужие типы блоков переводи в наши:
+    сообщение -> message; кнопки сообщения -> buttons;
+    пауза, задержка, таймер -> delay;
+    условие/проверка по тегу -> condition;
+    поставить или снять тег -> action add_tag / remove_tag;
+    отписать, отписка от рассылки -> action unsubscribe;
+    проверка подписки на канал -> action check_subscription (в channel — @имя);
+    удалить предыдущее сообщение -> action delete_message;
+    фильтр, сегмент, проверка по языку/дате/времени/активности -> filter;
+    запуск другой цепочки -> chain, но ТОЛЬКО если пользователь явно назвал
+    существующую у нас цепочку; иначе поставь note.
 - Блок, которому у нас нет аналога (рандомизатор, вебхук, запрос к API,
-  оплата, ИИ-ответ, передача оператору), НЕ выдумывай. Поставь на его месте
-  note с описанием того, что там было, и проведи ветку дальше.
+  оплата, ИИ-ответ, передача оператору, сбор ответа в переменную), НЕ выдумывай.
+  Поставь на его месте note с описанием того, что там было, и проведи ветку
+  дальше.
 - Если картинка в сообщении есть, но самого файла у тебя нет — поставь
   photo_url "%s" и note: какую картинку сюда вернуть.
 - Если не видно, куда ведёт стрелка (уходит за край, теряется, непонятно
@@ -93,10 +102,35 @@ SYSTEM_PROMPT = """Ты — конструктор воронок для тел�
     {"id": "n2", "type": "delay", "amount": 1, "unit": "seconds|minutes|hours|days", "next": "n3"},
     {"id": "n3", "type": "condition", "tag": "имя-тега", "yes": "id или null", "no": "id или null"},
     {"id": "n4", "type": "action", "op": "add_tag|remove_tag", "tag": "имя-тега", "next": null},
+    {"id": "n7", "type": "action", "op": "unsubscribe", "next": null},
+    {"id": "n8", "type": "action", "op": "check_subscription", "channel": "@канал", "yes": "id или null", "no": "id или null"},
+    {"id": "n9", "type": "action", "op": "delete_message", "target": "id узла message | \"last\"", "next": null},
+    {"id": "n10", "type": "filter", "match": "all|any",
+     "conditions": [{"field": "tag", "op": "has", "value": "имя-тега"}],
+     "yes": "id или null", "no": "id или null"},
+    {"id": "n11", "type": "chain", "chain": "название существующей цепочки", "next": "id или null"},
     {"id": "n6", "type": "language", "languages": [{"code": "ru", "next": "id или null"}, {"code": "en", "next": "id или null"}], "other": "id или null — куда идут все остальные языки"},
     {"id": "n5", "type": "note", "text": "⚠️ предупреждение", "about": "id узла, к которому относится"}
   ]
 }
+
+У message есть необязательное поле "text_first": true — тогда текст показывается
+НАД картинкой одним сообщением (по умолчанию текст идёт подписью снизу).
+У кнопки без url есть необязательное "style": "primary" | "success" | "danger".
+
+ПОЛЯ ФИЛЬТРА (только эти, других не выдумывай):
+  tag           has | not_has                       значение: имя тега
+  language      equals | not_equals                 значение: код языка (ru, en)
+  status        equals                              значение: active | blocked
+  subscribed    equals                              значение: yes | no
+  source        equals | contains                   значение: метка deep-link
+  name          contains | equals                   значение: текст
+  username      contains | equals                   значение: текст без @
+  signup        after | before | last_days          значение: 2026-10-15 или число дней
+  last_activity after | before | last_days | inactive_days
+  weekday       in | not_in                         значение: "1,2,3" (1=Пн … 7=Вс)
+  run_date      on | after | before                 значение: 2026-10-15
+  run_time      between | after | before            значение: "10:00-18:00" или "10:00"
 
 Правила:
 - Первый узел списка — точка входа.
@@ -107,6 +141,18 @@ SYSTEM_PROMPT = """Ты — конструктор воронок для тел�
 - Теги называй короткими латинскими slug'ами.
 - Если в ТЗ встречается маркер [КАРТИНКА: media/имя-файла] — поставь это значение в photo_url ближайшего сообщения.
 - Узлы note используй для предупреждений о недостающем: в ТЗ упомянут скрин/картинка, но файла нет; нужна ссылка (регистрация, оплата, канал), а её нет; лид-магнит описан, но самого материала нет; неясное условие или сроки. Каждый note привязывай через "about". Ничего не выдумывай вместо недостающего — ставь note.
+- ДЕЙСТВИЯ. «Отписать» (unsubscribe) ставь только там, где человек сам просит
+  отписаться — обычно на кнопке «Отписаться»: после него воронка обрывается.
+  «Проверка подписки на канал» (check_subscription) — единственное действие
+  с двумя выходами (yes/no); в channel пиши @имя канала или числовой id.
+  «Удалить прошлое сообщение» (delete_message) — в target id того узла message,
+  чьё сообщение убираем, либо "last" (последнее отправленное).
+- ФИЛЬТР — развилка по свойствам подписчика: yes — подходит, no — не подходит.
+  Условие обязано быть хотя бы одно: пустой фильтр пропускает всех и не нужен.
+  weekday, run_date и run_time — это про МОМЕНТ, когда человек дошёл до фильтра,
+  а не про его свойства; они годятся для «не писать ночью» и «только по будням».
+- ЦЕПОЧКА — вызов уже существующей цепочки по названию. Придумывать названия
+  нельзя: пиши сюда только то, что пользователь назвал явно.
 - МУЛЬТИЯЗЫЧНОСТЬ: для воронки на нескольких языках ставь узел language сразу после входа — он сам определяет язык Telegram-профиля, юзера спрашивать не надо. Каждая ветка ведёт в полную копию воронки на своём языке, "other" — в ветку языка по умолчанию (обычно английского). Коды языков — как в Telegram: ru, en, uk, de, es, pt. Кнопочный выбор языка делай только если в ТЗ это просят явно.
 """
 
@@ -242,6 +288,11 @@ async def ensure_tags(session: AsyncSession, spec: dict) -> dict:
     for n in spec.get("nodes", []):
         if n.get("type") in ("condition", "action") and n.get("tag"):
             names.add(str(n["tag"]))
+        # в фильтре теги тоже указаны именами — иначе условие соберётся впустую
+        if n.get("type") == "filter":
+            for c in n.get("conditions") or []:
+                if c.get("field") == "tag" and c.get("value"):
+                    names.add(str(c["value"]))
     existing = {
         t.name: t.id for t in (await session.execute(select(Tag))).scalars().all()
     }
@@ -252,6 +303,33 @@ async def ensure_tags(session: AsyncSession, spec: dict) -> dict:
             await session.flush()
             existing[name] = tag.id
     return existing
+
+
+async def resolve_chains(session: AsyncSession, spec: dict) -> dict:
+    """{название цепочки: id}. Придуманное название — ошибка, а не пустой блок.
+
+    Цепочку нельзя создать «заодно»: это отдельная воронка со своим холстом.
+    Молча выбросить блок тоже нельзя — в воронке пропал бы кусок сценария.
+    """
+    from .models import Funnel
+
+    wanted = [str(n.get("chain") or "").strip()
+              for n in spec.get("nodes", []) if n.get("type") == "chain"]
+    wanted = [w for w in wanted if w]
+    if not wanted:
+        return {}
+    rows = (await session.execute(
+        select(Funnel.id, Funnel.name).where(Funnel.is_chain == True)  # noqa: E712
+    )).all()
+    by_name = {name: fid for fid, name in rows}
+    missing = [w for w in wanted if w not in by_name]
+    if missing:
+        have = ", ".join(f"«{n}»" for n in by_name) or "ни одной"
+        raise AIError(
+            "Не нашлось цепочек: " + ", ".join(f"«{m}»" for m in missing)
+            + f". Сейчас существуют: {have}. Создайте цепочку в разделе «Воронки» "
+            "и повторите сборку.")
+    return by_name
 
 
 def _summary(ntype: str, d: dict, tag_names: dict) -> str:
@@ -265,8 +343,33 @@ def _summary(ntype: str, d: dict, tag_names: dict) -> str:
     if ntype == "condition":
         return f"Есть тег «{tag_names.get(str(d.get('tag')), '?')}»?"
     if ntype == "action":
-        op = "Снять тег: " if d.get("op") == "remove_tag" else "Добавить тег: "
-        return op + tag_names.get(str(d.get("tag")), "?")
+        op = d.get("op")
+        if op == "unsubscribe":
+            return "Отписать от рассылок"
+        if op == "check_subscription":
+            return "Подписан на " + str(d.get("channel") or "?") + "?"
+        if op == "delete_message":
+            t = str(d.get("target") or "last")
+            return "Удалить сообщение: " + ("последнее" if t == "last" else "блок #" + t)
+        label = "Снять тег: " if op == "remove_tag" else "Добавить тег: "
+        return label + tag_names.get(str(d.get("tag")), "?")
+    if ntype == "filter":
+        conds = (d.get("filter") or {}).get("conditions") or []
+        if not conds:
+            return "условия не заданы"
+        join = " ИЛИ " if (d.get("filter") or {}).get("match") == "any" else " И "
+        parts = []
+        for c in conds:
+            val = c.get("value")
+            if c.get("field") == "tag":
+                val = tag_names.get(str(val), val)
+            parts.append(f"{c.get('field')} {c.get('op')} {val}".strip())
+        return join.join(parts)
+    if ntype == "chain":
+        fid = str(d.get("funnel_id") or "")
+        # tag_names сюда же приносит имена цепочек: голый id на карточке
+        # ничего не говорит, а имя видно сразу
+        return "Цепочка: " + (tag_names.get("chain:" + fid) or ("#" + (fid or "?")))
     if ntype == "note":
         return (d.get("text") or "")[:500]
     if ntype == "language":
@@ -335,6 +438,28 @@ def _html(ntype: str, d: dict, tag_names: dict) -> str:
             '<div class="df-ports">1: остальные</div>'
         )
 
+    if ntype == "filter":
+        conds = (d.get("filter") or {}).get("conditions") or []
+        join = "ИЛИ" if (d.get("filter") or {}).get("match") == "any" else "И"
+        rows = "".join(
+            f'<div class="df-btn">{h.escape(str(c.get("field")))} '
+            f'{h.escape(str(c.get("op")))} '
+            f'{h.escape(str(tag_names.get(str(c.get("value")), c.get("value"))))}</div>'
+            for c in conds)
+        return (
+            f'<div class="df-title">{NODE_TITLES["filter"]}</div>'
+            f'<div class="df-sub">совпадение: {join}</div>'
+            f'<div class="df-btns">{rows}</div>'
+            '<div class="df-ports">1: подходит  •  2: не подходит</div>'
+        )
+
+    if ntype == "action" and d.get("op") == "check_subscription":
+        return (
+            f'<div class="df-title">{NODE_TITLES["action"]}</div>'
+            f'<div class="df-sub">{h.escape(_summary(ntype, d, tag_names))}</div>'
+            '<div class="df-ports">1: подписан  •  2: нет</div>'
+        )
+
     sum_ = _summary(ntype, d, tag_names)
     toggle = (
         '<span class="df-toggle" onclick="toggleNodeExpand(event, this)">развернуть ▾</span>'
@@ -347,7 +472,55 @@ def _html(ntype: str, d: dict, tag_names: dict) -> str:
     )
 
 
-def build_drawflow(spec: dict, tag_ids: dict) -> dict:
+# Поля фильтра, которые язык ТЗ разрешает модели. in_funnel/in_broadcast сюда
+# намеренно не входят: они ссылаются на числовые id, которых модель знать
+# не может, и придумала бы их.
+FILTER_OPS = {
+    "tag": {"has", "not_has"},
+    "language": {"equals", "not_equals"},
+    "status": {"equals"},
+    "subscribed": {"equals"},
+    "source": {"equals", "contains"},
+    "name": {"contains", "equals"},
+    "username": {"contains", "equals"},
+    "signup": {"after", "before", "last_days"},
+    "last_activity": {"after", "before", "last_days", "inactive_days"},
+    "weekday": {"in", "not_in"},
+    "run_date": {"on", "after", "before"},
+    "run_time": {"between", "after", "before"},
+}
+
+BUTTON_STYLES = {"primary", "success", "danger"}
+ACTION_OPS = {"add_tag", "remove_tag", "unsubscribe", "check_subscription", "delete_message"}
+
+
+def _filter_data(n: dict, tag_ids: dict) -> dict:
+    """Условия фильтра из спеки -> данные узла. Теги по именам -> в id."""
+    conds = []
+    for c in n.get("conditions") or []:
+        field, op = c.get("field"), c.get("op")
+        if field not in FILTER_OPS:
+            raise AIError(
+                f"Узел «{n.get('id')}»: в фильтре нет поля «{field}». "
+                f"Доступны: {', '.join(sorted(FILTER_OPS))}")
+        if op not in FILTER_OPS[field]:
+            raise AIError(
+                f"Узел «{n.get('id')}»: у поля «{field}» нет операции «{op}». "
+                f"Доступны: {', '.join(sorted(FILTER_OPS[field]))}")
+        val = c.get("value")
+        if field == "tag":
+            val = str(tag_ids.get(str(val), val))
+        conds.append({"field": field, "op": op, "value": val})
+    if not conds:
+        raise AIError(
+            f"Узел «{n.get('id')}»: фильтр без условий пропускает всех — "
+            "либо добавьте условие, либо уберите блок")
+    return {"filter": {"match": "any" if n.get("match") == "any" else "all",
+                       "active_24h": bool(n.get("active_24h")),
+                       "conditions": conds}}
+
+
+def build_drawflow(spec: dict, tag_ids: dict, chain_ids: dict | None = None) -> dict:
     """Конвертирует спеку в экспорт Drawflow (+ авторасстановка)."""
     nodes_spec = spec.get("nodes") or []
     if not nodes_spec:
@@ -357,6 +530,10 @@ def build_drawflow(spec: dict, tag_ids: dict) -> dict:
     for i, n in enumerate(nodes_spec):
         id_map[str(n["id"])] = str(i + 2)  # 1 занят под start
     tag_names = {str(v): k for k, v in tag_ids.items()}
+    # имена цепочек кладём в тот же словарь под префиксом, чтобы не тащить
+    # ещё один аргумент через все функции отрисовки карточек
+    for cname, cid in (chain_ids or {}).items():
+        tag_names["chain:" + str(cid)] = cname
 
     df = {}
 
@@ -377,7 +554,8 @@ def build_drawflow(spec: dict, tag_ids: dict) -> dict:
     for i, n in enumerate(nodes_spec):
         nid = id_map[str(n["id"])]
         ntype = n.get("type")
-        if ntype not in ("message", "delay", "condition", "action", "note", "language"):
+        if ntype not in ("message", "delay", "condition", "action", "note",
+                         "language", "filter", "chain"):
             raise AIError(f"Неизвестный тип узла: {ntype}")
 
         if ntype == "note":
@@ -391,11 +569,14 @@ def build_drawflow(spec: dict, tag_ids: dict) -> dict:
                 btn = {"label": str(b.get("label", "Кнопка"))}
                 if b.get("url"):
                     btn["url"] = b["url"]
+                if b.get("style") in BUTTON_STYLES:
+                    btn["style"] = b["style"]
                 buttons.append(btn)
             data = {
                 "text": n.get("text") or "",
                 "photo_url": n.get("photo_url") or "",
                 "buttons": buttons,
+                "text_first": bool(n.get("text_first")),
             }
             n_out = 1 + len([b for b in buttons if "url" not in b])
         elif ntype == "delay":
@@ -408,12 +589,34 @@ def build_drawflow(spec: dict, tag_ids: dict) -> dict:
             branches = n.get("languages") or []
             data = {"languages": [str(b.get("code", "")).strip() for b in branches]}
             n_out = 1 + len(branches)
-        else:
-            data = {
-                "op": n.get("op", "add_tag"),
-                "tag": str(tag_ids.get(str(n.get("tag")), "")),
-            }
+        elif ntype == "filter":
+            data = _filter_data(n, tag_ids)
+            n_out = 2
+        elif ntype == "chain":
+            name = str(n.get("chain") or "").strip()
+            data = {"funnel_id": str((chain_ids or {}).get(name, ""))}
             n_out = 1
+        else:  # action
+            op = n.get("op", "add_tag")
+            if op not in ACTION_OPS:
+                raise AIError(f"Узел «{n.get('id')}»: неизвестное действие «{op}». "
+                              f"Доступны: {', '.join(sorted(ACTION_OPS))}")
+            data = {"op": op}
+            if op in ("add_tag", "remove_tag"):
+                data["tag"] = str(tag_ids.get(str(n.get("tag")), ""))
+            elif op == "check_subscription":
+                data["channel"] = str(n.get("channel") or "").strip()
+            elif op == "delete_message":
+                # цель — id узла из спеки; в граф кладём уже внутренний номер
+                tgt_raw = str(n.get("target") or "last").strip()
+                if tgt_raw and tgt_raw != "last":
+                    if tgt_raw not in id_map:
+                        raise AIError(
+                            f"Узел «{n.get('id')}»: удалять нечего — узла "
+                            f"«{tgt_raw}» в воронке нет")
+                    tgt_raw = id_map[tgt_raw]
+                data["target"] = tgt_raw or "last"
+            n_out = 2 if op == "check_subscription" else 1
 
         df[nid] = {
             "id": int(nid), "name": ntype, "data": data, "class": ntype,
@@ -436,7 +639,9 @@ def build_drawflow(spec: dict, tag_ids: dict) -> dict:
                 raise AIError(f"Узел «{n['id']}» ссылается на несуществующий «{ref}»")
             return id_map[str(ref)]
 
-        if ntype == "condition":
+        two_way = ntype in ("condition", "filter") or (
+            ntype == "action" and n.get("op") == "check_subscription")
+        if two_way:
             for port, ref in (("output_1", n.get("yes")), ("output_2", n.get("no"))):
                 t = tgt(ref)
                 if t:
@@ -481,6 +686,11 @@ def _node_height(node: dict) -> int:
     long_text = lines > 4
     lines = min(lines, 4)  # свёрнутая карточка показывает до 4 строк
     buttons = len(node["data"].get("buttons") or []) if node["name"] == "message" else 0
+    if node["name"] == "filter":
+        # у фильтра вместо текста — список условий, по строке на каждое
+        buttons = len((node["data"].get("filter") or {}).get("conditions") or []) + 1
+    elif node["name"] == "language":
+        buttons = len(node["data"].get("languages") or [])
     h = 40 + lines * 19 + 20            # заголовок + строки текста + падинги
     if long_text:
         h += 22                        # строка «развернуть»
@@ -540,9 +750,9 @@ def _layout(df: dict):
             df[nid]["pos_y"] = y
 
 
-def spec_to_funnel_fields(spec: dict, tag_ids: dict) -> dict:
+def spec_to_funnel_fields(spec: dict, tag_ids: dict, chain_ids: dict | None = None) -> dict:
     """-> {name, trigger_type, trigger_value, graph_ui, graph} (с валидацией)."""
-    graph_ui = build_drawflow(spec, tag_ids)
+    graph_ui = build_drawflow(spec, tag_ids, chain_ids)
     try:
         compiled = compile_graph(graph_ui)
     except GraphError as e:
@@ -594,6 +804,8 @@ def graph_to_spec(funnel) -> dict:
         item = {"id": nid, "type": t}
         if t == "message":
             item["text"] = d.get("text") or ""
+            if d.get("text_first"):
+                item["text_first"] = True
             if d.get("media"):
                 item["media"] = d["media"]
             if d.get("photo_url"):
@@ -601,6 +813,8 @@ def graph_to_spec(funnel) -> dict:
             btns = []
             for i, b in enumerate(d.get("buttons") or []):
                 bb = {"label": b.get("label", "")}
+                if b.get("style"):
+                    bb["style"] = b["style"]
                 if b.get("url"):
                     bb["url"] = b["url"]
                 else:
@@ -618,7 +832,28 @@ def graph_to_spec(funnel) -> dict:
                            for k, c in enumerate(d.get("languages") or [])],
                 other=first(n, "output_1"))
         elif t == "action":
-            item.update(op=d.get("op"), tag=d.get("tag"), next=first(n, "output_1"))
+            op = d.get("op") or "add_tag"
+            item["op"] = op
+            if op in ("add_tag", "remove_tag"):
+                item.update(tag=d.get("tag"), next=first(n, "output_1"))
+            elif op == "check_subscription":
+                item.update(channel=d.get("channel") or "",
+                            yes=first(n, "output_1"), no=first(n, "output_2"))
+            elif op == "delete_message":
+                item.update(target=d.get("target") or "last", next=first(n, "output_1"))
+            else:
+                item["next"] = first(n, "output_1")
+        elif t == "filter":
+            f = d.get("filter") or {}
+            item.update(match=f.get("match") or "all",
+                        conditions=f.get("conditions") or [],
+                        yes=first(n, "output_1"), no=first(n, "output_2"))
+            if f.get("active_24h"):
+                item["active_24h"] = True
+        elif t == "chain":
+            # наружу отдаём НАЗВАНИЕ: id модели ничего не говорит, а придумать
+            # по нему она ничего не сможет — подставим имя на входе в LLM
+            item.update(chain_id=d.get("funnel_id"), next=first(n, "output_1"))
         elif t == "note":
             item.update(text=d.get("text") or "", about=d.get("about") or "")
         nodes_out.append(item)
@@ -634,6 +869,13 @@ def graph_to_spec(funnel) -> dict:
 
 
 EDIT_SYSTEM_PROMPT = """Ты — AI-редактор воронок телеграм-бота. Тебе дают ТЕКУЩУЮ воронку в JSON и просьбу пользователя (перевести, изменить, дополнить).
+
+Схема узлов — та же, что у конструктора: message (text, buttons, photo_url,
+text_first), delay, condition, action (add_tag, remove_tag, unsubscribe,
+check_subscription, delete_message), filter (conditions, yes, no), chain
+(chain — название существующей цепочки), language, note. Блоки, которых
+пользователь не просил трогать, возвращай как есть — вместе со всеми их
+полями. Потерянный блок — это пропавший кусок сценария у живых людей.
 
 Отвечай ТОЛЬКО JSON без markdown-ограждений:
 {"reply": "короткий ответ пользователю по-русски: что сделал/что уточнить",
@@ -655,25 +897,23 @@ async def chat_edit_funnel(session, funnel, tags_list, user_messages: list, prov
     """-> (reply_text, new_fields | None, in_tokens, out_tokens)"""
     import json as _json
 
-    # Блоки, которых нет в языке спеки. Модель вернула бы воронку без них —
-    # и «Цепочка» или «Фильтр» тихо исчезли бы вместе со всей веткой.
-    # Лучше честно отказаться, чем молча уничтожить кусок сценария.
-    UNSUPPORTED = {"chain": "Цепочка", "filter": "Фильтр"}
-    present = {n.get("type") for n in (funnel.graph or {}).get("nodes", {}).values()}
-    blocked = [title for t, title in UNSUPPORTED.items() if t in present]
-    if blocked:
-        raise AIError(
-            "В воронке есть блоки, которые AI-помощник пока не умеет: "
-            + ", ".join(f"«{b}»" for b in blocked)
-            + ". Он переписывает воронку целиком и потерял бы их. "
-            "Правьте такую воронку руками.")
+    from .models import Funnel
 
-    # входной контекст: текущая спека с именами тегов вместо id
+    # входной контекст: текущая спека, но с именами вместо id — по числовому id
+    # модель ничего осмысленного сделать не может и начнёт их выдумывать
     id2name = {str(t.id): t.name for t in tags_list}
+    chain_names = {str(fid): name for fid, name in (await session.execute(
+        select(Funnel.id, Funnel.name).where(Funnel.is_chain == True)  # noqa: E712
+    )).all()}
     spec = graph_to_spec(funnel)
     for n in spec["nodes"]:
         if n.get("tag") is not None:
             n["tag"] = id2name.get(str(n["tag"]), str(n["tag"]))
+        for c in n.get("conditions") or []:
+            if c.get("field") == "tag":
+                c["value"] = id2name.get(str(c.get("value")), str(c.get("value")))
+        if n.get("type") == "chain":
+            n["chain"] = chain_names.get(str(n.pop("chain_id", "")), "")
 
     convo = "ТЕКУЩАЯ ВОРОНКА:\n" + _json.dumps(spec, ensure_ascii=False) + "\n\nДИАЛОГ:\n"
     for m in user_messages[-12:]:
@@ -687,7 +927,8 @@ async def chat_edit_funnel(session, funnel, tags_list, user_messages: list, prov
     fields = None
     if new_spec:
         tag_ids = await ensure_tags(session, new_spec)
-        fields = spec_to_funnel_fields(new_spec, tag_ids)
+        chain_ids = await resolve_chains(session, new_spec)
+        fields = spec_to_funnel_fields(new_spec, tag_ids, chain_ids)
         # имя/триггер не трогаем, если LLM их не вернул
         fields["name"] = new_spec.get("name") or funnel.name
         if not new_spec.get("trigger_type"):

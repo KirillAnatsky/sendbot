@@ -1048,6 +1048,174 @@ def test_ai_placeholder_lands_in_media(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_ai_spec_supports_every_block(session):
+    """Язык ТЗ покрывает все блоки конструктора — и туда, и обратно."""
+    from app import ai
+    from app.models import Funnel, Tag
+
+    session.add(Tag(name="vip"))
+    chain = Funnel(name="Прогрев", is_chain=True, graph_ui={}, graph={})
+    session.add(chain)
+    await session.flush()
+
+    spec = {
+        "name": "Полная воронка",
+        "trigger_type": "start",
+        "nodes": [
+            {"id": "m1", "type": "message", "text": "Привет", "text_first": True,
+             "photo_url": "media/x.png",
+             "buttons": [{"label": "Да", "style": "success", "next": "f1"},
+                         {"label": "Сайт", "url": "https://ya.ru"}],
+             "next": "f1"},
+            {"id": "f1", "type": "filter", "match": "any",
+             "conditions": [{"field": "tag", "op": "has", "value": "vip"},
+                            {"field": "run_time", "op": "between", "value": "10:00-18:00"}],
+             "yes": "a1", "no": "a2"},
+            {"id": "a1", "type": "action", "op": "check_subscription",
+             "channel": "@news", "yes": "ch1", "no": "a3"},
+            {"id": "a2", "type": "action", "op": "unsubscribe", "next": None},
+            {"id": "a3", "type": "action", "op": "delete_message", "target": "m1", "next": "ch1"},
+            {"id": "ch1", "type": "chain", "chain": "Прогрев", "next": "d1"},
+            {"id": "d1", "type": "delay", "amount": 2, "unit": "hours", "next": None},
+        ],
+    }
+
+    tag_ids = await ai.ensure_tags(session, spec)
+    chain_ids = await ai.resolve_chains(session, spec)
+    fields = ai.spec_to_funnel_fields(spec, tag_ids, chain_ids)   # тут же compile_graph
+    nodes = fields["graph"]["nodes"]
+    by_type = {}
+    for nid, n in nodes.items():
+        by_type.setdefault(n["type"], []).append((nid, n))
+
+    # все типы доехали до графа
+    assert set(by_type) == {"start", "message", "filter", "action", "chain", "delay"}
+
+    msg_id, msg = by_type["message"][0]
+    assert msg["data"]["text_first"] is True
+    assert msg["data"]["buttons"][0]["style"] == "success"
+
+    _, filt = by_type["filter"][0]
+    conds = filt["data"]["filter"]["conditions"]
+    assert filt["data"]["filter"]["match"] == "any"
+    # тег превратился из имени в id, время осталось как есть
+    assert conds[0]["value"] == str(tag_ids["vip"])
+    assert conds[1] == {"field": "run_time", "op": "between", "value": "10:00-18:00"}
+    assert len(filt["outputs"]) == 2
+
+    acts = {n["data"]["op"]: (nid, n) for nid, n in by_type["action"]}
+    assert acts["check_subscription"][1]["data"]["channel"] == "@news"
+    assert len(acts["check_subscription"][1]["outputs"]) == 2
+    # цель удаления — внутренний id блока, а не id из ТЗ
+    assert acts["delete_message"][1]["data"]["target"] == msg_id
+
+    _, ch = by_type["chain"][0]
+    assert ch["data"]["funnel_id"] == str(chain.id)
+    # карточки рисуются в graph_ui — там же, где их видит редактор
+    cards = fields["graph_ui"]["drawflow"]["Home"]["data"]
+    assert "Прогрев" in cards[by_type["chain"][0][0]]["html"]   # имя, а не номер
+    assert "подходит" in cards[by_type["filter"][0][0]]["html"]
+    assert "подписан" in cards[acts["check_subscription"][0]]["html"]
+
+    # обратная разборка: то же самое читается назад без потерь
+    f = Funnel(name=fields["name"], graph=fields["graph"], graph_ui=fields["graph_ui"],
+               trigger_type="start")
+    back = ai.graph_to_spec(f)
+    types = {n["type"] for n in back["nodes"]}
+    assert types == {"message", "filter", "action", "chain", "delay"}
+    b_filter = next(n for n in back["nodes"] if n["type"] == "filter")
+    assert b_filter["match"] == "any" and len(b_filter["conditions"]) == 2
+    b_check = next(n for n in back["nodes"]
+                   if n["type"] == "action" and n["op"] == "check_subscription")
+    assert b_check["channel"] == "@news" and b_check["yes"] and b_check["no"]
+    b_chain = next(n for n in back["nodes"] if n["type"] == "chain")
+    assert str(b_chain["chain_id"]) == str(chain.id)
+    b_msg = next(n for n in back["nodes"] if n["type"] == "message")
+    assert b_msg["text_first"] is True and b_msg["buttons"][0]["style"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_ai_spec_rejects_invented_things(session):
+    """Придуманное поле фильтра, действие или цепочка — ошибка, а не тихий пропуск."""
+    from app import ai
+    from app.models import Funnel
+
+    session.add(Funnel(name="Прогрев", is_chain=True, graph_ui={}, graph={}))
+    await session.flush()
+
+    def build(nodes):
+        return ai.spec_to_funnel_fields({"nodes": nodes}, {}, {"Прогрев": 1})
+
+    # несуществующее поле фильтра
+    with pytest.raises(ai.AIError) as e:
+        build([{"id": "f", "type": "filter",
+                "conditions": [{"field": "оплатил", "op": "yes", "value": "1"}]}])
+    assert "нет поля" in str(e.value)
+
+    # поле есть, операции нет
+    with pytest.raises(ai.AIError) as e:
+        build([{"id": "f", "type": "filter",
+                "conditions": [{"field": "language", "op": "contains", "value": "ru"}]}])
+    assert "нет операции" in str(e.value)
+
+    # фильтр без условий пропускал бы всех
+    with pytest.raises(ai.AIError) as e:
+        build([{"id": "f", "type": "filter", "conditions": []}])
+    assert "пропускает всех" in str(e.value)
+
+    # выдуманное действие
+    with pytest.raises(ai.AIError) as e:
+        build([{"id": "a", "type": "action", "op": "выдать_деньги"}])
+    assert "неизвестное действие" in str(e.value)
+
+    # удаление сообщения из несуществующего блока
+    with pytest.raises(ai.AIError) as e:
+        build([{"id": "a", "type": "action", "op": "delete_message", "target": "нетакого"}])
+    assert "удалять нечего" in str(e.value)
+
+    # цепочка с придуманным названием: в ошибке видно, что есть на самом деле
+    with pytest.raises(ai.AIError) as e:
+        await ai.resolve_chains(session, {"nodes": [{"type": "chain", "chain": "Выдумка"}]})
+    assert "Выдумка" in str(e.value) and "Прогрев" in str(e.value)
+
+    # существующая — находится
+    assert await ai.resolve_chains(
+        session, {"nodes": [{"type": "chain", "chain": "Прогрев"}]}) == {"Прогрев": 1}
+
+
+@pytest.mark.asyncio
+async def test_ai_chat_no_longer_refuses_new_blocks(session):
+    """Раньше чат отказывался править воронки с «Фильтром» и «Цепочкой»."""
+    from app import ai
+    from app.models import Funnel, Tag
+
+    tag = Tag(name="vip")
+    session.add(tag)
+    chain = Funnel(name="Прогрев", is_chain=True, graph_ui={}, graph={})
+    session.add(chain)
+    await session.flush()
+
+    graph = {"start": "1", "nodes": {
+        "1": {"type": "start", "data": {}, "outputs": {"output_1": ["2"]}},
+        "2": {"type": "filter", "data": {"filter": {"match": "all", "conditions": [
+            {"field": "tag", "op": "has", "value": str(tag.id)}]}},
+            "outputs": {"output_1": ["3"]}},
+        "3": {"type": "chain", "data": {"funnel_id": str(chain.id)}, "outputs": {}},
+    }}
+    f = Funnel(name="F", graph=graph, graph_ui={}, trigger_type="start")
+
+    spec = ai.graph_to_spec(f)
+    # id тега и цепочки заменяются на имена — так же, как это делает чат
+    id2name = {str(tag.id): tag.name}
+    for n in spec["nodes"]:
+        for c in n.get("conditions") or []:
+            if c.get("field") == "tag":
+                c["value"] = id2name.get(str(c["value"]), c["value"])
+    assert next(n for n in spec["nodes"] if n["type"] == "filter")["conditions"][0]["value"] == "vip"
+    assert next(n for n in spec["nodes"] if n["type"] == "chain")["chain_id"] == str(chain.id)
+
+
+@pytest.mark.asyncio
 async def test_subscribers_isolated_per_bot(session):
     from app.bot import runner
     from app.models import Bot

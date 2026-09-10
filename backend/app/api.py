@@ -2046,7 +2046,8 @@ async def ai_generate(body: GenerateIn, session=Depends(get_session)):
         req.input_tokens, req.output_tokens = tin, tout
         spec = ai.parse_llm_json(text)
         tag_ids = await ai.ensure_tags(session, spec)
-        fields = ai.spec_to_funnel_fields(spec, tag_ids)
+        chain_ids = await ai.resolve_chains(session, spec)
+        fields = ai.spec_to_funnel_fields(spec, tag_ids, chain_ids)
     except ai.AIError as e:
         req.status, req.error = "error", str(e)
         await session.commit()  # сохранить запись об ошибке в статистику
