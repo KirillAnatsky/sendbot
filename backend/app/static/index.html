@@ -40,6 +40,7 @@
       <a data-page="analysis" class="nav-item" onclick="go('analysis')">📈 Анализ</a>
       <a data-page="ai" class="nav-item owner-only" onclick="go('ai')">🤖 AI-сборка</a>
       <a data-page="sheets" class="nav-item" onclick="go('sheets')">📗 Google Таблицы</a>
+      <a data-page="settings" class="nav-item" onclick="go('settings')">⚙️ Настройки</a>
       <a data-page="team" class="nav-item owner-only" onclick="go('team')">👤 Команда</a>
       <a data-page="logs" class="nav-item owner-only" onclick="go('logs')">📜 Логи</a>
     </nav>
@@ -304,6 +305,12 @@
         <button class="btn primary" onclick="createTag()">+ Добавить</button>
       </div>
       <div id="tags-list"></div>
+    </section>
+
+    <!-- Настройки -->
+    <section id="page-settings" class="page hidden">
+      <div class="page-head"><h2>Настройки</h2></div>
+      <div id="settings-body"></div>
     </section>
 
     <!-- Рассылки -->

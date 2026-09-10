@@ -174,6 +174,7 @@ const PAGE_PERM = {
   dashboard: 'analytics', analysis: 'analytics', bots: 'bots',
   funnels: 'funnels', subscribers: 'subscribers', tags: 'tags',
   broadcasts: 'broadcasts', ai: 'ai', logs: 'logs', sheets: 'integrations',
+  settings: 'settings',
 };
 
 // прячем разделы и кнопки, на которые нет прав
@@ -247,6 +248,7 @@ const loaders = {
   team: () => loadUsers(),
   logs: () => loadLogs(),
   ai: () => loadAIPage(),
+  settings: () => loadSettingsPage(),
 };
 function go(page) {
   const feature = PAGE_PERM[page];
@@ -795,6 +797,41 @@ async function deleteSubscriber(subId) {
   catch (e) { return; }
   closeChat();
   loadSubscribers();
+}
+
+// ---------- настройки ----------
+async function loadSettingsPage() {
+  const r = await api('/settings/timezone');
+  const editable = can('settings', 'edit');
+  const known = r.options.some(o => o.v === r.tz);
+  document.getElementById('settings-body').innerHTML = `
+    <div class="panel">
+      <h3 style="margin-top:0">Часовой пояс проекта</h3>
+      <p style="font-size:13px;color:#7a8499;max-width:640px">
+        По нему считаются условия «День недели», «Дата срабатывания» и
+        «Время срабатывания» в блоке «Фильтр». Сам сервер живёт по UTC —
+        без этой настройки окно «с 10:00 до 18:00» уехало бы на несколько
+        часов, и заметили бы это по недошедшим сообщениям.
+      </p>
+      <select id="tz-select" class="inline-input" ${editable ? '' : 'disabled'} style="min-width:280px">
+        ${r.options.map(o =>
+          `<option value="${esc(o.v)}" ${o.v === r.tz ? 'selected' : ''}>${esc(o.l)}</option>`).join('')}
+        ${known ? '' : `<option value="${esc(r.tz)}" selected>${esc(r.tz)}</option>`}
+      </select>
+      ${editable ? '<button class="btn primary" onclick="saveTimezone()">Сохранить</button>' : ''}
+      <div id="tz-now" style="margin-top:10px;font-size:13px;color:#7a8499">
+        Сейчас по этому поясу: <b>${esc(r.now)}</b>
+      </div>
+    </div>`;
+}
+
+async function saveTimezone() {
+  const tz = document.getElementById('tz-select').value;
+  const r = await api('/settings/timezone', { method: 'PUT', body: { tz } });
+  document.getElementById('tz-now').innerHTML =
+    `Сейчас по этому поясу: <b>${esc(r.now)}</b>`;
+  SEG_FIELDS = null;   // подписи про пояс в конструкторе условий устарели
+  alert('Часовой пояс сохранён: ' + r.tz);
 }
 
 // ---------- воронки: список ----------

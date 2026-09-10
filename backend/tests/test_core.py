@@ -846,6 +846,129 @@ async def test_text_first_puts_caption_above_media(session):
 
 
 @pytest.mark.asyncio
+async def test_run_moment_conditions(session):
+    """День недели, дата и время срабатывания — считаются от «сейчас» в поясе проекта."""
+    from datetime import date, time as dtime
+    from zoneinfo import ZoneInfo
+
+    from app import segment as seg
+    from app import tz
+    from app.models import Bot, Subscriber
+
+    b = Bot(name="B", token="t", is_active=True)
+    session.add(b)
+    await session.flush()
+    sub = Subscriber(bot_id=b.id, tg_id=10, first_name="X", is_active=True)
+    session.add(sub)
+    await session.flush()
+
+    tz.set_timezone("Europe/Kyiv")
+
+    def at(moment, conditions):
+        """Проверить фильтр так, будто «сейчас» — это moment."""
+        real = tz.now
+        tz.now = lambda: moment
+        try:
+            return seg.build_query(None, {"conditions": conditions}, allow_now=True)
+        finally:
+            tz.now = real
+
+    kyiv = ZoneInfo("Europe/Kyiv")
+    # среда, 15 октября 2026, 14:30
+    wed = datetime.combine(date(2026, 10, 15), dtime(14, 30), kyiv)
+    assert wed.isoweekday() == 4  # проверяем сам ориентир: это четверг
+
+    async def passes(moment, cond):
+        q = at(moment, [cond]).where(Subscriber.id == sub.id)
+        return (await session.execute(q)).first() is not None
+
+    # --- день недели ---
+    assert await passes(wed, {"field": "weekday", "op": "in", "value": "4"})
+    assert not await passes(wed, {"field": "weekday", "op": "in", "value": "1,2,3"})
+    assert await passes(wed, {"field": "weekday", "op": "not_in", "value": "6,7"})
+    assert not await passes(wed, {"field": "weekday", "op": "not_in", "value": "4"})
+
+    # --- дата срабатывания ---
+    assert await passes(wed, {"field": "run_date", "op": "on", "value": "2026-10-15"})
+    assert not await passes(wed, {"field": "run_date", "op": "on", "value": "2026-10-16"})
+    assert await passes(wed, {"field": "run_date", "op": "after", "value": "2026-10-01"})
+    assert not await passes(wed, {"field": "run_date", "op": "after", "value": "2026-11-01"})
+    assert await passes(wed, {"field": "run_date", "op": "before", "value": "2026-12-31"})
+
+    # --- время срабатывания ---
+    assert await passes(wed, {"field": "run_time", "op": "between", "value": "10:00-18:00"})
+    assert not await passes(wed, {"field": "run_time", "op": "between", "value": "18:00-22:00"})
+    assert await passes(wed, {"field": "run_time", "op": "after", "value": "14:00"})
+    assert await passes(wed, {"field": "run_time", "op": "before", "value": "15:00"})
+
+    # окно через полночь: 22:00–06:00 должно ловить и вечер, и ночь
+    night = {"field": "run_time", "op": "between", "value": "22:00-06:00"}
+    assert await passes(datetime.combine(date(2026, 10, 15), dtime(23, 0), kyiv), night)
+    assert await passes(datetime.combine(date(2026, 10, 15), dtime(3, 0), kyiv), night)
+    assert not await passes(wed, night)   # 14:30 — не ночь
+
+    # --- пояс реально влияет ---
+    # 23:30 по Киеву — это уже следующий день по UTC+5, и наоборот
+    late = datetime.combine(date(2026, 10, 15), dtime(23, 30), kyiv)
+    assert await passes(late, {"field": "run_date", "op": "on", "value": "2026-10-15"})
+    tz.set_timezone("Asia/Almaty")
+    almaty = late.astimezone(ZoneInfo("Asia/Almaty"))
+    assert almaty.date() == date(2026, 10, 16)
+    assert await passes(almaty, {"field": "run_date", "op": "on", "value": "2026-10-16"})
+    tz.set_timezone("Europe/Kyiv")
+
+
+def test_run_moment_conditions_are_rejected_in_broadcasts():
+    """В рассылке эти условия запрещены: она идёт долго и перевернулась бы."""
+    from app import segment as seg
+
+    for field, op, value in [("weekday", "in", "1"),
+                             ("run_date", "on", "2026-10-15"),
+                             ("run_time", "between", "10:00-18:00")]:
+        with pytest.raises(seg.SegmentError) as e:
+            seg.build_query(1, {"conditions": [{"field": field, "op": op, "value": value}]})
+        assert "только в блоке «Фильтр»" in str(e.value)
+
+    # а в ноде «Фильтр» те же условия проходят
+    seg.build_query(1, {"conditions": [
+        {"field": "weekday", "op": "in", "value": "1"}]}, allow_now=True)
+
+    # в конструктор рассылки эти поля вообще не отдаются как обычные
+    meta = {f["key"]: f for f in seg.fields_meta([], [], [])}
+    assert all(meta[k].get("node_only") for k in ("weekday", "run_date", "run_time"))
+
+
+def test_run_moment_values_are_validated():
+    """Кривое значение — понятная ошибка, а не молча пропущенное условие."""
+    from app import segment as seg
+
+    def check(cond, hint):
+        with pytest.raises(seg.SegmentError) as e:
+            seg.build_query(None, {"conditions": [cond]}, allow_now=True)
+        assert hint in str(e.value), (cond, str(e.value))
+
+    check({"field": "weekday", "op": "in", "value": "8"}, "день недели")
+    check({"field": "weekday", "op": "in", "value": ""}, "не заполнено")
+    check({"field": "run_time", "op": "after", "value": "25:00"}, "время")
+    check({"field": "run_time", "op": "between", "value": "10:00-"}, "время")
+    check({"field": "run_time", "op": "between", "value": ""}, "не заполнено")
+    check({"field": "run_date", "op": "on", "value": "не дата"}, "дата")
+
+
+def test_timezone_setting_survives_nonsense():
+    """Пояс из настроек: неизвестный не должен ломать фильтры молча."""
+    from app import tz
+
+    assert tz.is_valid("Europe/Kyiv")
+    assert not tz.is_valid("Марс/Олимп")
+    assert tz.set_timezone("Europe/Warsaw") == "Europe/Warsaw"
+    assert tz.set_timezone("Марс/Олимп") == "Europe/Warsaw"   # оставили прежний
+    assert tz.now().tzinfo is not None
+    assert all(tz.is_valid(v) for v, _ in tz.COMMON)
+    tz.set_timezone(tz.DEFAULT_TZ)
+
+
+@pytest.mark.asyncio
 async def test_subscribers_isolated_per_bot(session):
     from app.bot import runner
     from app.models import Bot

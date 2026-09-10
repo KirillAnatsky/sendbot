@@ -14,14 +14,20 @@
      {"field": "in_funnel",     "op": "yes"|"no",                "value": <funnel_id>},
      {"field": "in_broadcast",  "op": "yes"|"no",                "value": <broadcast_id>},
      {"field": "signup",        "op": "after"|"before"|"last_days", "value": "2026-01-01"|N},
-     {"field": "last_activity", "op": "after"|"before"|"last_days"|"inactive_days", "value": ...}
+     {"field": "last_activity", "op": "after"|"before"|"last_days"|"inactive_days", "value": ...},
+     # Три условия про момент срабатывания, а не про подписчика: они одинаково
+     # верны или неверны для всех сразу. Живут только в ноде «Фильтр» —
+     # в рассылке их смысл разъезжается (см. NODE_ONLY ниже).
+     {"field": "weekday",   "op": "in"|"not_in",              "value": "1,2,3"},
+     {"field": "run_date",  "op": "after"|"before"|"on",      "value": "2026-10-15"},
+     {"field": "run_time",  "op": "between"|"after"|"before", "value": "10:00-18:00"}
   ]
 }
 Плюс шорткат "active_24h": True (был активен за последние сутки).
 """
 from datetime import datetime, timedelta
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, false, or_, select, true
 
 from .models import (
     Broadcast,
@@ -36,6 +42,52 @@ from .models import (
 
 class SegmentError(Exception):
     pass
+
+
+# Поля про «сейчас». В сегменте рассылки им не место: аудитория считается
+# один раз, а рассылка на 400 тысяч идёт около часа и запрашивает базу
+# страницами. Условие «время 10:00–18:00» посреди отправки перевернулось бы,
+# и часть людей молча осталась бы без письма — а рассылка отчиталась бы
+# «готово». В ноде «Фильтр» проверка мгновенная, поэтому там всё честно.
+NODE_ONLY = {"weekday", "run_date", "run_time"}
+
+WEEKDAY_NAMES = {1: "понедельник", 2: "вторник", 3: "среда", 4: "четверг",
+                 5: "пятница", 6: "суббота", 7: "воскресенье"}
+
+
+def _parse_time(v) -> int:
+    """«14:30» -> минуты от полуночи."""
+    txt = str(v or "").strip()
+    try:
+        hh, mm = txt.split(":")
+        h, m = int(hh), int(mm)
+    except ValueError:
+        raise SegmentError(f"Некорректное время: {v} (нужно ЧЧ:ММ)")
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        raise SegmentError(f"Некорректное время: {v}")
+    return h * 60 + m
+
+
+def _weekday_list(v) -> list[int]:
+    if isinstance(v, (list, tuple)):
+        raw = list(v)
+    else:
+        raw = [x for x in str(v or "").split(",")]
+    days = []
+    for x in raw:
+        x = str(x).strip()
+        if not x:
+            continue
+        try:
+            d = int(x)
+        except ValueError:
+            raise SegmentError(f"Некорректный день недели: {x}")
+        if not 1 <= d <= 7:
+            raise SegmentError(f"Некорректный день недели: {x}")
+        days.append(d)
+    if not days:
+        raise SegmentError("Выберите хотя бы один день недели")
+    return days
 
 
 def _parse_date(v):
@@ -113,6 +165,37 @@ def _cond(c):
     if field == "active_24h":
         return Subscriber.last_active_at >= datetime.utcnow() - timedelta(hours=24)
 
+    # ---- условия про момент срабатывания ----
+    # Они не про подписчика: либо верны для всех сразу, либо ни для кого.
+    # Поэтому и превращаются в true()/false() — в SQL идти не за чем.
+    if field in NODE_ONLY:
+        from . import tz
+
+        now = tz.now()
+        if field == "weekday":
+            days = _weekday_list(val)
+            hit = now.isoweekday() in days
+            return true() if (hit if op != "not_in" else not hit) else false()
+
+        if field == "run_date":
+            today = now.date()
+            other = _parse_date(val).date()
+            hit = today == other if op == "on" else (
+                today >= other if op == "after" else today <= other)
+            return true() if hit else false()
+
+        if field == "run_time":
+            mins = now.hour * 60 + now.minute
+            if op == "between":
+                a, _, b = str(val or "").partition("-")
+                start, end = _parse_time(a), _parse_time(b)
+                # окно через полночь («22:00-06:00») — это два куска суток
+                hit = start <= mins <= end if start <= end else (mins >= start or mins <= end)
+            else:
+                point = _parse_time(val)
+                hit = mins >= point if op == "after" else mins <= point
+            return true() if hit else false()
+
     raise SegmentError(f"Неизвестное поле фильтра: {field}")
 
 
@@ -121,19 +204,24 @@ async def matches(session, sub_id: int, filt: dict) -> bool:
 
     Тот же движок, что в рассылках и в разделе подписчиков: условия в ноде
     «Фильтр» и в сегменте рассылки значат одно и то же, и добавленное поле
-    сразу доступно везде.
+    сразу доступно везде. Разрешены и условия про момент срабатывания —
+    здесь это ровно текущая секунда, а не растянутая на час рассылка.
     """
     if not (filt or {}).get("conditions") and not (filt or {}).get("active_24h"):
         return True   # пустой фильтр никого не отсеивает
-    q = build_query(None, filt).where(Subscriber.id == sub_id).limit(1)
+    q = build_query(None, filt, allow_now=True).where(Subscriber.id == sub_id).limit(1)
     return (await session.execute(q)).first() is not None
 
 
-def build_query(bot_id: int | None, filt: dict, allowed_bot_ids: list[int] | None = None):
+def build_query(bot_id: int | None, filt: dict, allowed_bot_ids: list[int] | None = None,
+                allow_now: bool = False):
     """Возвращает select(Subscriber) с применённым сегментом.
 
     allowed_bot_ids — жёсткое ограничение по правам пользователя: даже если
     в запросе просят другого бота, чужие подписчики не попадут в выборку.
+
+    allow_now — пускать ли условия про момент срабатывания. По умолчанию нет:
+    их зовёт нода «Фильтр», а в рассылке они врали бы (см. NODE_ONLY).
     """
     q = select(Subscriber)
     if allowed_bot_ids is not None:
@@ -146,10 +234,19 @@ def build_query(bot_id: int | None, filt: dict, allowed_bot_ids: list[int] | Non
     if filt.get("active_24h"):
         conds.append(_cond({"field": "active_24h"}))
     for c in filt.get("conditions", []):
+        if c.get("field") in NODE_ONLY and not allow_now:
+            raise SegmentError(
+                f"Условие «{_FIELD_LABEL.get(c['field'], c['field'])}» работает "
+                "только в блоке «Фильтр» внутри воронки: рассылка идёт долго, "
+                "и посреди неё такое условие перевернулось бы.")
         if c.get("field") and c.get("op") is not None:
             if c.get("value") in (None, "") and c["field"] not in (
                 "status", "subscribed", "active_24h"
             ) and c["op"] not in ("yes", "no"):
+                if c["field"] in NODE_ONLY:
+                    raise SegmentError(
+                        f"Условие «{_FIELD_LABEL.get(c['field'], c['field'])}»: "
+                        "не заполнено значение")
                 continue  # пустое значение — пропускаем условие
             conds.append(_cond(c))
     if not conds:
@@ -186,6 +283,15 @@ def fields_meta(tags, funnels, broadcasts):
         {"key": "last_activity", "label": "Последняя активность", "type": "date",
          "ops": [["after", "после"], ["before", "до"],
                  ["last_days", "за последние N дней"], ["inactive_days", "неактивен N дней"]]},
+        # node_only — условия про момент срабатывания; в сегменте рассылки
+        # они не показываются, там их смысл разъезжается (см. NODE_ONLY)
+        {"key": "weekday", "label": "День недели", "type": "weekdays", "node_only": True,
+         "options": [{"v": d, "l": WEEKDAY_NAMES[d][:2].capitalize()} for d in range(1, 8)],
+         "ops": [["in", "один из"], ["not_in", "кроме"]]},
+        {"key": "run_date", "label": "Дата срабатывания", "type": "date", "node_only": True,
+         "ops": [["on", "в этот день"], ["after", "начиная с"], ["before", "по"]]},
+        {"key": "run_time", "label": "Время срабатывания", "type": "time", "node_only": True,
+         "ops": [["between", "в промежутке"], ["after", "после"], ["before", "до"]]},
     ]
 
 
@@ -197,12 +303,16 @@ _FIELD_LABEL = {
     "source": "источник (deep-link)",
     "in_funnel": "был в воронке", "in_broadcast": "был в рассылке",
     "signup": "дата подписки", "last_activity": "последняя активность",
+    "weekday": "день недели", "run_date": "дата срабатывания",
+    "run_time": "время срабатывания",
 }
 _OP_LABEL = {
     "has": "есть", "not_has": "нет", "contains": "содержит", "equals": "=",
     "not_equals": "≠", "yes": "да", "no": "нет", "after": "после",
     "before": "до", "last_days": "за последние N дней",
     "inactive_days": "неактивен N дней",
+    "in": "один из", "not_in": "кроме", "on": "в этот день",
+    "between": "в промежутке",
 }
 _STATUS_LABEL = {"active": "активен", "blocked": "заблокировал"}
 
@@ -226,6 +336,13 @@ def describe(filt: dict, tag_names: dict, funnel_names: dict, bc_names: dict) ->
             val = _STATUS_LABEL.get(val, val)
         elif field == "subscribed":
             val = {"yes": "да", "no": "отписался"}.get(val, val)
+        elif field == "weekday":
+            try:
+                val = ", ".join(WEEKDAY_NAMES[d] for d in _weekday_list(val))
+            except SegmentError:
+                pass
+        elif field == "run_time" and op == "between":
+            val = str(val).replace("-", " – ")
         label = _FIELD_LABEL.get(field, field)
         op_l = _OP_LABEL.get(op, op)
         out.append(f"{label}: {op_l} {val}".strip() if val not in (None, "") else f"{label}: {op_l}")

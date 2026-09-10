@@ -98,6 +98,14 @@ function segSummaryText(filter) {
     if (fd && (fd.type === 'choice' || fd.type === 'select')) {
       const o = (fd.options || []).find(x => String(x.v) === String(c.value));
       if (o) val = o.l;
+    } else if (fd && fd.type === 'weekdays') {
+      // «1,2,4» на карточке узла не читается — показываем Пн, Вт, Чт
+      val = String(c.value ?? '').split(',').filter(Boolean).map(d => {
+        const o = (fd.options || []).find(x => String(x.v) === d);
+        return o ? o.l : d;
+      }).join(', ');
+    } else if (fd && fd.type === 'time' && c.op === 'between') {
+      val = String(c.value ?? '').replace('-', ' – ');
     }
     return `${label} ${op}${val === '' || val == null ? '' : ' ' + val}`;
   });
@@ -733,7 +741,8 @@ function showProps(id) {
     html += `
       <p style="font-size:12.5px;color:#7a8499;margin-bottom:8px">
         Выход 1 — подходит под условия, выход 2 — не подходит.
-        Условия те же, что в сегментах рассылок.
+        Условия те же, что в сегментах рассылок, плюс три про сам момент
+        срабатывания: день недели, дата и время.
       </p>
       <div id="p-filter"></div>`;
   } else if (node.name === 'language') {
@@ -804,7 +813,7 @@ function showProps(id) {
     RT_TEXT = null;
   }
   if (node.name === 'filter') {
-    NODE_SEG = makeSegment(document.getElementById('p-filter'), d.filter);
+    NODE_SEG = makeSegment(document.getElementById('p-filter'), d.filter, { nodeOnly: true });
   } else {
     NODE_SEG = null;
   }

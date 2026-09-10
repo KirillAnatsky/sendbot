@@ -24,6 +24,7 @@ from .db import init_db
 from .logging_setup import setup_logging
 
 setup_logging()
+log = logging.getLogger("sendbot.main")
 
 
 @asynccontextmanager
@@ -32,6 +33,14 @@ async def lifespan(app: FastAPI):
     from .auth import ensure_owner_exists
 
     await ensure_owner_exists()
+
+    # часовой пояс проекта читаем один раз в память: условия сегмента
+    # собираются синхронно, ходить оттуда в базу неоткуда
+    from . import tz
+    from .db import SessionLocal
+
+    async with SessionLocal() as s:
+        log.info("Часовой пояс проекта: %s", await tz.load_from_db(s))
     await start_bot_and_workers()
     yield
     await manager.shutdown()

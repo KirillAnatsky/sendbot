@@ -549,3 +549,10 @@ th { background: #f8fafc; color: #7a8499; font-weight: 600; font-size: 12.5px; t
 /* заголовок и пояснение над отдельной таблицей (цепочки в списке воронок) */
 .list-title { margin: 22px 0 4px; font-size: 15px; }
 .list-note { margin: 0 0 10px; font-size: 12.5px; color: #7a8499; max-width: 620px; }
+
+/* условия про момент срабатывания: дни недели пилюлями и сноска про пояс */
+.seg-days { display: inline-flex; flex-wrap: wrap; gap: 4px; }
+.seg-day { cursor: pointer; user-select: none; }
+.seg-day.on { background: #2e6bff; border-color: #2e6bff; color: #fff; }
+.seg-dash { color: #7a8499; padding: 0 2px; }
+.seg-tz { margin: 8px 0 2px; font-size: 12.5px; color: #7a8499; }

@@ -16,3 +16,6 @@ python-docx==1.2.0
 python-multipart==0.0.32
 websockets==17.1
 google-auth==2.57.0
+# база часовых поясов для zoneinfo: в python:slim её нет, и без неё
+# ZoneInfo("Europe/Kyiv") падает, а настройка пояса теряет смысл
+tzdata==2026.3

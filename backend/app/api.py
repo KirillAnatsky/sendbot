@@ -1155,6 +1155,29 @@ async def start_flow(sub_id: int, body: StartFlowIn, user=Depends(current_user),
 
 # ---------- segments ----------
 
+class TimezoneIn(BaseModel):
+    tz: str
+
+
+@router.get("/settings/timezone")
+async def timezone_get(user=Depends(current_user)):
+    from . import tz
+
+    return {"tz": tz.get_timezone(), "options": [
+        {"v": v, "l": l} for v, l in tz.COMMON
+    ], "now": tz.now().strftime("%d.%m.%Y %H:%M")}
+
+
+@router.put("/settings/timezone", dependencies=[Depends(require("settings", "edit"))])
+async def timezone_put(body: TimezoneIn, session=Depends(get_session)):
+    from . import tz
+
+    if not tz.is_valid(body.tz):
+        raise HTTPException(400, f"Неизвестный часовой пояс: {body.tz}")
+    applied = await tz.save_to_db(session, body.tz)
+    return {"tz": applied, "now": tz.now().strftime("%d.%m.%Y %H:%M")}
+
+
 @router.get("/segment/fields", dependencies=[Depends(require("subscribers", "view"))])
 async def segment_fields(session=Depends(get_session)):
     tags = [
@@ -1169,7 +1192,14 @@ async def segment_fields(session=Depends(get_session)):
         {"v": b.id, "l": b.name}
         for b in (await session.execute(select(Broadcast).order_by(Broadcast.created_at.desc()))).scalars()
     ]
-    return segment.fields_meta(tags, funnels, bcs)
+    from . import tz
+
+    return {
+        "fields": segment.fields_meta(tags, funnels, bcs),
+        # пояс показываем рядом с условиями про время: иначе непонятно,
+        # чьи это 10:00
+        "timezone": tz.get_timezone(),
+    }
 
 
 class SegmentSearchIn(BaseModel):

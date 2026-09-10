@@ -1,6 +1,6 @@
-// Чистые функции редактора воронок: блоки «Действие» и «Цепочка» —
-// какие поля показываются, сколько у блока выходов, что видит пользователь,
-// когда выбранная цепочка или блок-адресат уже удалены.
+// Чистые функции редактора воронок: блоки «Действие», «Цепочка» и подписи
+// условий фильтра — какие поля показываются, сколько у блока выходов и что
+// видит пользователь, когда выбранная цепочка или блок-адресат уже удалены.
 const fs = require('fs');
 const { JSDOM } = require('jsdom');
 
@@ -31,7 +31,7 @@ const ctx = { esc: s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt
 // выполняем файл в песочнице и достаём нужные функции
 const vm = require('vm');
 vm.createContext(ctx);
-vm.runInContext(src + '\n;__api = {ACTION_OPS, ACTION_OUTPUTS, actionSummary, actionBody, messageNodes, msgNodeName, portsHint, summary, NODE_META, chainName};', ctx);
+vm.runInContext(src + '\n;__api = {ACTION_OPS, ACTION_OUTPUTS, actionSummary, actionBody, messageNodes, msgNodeName, portsHint, summary, NODE_META, chainName, segSummaryText};', ctx);
 const A = ctx.__api;
 
 let failed = 0;
@@ -136,6 +136,29 @@ check('подпись блока — имя цепочки', () => {
 check('удалённая и невыбранная цепочка видны как проблема', () => {
   has(A.chainName('77'), 'удалена');
   has(A.chainName(''), 'не выбрана');
+});
+
+// ---------- условия про момент срабатывания в блоке «Фильтр» ----------
+vm.runInContext(`SEG_FIELDS = [
+  {key: 'weekday', label: 'День недели', type: 'weekdays', node_only: true,
+   options: [{v: 1, l: 'Пн'}, {v: 2, l: 'Вт'}, {v: 4, l: 'Чт'}],
+   ops: [['in', 'один из'], ['not_in', 'кроме']]},
+  {key: 'run_time', label: 'Время срабатывания', type: 'time', node_only: true,
+   ops: [['between', 'в промежутке'], ['after', 'после']]},
+];`, ctx);
+
+check('дни недели на карточке читаются словами, а не номерами', () => {
+  const t = A.segSummaryText({ conditions: [{ field: 'weekday', op: 'in', value: '1,2,4' }] });
+  eq(t, 'День недели один из Пн, Вт, Чт');
+});
+
+check('промежуток времени показывается как промежуток', () => {
+  const t = A.segSummaryText({ conditions: [{ field: 'run_time', op: 'between', value: '10:00-18:00' }] });
+  eq(t, 'Время срабатывания в промежутке 10:00 – 18:00');
+});
+
+check('пустой фильтр по-прежнему честно говорит, что условий нет', () => {
+  eq(A.segSummaryText({ conditions: [] }), 'условия не заданы');
 });
 
 console.log(failed ? `\n${failed} проверок упало` : '\nвсе проверки прошли');
