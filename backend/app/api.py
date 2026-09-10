@@ -2069,7 +2069,7 @@ class BroadcastIn(BaseModel):
     photo_url: str | None = None
     media: list = []  # [{type, path, name}] — вложения (в т.ч. видео/альбомы)
     buttons: list = []  # [{label, url}] — ссылка, либо {label, tag_id} — тег по клику
-    text_first: bool = False  # текст отдельным сообщением перед вложениями
+    text_first: bool = False  # подпись над вложением (show_caption_above_media)
     include_tags: list[int] = []
     exclude_tags: list[int] = []
     segment: dict | None = None  # если задан — используется вместо include/exclude

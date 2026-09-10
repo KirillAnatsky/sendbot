@@ -1051,7 +1051,7 @@ async function openBroadcast(id) {
             return `<div class="df-btn${st}" title="${esc(what)}">${esc(x.label)}</div>`;
           }).join('')}</div>` : ''}
         </div>
-        ${b.text_first ? '<div class="bc-hint">Текст уходил отдельным сообщением перед вложением.</div>' : ''}
+        ${b.text_first ? '<div class="bc-hint">Текст показывался над вложением.</div>' : ''}
         ${media.length > 1 ? '<div class="bc-hint">Несколько фото/видео уходят одним альбомом.</div>' : ''}
       </div>
 

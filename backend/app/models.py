@@ -282,7 +282,9 @@ class Broadcast(Base):
     media: Mapped[list] = mapped_column(JSON, default=list)  # [{type, path, name}]
     # [{label, url}] — ссылка, либо {label, tag_id} — повесить тег по клику
     buttons: Mapped[list] = mapped_column(JSON, default=list)
-    # True — текст уходит отдельным сообщением ПЕРЕД вложениями
+    # True — подпись показывается НАД вложением, тем же одним сообщением
+    # (show_caption_above_media). Название поля осталось с прошлой версии,
+    # когда это делалось вторым сообщением.
     text_first: Mapped[bool] = mapped_column(Boolean, default=False)
     # {"include_tags": [ids], "exclude_tags": [ids]}
     filters: Mapped[dict] = mapped_column(JSON, default=dict)

@@ -33,7 +33,7 @@ function nodeHtml(type, data) {
       }).join('') + (media.length > 6 ? `<span class="df-media-more">+${media.length - 6}</span>` : '') + `</div>`;
     }
     const orderHint = (data.text_first && media.length)
-      ? '<div class="df-order">↑ текст идёт первым</div>' : '';
+      ? '<div class="df-order">↑ текст над вложением</div>' : '';
     const text = (data.text || '').slice(0, 500);
     const toggle = text.length > 120
       ? `<span class="df-toggle" onclick="toggleNodeExpand(event, this)">развернуть ▾</span>` : '';
@@ -678,15 +678,17 @@ function showProps(id) {
     html += `
       <label>Текст — выделите и жмите кнопку, {first_name} подставится</label>
       <div id="p-text-rt"></div>
-      <label>Порядок</label>
+      <label>Где текст</label>
       <select id="p-order">
-        <option value="" ${d.text_first ? '' : 'selected'}>сначала вложение, текст подписью</option>
-        <option value="1" ${d.text_first ? 'selected' : ''}>сначала текст, потом вложение</option>
+        <option value="" ${d.text_first ? '' : 'selected'}>под вложением</option>
+        <option value="1" ${d.text_first ? 'selected' : ''}>над вложением</option>
       </select>
       <div class="hint-box" style="margin-top:6px">
-        По умолчанию Telegram вешает текст подписью под картинкой — одним
-        сообщением. Второй вариант шлёт текст отдельным сообщением перед
-        вложением; кнопки в обоих случаях остаются внизу.
+        В обоих случаях это <b>одно сообщение</b>: текст остаётся подписью,
+        меняется только его место. Кнопки всегда внизу.<br>
+        Сверху текст умеют показывать <b>фото и видео</b>. У аудио, голосового,
+        файла и кружка Telegram такого не даёт — там текст уйдёт отдельным
+        сообщением перед вложением.
       </div>
 
       <label>Вложения (фото, видео, аудио, голосовое, кружок, файл)</label>

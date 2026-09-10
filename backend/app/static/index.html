@@ -318,11 +318,16 @@
         <input id="bc-name" class="inline-input wide" placeholder="Название (для себя)">
         <label>Текст — выделите и жмите кнопку, {first_name} подставится</label>
         <div id="bc-text-rt"></div>
-        <label>Порядок</label>
+        <label>Где текст</label>
         <select id="bc-order">
-          <option value="">сначала вложение, текст подписью</option>
-          <option value="1">сначала текст, потом вложение</option>
+          <option value="">под вложением</option>
+          <option value="1">над вложением</option>
         </select>
+        <div class="hint-box" style="margin-top:6px">
+          Одно сообщение в обоих случаях — меняется только место подписи.
+          Сверху текст умеют фото и видео; у аудио, файла и кружка Telegram
+          так не даёт, там он уйдёт отдельным сообщением перед вложением.
+        </div>
 
         <label style="margin-top:14px">Вложения (фото, видео, аудио, кружок, файл — несколько уйдут альбомом)</label>
         <div id="bc-media"></div>

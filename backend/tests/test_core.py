@@ -740,6 +740,112 @@ async def test_chain_never_starts_on_its_own(session):
 
 
 @pytest.mark.asyncio
+async def test_text_first_puts_caption_above_media(session):
+    """«Сначала текст» — одно сообщение с подписью сверху, а не два сообщения."""
+    from app.bot import sender
+    from app.models import Bot, Subscriber
+
+    class MockBot:
+        def __init__(self, fail_above=False):
+            self.calls = []
+            self.fail_above = fail_above
+
+        def _rec(self, name, **kw):
+            self.calls.append((name, kw))
+            if self.fail_above and kw.get("show_caption_above_media"):
+                raise RuntimeError("Bad Request: unknown parameter")
+            return type("M", (), {"message_id": len(self.calls), "photo": [],
+                                  "video": None, "audio": None, "voice": None,
+                                  "document": None, "video_note": None})()
+
+        async def send_message(self, cid, text, **kw):
+            return self._rec("message", text=text, **kw)
+
+        async def send_photo(self, cid, arg, **kw):
+            return self._rec("photo", **kw)
+
+        async def send_video(self, cid, arg, **kw):
+            return self._rec("video", **kw)
+
+        async def send_audio(self, cid, arg, **kw):
+            return self._rec("audio", **kw)
+
+        async def send_media_group(self, cid, media):
+            self.calls.append(("group", {"media": media}))
+            return [type("M", (), {"message_id": 1, "photo": []})() for _ in media]
+
+    b = Bot(name="B", token="t", is_active=True)
+    session.add(b)
+    await session.flush()
+    sub = Subscriber(bot_id=b.id, tg_id=10, first_name="X", is_active=True)
+    session.add(sub)
+    await session.flush()
+
+    photo = [{"type": "photo", "path": "http://x/1.jpg"}]
+
+    # фото + текст сверху = ОДНО сообщение с флагом
+    bot = MockBot()
+    await sender.send_message_content(bot, session, sub, "привет", photo, None,
+                                      text_first=True, log_history=False)
+    assert [c[0] for c in bot.calls] == ["photo"]
+    assert bot.calls[0][1]["caption"] == "привет"
+    assert bot.calls[0][1]["show_caption_above_media"] is True
+
+    # без флага параметр не передаём вообще
+    bot = MockBot()
+    await sender.send_message_content(bot, session, sub, "привет", photo, None,
+                                      log_history=False)
+    assert "show_caption_above_media" not in bot.calls[0][1]
+
+    # кнопки остаются в том же сообщении, под фото
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Да", callback_data="x")]])
+    bot = MockBot()
+    await sender.send_message_content(bot, session, sub, "привет", photo, kb,
+                                      text_first=True, log_history=False)
+    assert [c[0] for c in bot.calls] == ["photo"]
+    assert bot.calls[0][1]["reply_markup"] is kb
+    assert bot.calls[0][1]["show_caption_above_media"] is True
+
+    # альбом: подпись сверху ставится на первое вложение
+    bot = MockBot()
+    await sender.send_message_content(
+        bot, session, sub, "привет",
+        [{"type": "photo", "path": "http://x/1.jpg"}, {"type": "photo", "path": "http://x/2.jpg"}],
+        None, text_first=True, log_history=False)
+    assert [c[0] for c in bot.calls] == ["group"]
+    first = bot.calls[0][1]["media"][0]
+    assert first.caption == "привет" and first.show_caption_above_media is True
+    assert bot.calls[0][1]["media"][1].caption is None
+
+    # аудио так не умеет — остаётся честное отдельное сообщение перед вложением
+    bot = MockBot()
+    await sender.send_message_content(bot, session, sub, "привет",
+                                      [{"type": "audio", "path": "http://x/1.mp3"}],
+                                      None, text_first=True, log_history=False)
+    assert [c[0] for c in bot.calls] == ["message", "audio"]
+    assert bot.calls[0][1]["text"] == "привет"
+    assert bot.calls[1][1]["caption"] is None      # текст не продублирован
+
+    # текст не дублируется и когда кнопки уезжают отдельным сообщением
+    bot = MockBot()
+    await sender.send_message_content(
+        bot, session, sub, "привет",
+        [{"type": "audio", "path": "http://x/1.mp3"}, {"type": "audio", "path": "http://x/2.mp3"}],
+        kb, text_first=True, log_history=False)
+    texts = [c[1].get("text") for c in bot.calls if c[0] == "message"]
+    assert texts.count("привет") == 1
+
+    # если Telegram вдруг не примет флаг, сообщение всё равно уходит
+    bot = MockBot(fail_above=True)
+    ok = await sender.send_message_content(bot, session, sub, "привет", photo, None,
+                                           text_first=True, log_history=False)
+    assert ok is True
+    assert [c[0] for c in bot.calls] == ["photo", "photo"]
+    assert "show_caption_above_media" not in bot.calls[1][1]
+
+
+@pytest.mark.asyncio
 async def test_subscribers_isolated_per_bot(session):
     from app.bot import runner
     from app.models import Bot

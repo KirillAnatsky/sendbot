@@ -220,6 +220,10 @@ async def send_to_subscriber(
 # ---------- мультимедиа-сообщение (альбомы, видео/аудио/кружок/файл) ----------
 
 CAPTION_CAPABLE = {"photo", "video", "audio", "voice", "document"}
+# Подпись НАД вложением в том же сообщении — show_caption_above_media,
+# Bot API 7.4 (28.05.2024). Telegram даёт это только фото, видео и анимации;
+# у аудио, голосового, файла и кружка подпись всегда снизу.
+CAPTION_ABOVE_CAPABLE = {"photo", "video"}
 GROUP_FAMILY = {"photo": "pv", "video": "pv", "audio": "audio", "document": "document"}
 KIND_LABEL = {
     "photo": "🖼 фото", "video": "🎬 видео", "audio": "🎵 аудио",
@@ -360,7 +364,7 @@ async def _media_arg(session, bot_id: int, m: dict):
     return f, (path if f is not None else None)
 
 
-def _input_media(mtype: str, arg, caption):
+def _input_media(mtype: str, arg, caption, above: bool = False):
     from aiogram.types import (
         InputMediaAudio,
         InputMediaDocument,
@@ -372,12 +376,34 @@ def _input_media(mtype: str, arg, caption):
         "photo": InputMediaPhoto, "video": InputMediaVideo,
         "audio": InputMediaAudio, "document": InputMediaDocument,
     }[mtype]
-    if caption:
-        return cls(media=arg, caption=caption, parse_mode=ParseMode.HTML)
-    return cls(media=arg)
+    if not caption:
+        return cls(media=arg)
+    extra = {}
+    if above and mtype in CAPTION_ABOVE_CAPABLE:
+        extra["show_caption_above_media"] = True
+    return cls(media=arg, caption=caption, parse_mode=ParseMode.HTML, **extra)
 
 
-async def _send_one(bot, session, sub, kind, items, caption, markup, track=None) -> bool:
+def _caption_holder(sends: list, single_total: bool, keyboard) -> str | None:
+    """Тип вложения, на которое по нашим правилам сядет подпись (или None).
+
+    Повторяет решение цикла отправки — нужно заранее, чтобы понять, можно ли
+    показать текст над вложением или придётся слать его отдельным сообщением.
+    """
+    for kind, _fam, items in sends:
+        real_single = kind == "single" or (kind == "group" and len(items) == 1)
+        t = items[0]["type"]
+        if single_total and real_single:
+            return t if t in CAPTION_CAPABLE else None
+        # при нескольких вложениях подпись вешаем, только если нет кнопок:
+        # иначе текст уедет в последнее сообщение вместе с ними
+        if keyboard is None and t in CAPTION_CAPABLE:
+            return t
+    return None
+
+
+async def _send_one(bot, session, sub, kind, items, caption, markup, track=None,
+                    caption_above: bool = False) -> bool:
     """Отправить одну единицу плана. Кэширует полученные file_id по (бот, файл)."""
     bot_id = sub.bot_id
 
@@ -388,7 +414,8 @@ async def _send_one(bot, session, sub, kind, items, caption, markup, track=None)
             arg, cache_path = await _media_arg(session, bot_id, m)
             if arg is None:
                 continue
-            group.append(_input_media(m["type"], arg, caption if first else None))
+            group.append(_input_media(m["type"], arg, caption if first else None,
+                                      above=caption_above))
             cache_map.append((len(group) - 1, cache_path, m["type"]))
             first = False
         if not group:
@@ -413,9 +440,12 @@ async def _send_one(bot, session, sub, kind, items, caption, markup, track=None)
         log.warning("Файл вложения не найден: %s", m.get("path"))
         return False
     html = ParseMode.HTML
+    # подпись над вложением просим только там, где Telegram это умеет
+    above = {"show_caption_above_media": True} if (
+        caption_above and caption and t in CAPTION_ABOVE_CAPABLE) else {}
     senders = {
-        "photo": lambda: bot.send_photo(sub.tg_id, arg, caption=caption, reply_markup=markup, parse_mode=html),
-        "video": lambda: bot.send_video(sub.tg_id, arg, caption=caption, reply_markup=markup, parse_mode=html),
+        "photo": lambda: bot.send_photo(sub.tg_id, arg, caption=caption, reply_markup=markup, parse_mode=html, **above),
+        "video": lambda: bot.send_video(sub.tg_id, arg, caption=caption, reply_markup=markup, parse_mode=html, **above),
         "audio": lambda: bot.send_audio(sub.tg_id, arg, caption=caption, reply_markup=markup, parse_mode=html),
         "voice": lambda: bot.send_voice(sub.tg_id, arg, caption=caption, reply_markup=markup, parse_mode=html),
         "document": lambda: bot.send_document(sub.tg_id, arg, caption=caption, reply_markup=markup, parse_mode=html),
@@ -425,6 +455,13 @@ async def _send_one(bot, session, sub, kind, items, caption, markup, track=None)
     if fn is None:
         return False
     res = await _deliver_result(fn, bot, session, sub)
+    if not res and above:
+        # Подпись сверху — украшение. Если этот параметр вдруг не принят
+        # (старый Bot API у локального сервера), сообщение всё равно должно
+        # уйти: доставка важнее расположения текста.
+        log.warning("Подпись над вложением не принята — отправляю обычным способом")
+        above.clear()
+        res = await _deliver_result(senders[t], bot, session, sub)
     if not res:
         return False
     if cache_path:
@@ -473,18 +510,24 @@ async def send_message_content(
     kb_used = False
     delivered = False
 
-    # text_first — текст отдельным сообщением ПЕРЕД вложениями. По умолчанию
-    # Telegram-логика обратная: текст становится подписью под картинкой, то
-    # есть визуально идёт после неё. Кнопки в этом режиме остаются на потом,
-    # чтобы оказаться внизу, под последним вложением.
+    # «Сначала текст» — это не два сообщения, а флаг show_caption_above_media
+    # (Bot API 7.4): тот же текст той же подписью, но НАД вложением. Одно
+    # сообщение, кнопки под ним. Отдельным сообщением текст уходит только
+    # там, где Telegram подпись сверху не поддерживает: аудио, голосовое,
+    # файл, кружок — и когда подпись вообще некуда посадить.
+    caption_above = False
     if text_first and text:
-        res = await _deliver_result(
-            lambda: bot.send_message(sub.tg_id, text, parse_mode=ParseMode.HTML),
-            bot, session, sub,
-        )
-        await _remember_sent(session, sub, track, res)
-        delivered = delivered or res is not None
-        caption_used = True   # текст уже ушёл, подписью его не дублируем
+        holder = _caption_holder(sends, single_total, keyboard)
+        if holder in CAPTION_ABOVE_CAPABLE:
+            caption_above = True
+        else:
+            res = await _deliver_result(
+                lambda: bot.send_message(sub.tg_id, text, parse_mode=ParseMode.HTML),
+                bot, session, sub,
+            )
+            await _remember_sent(session, sub, track, res)
+            delivered = delivered or res is not None
+            caption_used = True   # текст уже ушёл, подписью его не дублируем
 
     for kind, fam, items in sends:
         cap, markup = None, None
@@ -497,13 +540,16 @@ async def send_message_content(
         elif keyboard is None and not caption_used and items[0]["type"] in CAPTION_CAPABLE:
             # нет кнопок — вешаем подпись на первое подходящее вложение
             cap, caption_used = text or None, True
-        ok = await _send_one(bot, session, sub, kind, items, cap, markup, track)
+        ok = await _send_one(bot, session, sub, kind, items, cap, markup, track,
+                             caption_above=caption_above and cap is not None)
         delivered = delivered or ok
 
     # финальное текстовое сообщение: если кнопки ещё не прикреплены или текст не отправлен
     need_final = (keyboard is not None and not kb_used) or (text and not caption_used)
     if need_final:
-        body = text or "⠀"  # send_message требует непустой текст
+        # текст, уже ушедший подписью или отдельным сообщением, не повторяем:
+        # иначе в режиме «сначала текст» человек получал его дважды
+        body = ("" if caption_used else text) or "⠀"  # send_message требует непустой текст
         kb_final = None if kb_used else keyboard
         res = await _deliver_result(
             lambda: bot.send_message(sub.tg_id, body, reply_markup=kb_final, parse_mode=ParseMode.HTML),
