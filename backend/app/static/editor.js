@@ -52,7 +52,10 @@ function nodeHtml(type, data) {
         return `<div class="df-btn${st}${off}"><span class="df-btn-port">${port++}</span>${esc(b.label || 'кнопка')}</div>`;
       }).join('') + `</div>`;
     }
-    return `<div class="df-title">${NODE_META.message.title}</div>${orderHint}${mediaHtml}${textHtml}${btnsHtml}` +
+    // Номер шага ставим пустым: настоящий проставит refreshStepNumbers, когда
+    // карточка окажется на холсте и станет понятен порядок обхода.
+    return `<div class="df-title">${NODE_META.message.title}<span class="df-step"></span></div>` +
+           `${orderHint}${mediaHtml}${textHtml}${btnsHtml}` +
            `<div class="df-ports">${buttons.some(b => !b.url) ? '1: далее' : ''}</div>`;
   }
   if (type === 'language') {
@@ -318,7 +321,10 @@ async function openEditor(id) {
     // при этом сбрасывать нельзя (это и ломало групповое перетаскивание).
     // Пустой фон снимает выделение сам (см. setupMarquee).
     editor.on('nodeUnselected', () => { hideProps(); });
-    editor.on('nodeRemoved', () => hideProps());
+    editor.on('nodeRemoved', () => { hideProps(); refreshStepNumbers(); });
+    // номера зависят от связей и состава блоков, а не от содержимого карточки
+    ['nodeCreated', 'connectionCreated', 'connectionRemoved']
+      .forEach(ev => editor.on(ev, () => refreshStepNumbers()));
     setupClipboard();
   }
   editor.clear();
@@ -332,6 +338,7 @@ async function openEditor(id) {
   }
   document.getElementById('steps-drawer').classList.add('hidden');
   decoratePorts();
+  refreshStepNumbers();
   loadFunnelStats();
   EDITOR_SNAPSHOT = editorStateJson();
 }
@@ -398,7 +405,59 @@ function orderedSteps() {
     Object.values(n.outputs || {}).forEach(p =>
       (p.connections || []).forEach(c => queue.push(String(c.node))));
   }
+  // узлы, до которых обход не дошёл, — в конец: так же делает выгрузка,
+  // иначе номера на плитках разъедутся с колонками в таблице
+  Object.keys(df).forEach(id => {
+    const n = df[id];
+    if (!seen.has(String(id)) && n.name !== 'start' && n.name !== 'note') {
+      order.push({ id: String(id), name: n.name, data: n.data });
+    }
+  });
   return order;
+}
+
+// Сколько шагов помещается в выгрузку: в листе колонки Step 1 … Step 25.
+const EXPORT_MAX_STEPS = 25;
+
+// Номера шагов = позиция среди блоков «Сообщение» в порядке обхода. Ровно эти
+// номера становятся колонками Step N в Google-таблице, поэтому считаются они
+// тем же способом, что и на сервере.
+function stepNumbers() {
+  const map = {};
+  let k = 0;
+  orderedSteps().forEach(st => {
+    if (st.name === 'message') map[String(st.id)] = ++k;
+  });
+  return map;
+}
+
+// Номера, посчитанные в последний раз. Нужны при отрисовке карточки: она
+// собирается до того, как узел попадёт на холст, и пересчитать порядок там
+// уже поздно.
+let STEP_NUMBERS = {};
+
+// Пересчитать и расставить номера. Вставка или удаление блока сдвигает
+// нумерацию у всех следующих — оставить старые номера значило бы врать.
+let _stepsTimer = null;
+function refreshStepNumbers() {
+  clearTimeout(_stepsTimer);
+  _stepsTimer = setTimeout(() => {
+    if (!editor) return;
+    STEP_NUMBERS = stepNumbers();
+    const df = editor.export().drawflow.Home.data;
+    Object.keys(df).forEach(id => {
+      if (df[id].name !== 'message') return;
+      const el = document.querySelector(`#node-${id} .df-step`);
+      if (!el) return;
+      const num = STEP_NUMBERS[String(id)];
+      el.textContent = num ? 'Шаг ' + num : '';
+      el.classList.toggle('over', !!num && num > EXPORT_MAX_STEPS);
+      el.title = !num ? ''
+        : num > EXPORT_MAX_STEPS
+          ? `Шаг ${num}: в выгрузку не попадёт — в таблице только ${EXPORT_MAX_STEPS} колонок`
+          : `Шаг ${num} — колонка «Step ${num} users» в таблице`;
+    });
+  }, 0);
 }
 
 async function toggleStepsDrawer() {
@@ -420,13 +479,17 @@ async function toggleStepsDrawer() {
       <div class="step-label">▶️ Вошли в воронку</div>
       <div class="step-nums"><span class="step-count">${entered}</span><span class="step-pct">запусков: ${s.runs}</span></div>
     </div>`;
+  const nums = stepNumbers();
   steps.forEach(st => {
     const count = s.nodes[st.id] || 0;
     const fromPrev = prev ? Math.round(100 * count / prev) : 0;
     const fromStart = entered ? Math.round(100 * count / entered) : 0;
+    // номер — тот же, что на плитке и в колонке Step N выгрузки
+    const num = nums[String(st.id)];
+    const badge = num ? `<span class="step-no${num > EXPORT_MAX_STEPS ? ' over' : ''}">${num}</span>` : '';
     html += `
       <div class="step-row">
-        <div class="step-label">${esc(summary(st.name, st.data)).slice(0, 60)}</div>
+        <div class="step-label">${badge}${esc(summary(st.name, st.data)).slice(0, 60)}</div>
         <div class="step-bar"><i style="width:${fromStart}%"></i></div>
         <div class="step-nums">
           <span class="step-count">${count}</span>
@@ -607,8 +670,9 @@ function refreshNodeHtml(id) {
   const node = editor.getNodeFromId(id);
   const el = document.querySelector(`#node-${id} .drawflow_content_node`);
   if (el) el.innerHTML = nodeHtml(node.name, node.data);
-  // вернуть бейджи статистики после перерисовки
+  // вернуть бейджи статистики и номер шага после перерисовки
   if (typeof applyStatsBadges === 'function') applyStatsBadges();
+  refreshStepNumbers();
   decoratePorts();
   // связи могли сместиться из-за изменившейся высоты карточки
   try { editor.updateConnectionNodes('node-' + id); } catch (e) {}
@@ -1121,6 +1185,7 @@ function applyFunnelToCanvas(f) {
   // порты, статистика и связи — после отрисовки узлов
   setTimeout(() => {
     decoratePorts();
+    refreshStepNumbers();
     loadFunnelStats();
     Object.keys(editor.drawflow.drawflow.Home.data).forEach(id => {
       try { editor.updateConnectionNodes('node-' + id); } catch (e) {}

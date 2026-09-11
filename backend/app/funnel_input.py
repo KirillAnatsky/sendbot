@@ -75,7 +75,11 @@ def weeks_since(start_week: str | None) -> list[tuple[datetime, datetime]]:
 # ---------- сбор данных ----------
 
 def funnel_steps(graph: dict) -> list[tuple[str, dict]]:
-    """Шаги воронки: узлы «Сообщение» по порядку обхода, не больше 25."""
+    """Шаги воронки: узлы «Сообщение» по порядку обхода, не больше 25.
+
+    Нумерация — позиция в этом списке; она же стоит на плитке в редакторе
+    (см. exports.step_numbers, общий источник правды).
+    """
     return [(nid, n) for nid, n in exports._ordered_nodes(graph or {})
             if n.get("type") == "message"][:MAX_STEPS]
 

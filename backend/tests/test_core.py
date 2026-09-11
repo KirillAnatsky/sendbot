@@ -1215,6 +1215,89 @@ async def test_ai_chat_no_longer_refuses_new_blocks(session):
     assert next(n for n in spec["nodes"] if n["type"] == "chain")["chain_id"] == str(chain.id)
 
 
+def test_step_numbers_are_one_source_of_truth():
+    """Номер шага одинаков везде: на плитке, в выгрузке конверсий и в отчёте."""
+    from app import exports
+    from app.funnel_input import funnel_steps
+    from app.graph import compile_graph
+
+    def msg(nid, nxt=None):
+        return {"id": int(nid), "name": "message", "data": {"text": "т", "buttons": []},
+                "inputs": {"input_1": {"connections": []}},
+                "outputs": {"output_1": {"connections":
+                    [{"node": str(nxt), "output": "input_1"}] if nxt else []}}}
+
+    gui = _gui({
+        "1": {"id": 1, "name": "start", "data": {}, "inputs": {},
+              "outputs": {"output_1": {"connections": [{"node": "2", "output": "input_1"}]}}},
+        "2": msg("2", "3"),
+        # задержка между сообщениями не должна занимать номер шага
+        "3": {"id": 3, "name": "delay", "data": {"amount": 1, "unit": "hours"},
+              "inputs": {"input_1": {"connections": []}},
+              "outputs": {"output_1": {"connections": [{"node": "4", "output": "input_1"}]}}},
+        "4": msg("4", "5"),
+        "5": msg("5"),
+        "9": msg("9"),   # оторванный — уходит в конец
+    })
+    graph = compile_graph(gui)
+
+    nums = exports.step_numbers(graph)
+    assert nums == {"2": 1, "4": 2, "5": 3, "9": 4}
+    # блоки, которых нет в выгрузке конверсий, номеров не получают
+    assert "3" not in nums and "1" not in nums
+
+    # выгрузка конверсий нумерует ровно так же
+    from_export = {nid: i + 1 for i, (nid, _n) in enumerate(funnel_steps(graph))}
+    assert from_export == nums
+
+
+@pytest.mark.asyncio
+async def test_funnels_report_shows_step_numbers(session):
+    """В отчёте «Воронки» у сообщений виден тот же номер шага."""
+    from app import exports
+    from app.graph import compile_graph
+    from app.models import Bot, Funnel, FunnelBot
+
+    gui = _gui({
+        "1": {"id": 1, "name": "start", "data": {}, "inputs": {},
+              "outputs": {"output_1": {"connections": [{"node": "2", "output": "input_1"}]}}},
+        "2": {"id": 2, "name": "message", "data": {"text": "Привет", "buttons": []},
+              "inputs": {"input_1": {"connections": []}},
+              "outputs": {"output_1": {"connections": [{"node": "3", "output": "input_1"}]}}},
+        "3": {"id": 3, "name": "delay", "data": {"amount": 1, "unit": "hours"},
+              "inputs": {"input_1": {"connections": []}},
+              "outputs": {"output_1": {"connections": [{"node": "4", "output": "input_1"}]}}},
+        "4": {"id": 4, "name": "message", "data": {"text": "Оффер", "buttons": []},
+              "inputs": {"input_1": {"connections": []}},
+              "outputs": {"output_1": {"connections": []}}},
+    })
+    b = Bot(name="B", token="t", is_active=True)
+    session.add(b)
+    await session.flush()
+    f = Funnel(name="F", is_active=True, trigger_type="start",
+               graph_ui=gui, graph=compile_graph(gui))
+    session.add(f)
+    await session.flush()
+    session.add(FunnelBot(funnel_id=f.id, bot_id=b.id))
+    await session.flush()
+
+    rows = await exports.funnels_rows(session)
+    header = rows[0]
+    # колонка со сквозным номером строки больше не зовётся «№»: её путали
+    # со Step N, а это разные числа
+    assert header[3] == "Порядок" and header[4] == "Шаг"
+
+    labels = [r[4] for r in rows[1:]]
+    assert any(l.startswith("Шаг 1 —") for l in labels)
+    assert any(l.startswith("Шаг 2 —") for l in labels)
+    # у задержки номера шага нет — в выгрузку конверсий она не попадает
+    delay_row = next(r for r in rows[1:] if r[5] == "delay")
+    assert not delay_row[4].startswith("Шаг")
+    # сквозной номер и номер шага — разные: у второго сообщения строка 3, шаг 2
+    offer = next(r for r in rows[1:] if r[4].startswith("Шаг 2"))
+    assert offer[3] == 3
+
+
 @pytest.mark.asyncio
 async def test_subscribers_isolated_per_bot(session):
     from app.bot import runner
@@ -1763,8 +1846,9 @@ async def test_export_funnel_steps_numbers(session):
     header, *data = rows
     assert header[:3] == ["Воронка", "Боты", "Статус"]
 
-    # строка входа + два шага, в порядке прохождения
-    assert [r[4] for r in data] == ["Вошли в воронку", "Привет", "Оффер"]
+    # строка входа + два шага, в порядке прохождения; у сообщений в названии
+    # стоит номер шага — тот же, что на плитке и в колонке «Step N users»
+    assert [r[4] for r in data] == ["Вошли в воронку", "Шаг 1 — Привет", "Шаг 2 — Оффер"]
     entered, step1, step2 = data
     assert entered[6] == 10
     assert step1[6] == 10 and step1[7] == 100.0     # 100% от входа

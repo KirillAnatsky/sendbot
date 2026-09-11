@@ -824,12 +824,20 @@ async def analysis_options(user=Depends(current_user), session=Depends(get_sessi
     if visible is not None:
         fq = fq.where(Funnel.id.in_(visible or [-1]))
     funnels = (await session.execute(fq)).scalars().all()
+    from .exports import step_numbers
+
     fl = []
     for f in funnels:
         nodes = []
+        # номер шага тот же, что на плитке и в выгрузке: иначе выбирая шаг
+        # для анализа, приходится гадать, тот ли это «шаг 3», что в таблице
+        steps = step_numbers(f.graph or {})
         for nid, n in (f.graph.get("nodes") or {}).items():
             if n.get("type") in ("message", "delay", "condition", "action", "chain"):
-                item = {"id": nid, "label": _node_label(n["type"], n.get("data") or {})}
+                label = _node_label(n["type"], n.get("data") or {})
+                if nid in steps:
+                    label = f"Шаг {steps[nid]} — {label}"
+                item = {"id": nid, "label": label}
                 if n["type"] == "message":
                     item["buttons"] = [
                         b.get("label", f"кнопка {i+1}")

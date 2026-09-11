@@ -65,6 +65,22 @@ def _node_label(ntype: str, data: dict) -> str:
     return ntype
 
 
+def step_numbers(graph: dict) -> dict:
+    """{id узла: номер шага} — только для блоков «Сообщение».
+
+    Единственный источник правды для нумерации: по нему рисуются номера на
+    плитках в редакторе, им же подписаны колонки «Step N users» в выгрузке
+    конверсий. Расходиться этим числам нельзя — иначе «шаг 7» в таблице и
+    «шаг 7» на холсте окажутся разными местами воронки.
+    """
+    out, k = {}, 0
+    for nid, n in _ordered_nodes(graph or {}):
+        if n.get("type") == "message":
+            k += 1
+            out[nid] = k
+    return out
+
+
 def _ordered_nodes(graph: dict):
     """Шаги воронки по порядку обхода от старта — как их проходит подписчик.
 
@@ -107,7 +123,11 @@ async def funnels_rows(session, allowed_bots=None) -> list[list]:
     for fid, bid in fb:
         bots_of.setdefault(fid, []).append(bot_names.get(bid, str(bid)))
 
-    rows = [["Воронка", "Боты", "Статус", "№", "Шаг", "Тип",
+    # «Порядок» — просто номер строки по обходу, он есть у каждого блока.
+    # «Шаг N» в названии — тот же номер, что на плитке в редакторе и в колонке
+    # «Step N users» листа 08B_FUNNEL_INPUT. Раньше колонка звалась «№» и её
+    # путали со Step N, хотя это разные числа: Step считает только сообщения.
+    rows = [["Воронка", "Боты", "Статус", "Порядок", "Шаг", "Тип",
              "Дошло человек", "% от входа", "% от предыдущего"]]
     for f in funnels:
         entered = (await session.execute(
@@ -124,12 +144,14 @@ async def funnels_rows(session, allowed_bots=None) -> list[list]:
         rows.append([f.name, bots, status, 0, "Вошли в воронку", "вход",
                      entered, 100 if entered else 0, ""])
         prev = entered
+        steps = step_numbers(f.graph)
         for i, (nid, n) in enumerate(_ordered_nodes(f.graph), start=1):
             count = int(visits.get(nid, 0))
+            label = _node_label(n.get("type", ""), n.get("data") or {})
+            if nid in steps:
+                label = f"Шаг {steps[nid]} — {label}"
             rows.append([
-                f.name, bots, status, i,
-                _node_label(n.get("type", ""), n.get("data") or {}),
-                n.get("type", ""),
+                f.name, bots, status, i, label, n.get("type", ""),
                 count, _pct(count, entered), _pct(count, prev),
             ])
             prev = count or prev

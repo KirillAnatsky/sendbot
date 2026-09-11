@@ -29,3 +29,16 @@ cd backend/tests/browser
 npm i jsdom
 node action_node.test.js
 ```
+
+## steps_match.test.js — номера шагов
+
+Номер на плитке в редакторе обязан совпадать с колонкой «Step N users» в
+`08B_FUNNEL_INPUT`. Это два разных куска кода на двух языках — JS в редакторе
+и Python в выгрузке, — поэтому тест прогоняет один и тот же граф через оба и
+сверяет результат: ветвления, петли, оторванные блоки, обрезание на 25 шагах.
+
+```
+cd backend/tests/browser
+npm i jsdom
+node steps_match.test.js
+```

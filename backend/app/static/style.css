@@ -567,3 +567,13 @@ th { background: #f8fafc; color: #7a8499; font-weight: 600; font-size: 12.5px; t
   text-align: center; cursor: pointer; }
 .ai-screen-name { font-size: 11px; color: #7a8499; margin-top: 3px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* номер шага на карточке сообщения — тот же, что колонка Step N в выгрузке */
+.df-step { float: right; font-size: 11px; font-weight: 600; color: #2e6bff;
+  background: #eef3ff; border-radius: 10px; padding: 1px 7px; margin-left: 6px; }
+.df-step:empty { display: none; }
+.df-step.over { color: #a05a00; background: #fff3e0; }
+.step-no { display: inline-block; min-width: 18px; margin-right: 6px; padding: 0 5px;
+  font-size: 11px; font-weight: 600; text-align: center; color: #2e6bff;
+  background: #eef3ff; border-radius: 9px; }
+.step-no.over { color: #a05a00; background: #fff3e0; }
