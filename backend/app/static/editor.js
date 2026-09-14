@@ -1215,71 +1215,129 @@ function applyFunnelToCanvas(f) {
 }
 
 // ---------- вертикальная авторасстановка ----------
+// Ветки воронки раскладываем столбцами: каждая ветка — своя вертикальная
+// дорожка, глубина — ряд. Именно ради этого кнопка и нужна: у воронки с
+// десятью языками получается десять параллельных столбцов, а не каша.
+// Раньше все узлы одной глубины просто выстраивались в ряд, и на длинных
+// ветках соседние дорожки перемешивались между собой.
 function arrangeVertical() {
   const df = editor.export().drawflow.Home.data;
   const flow = {}, notes = {};
   Object.values(df).forEach(n => {
     (n.name === 'note' ? notes : flow)[String(n.id)] = n;
   });
-  // глубина BFS от старта
+
+  // потомки в порядке портов: output_1, output_2 … — это порядок веток
+  // на карточке, и столбцы должны идти так же, как кнопки сверху вниз
+  const childrenOf = id => {
+    const node = df[id] || {};
+    const out = [];
+    Object.keys(node.outputs || {})
+      .sort((a, b) => (+String(a).split('_')[1] || 0) - (+String(b).split('_')[1] || 0))
+      .forEach(port => ((node.outputs[port] || {}).connections || []).forEach(c => {
+        const t = String(c.node);
+        if (flow[t] && !out.includes(t)) out.push(t);
+      }));
+    return out;
+  };
+
+  const depth = {}, col = {}, groupOf = {};
+  let group = 0;
+
+  // Стартуем от «Старта», потом отдельными группами разбираем всё, до чего
+  // из него не дойти: оторванный кусок должен лечь под воронкой, а не влезть
+  // первым рядом в середину (раньше он получал глубину 1 и всё ломал).
   let startId = null;
   Object.values(df).forEach(n => { if (n.name === 'start') startId = String(n.id); });
-  const depth = {};
-  if (startId != null) depth[startId] = 0;
-  const queue = startId != null ? [startId] : [];
-  while (queue.length) {
-    const cur = queue.shift();
-    Object.values(df[cur].outputs || {}).forEach(p => (p.connections || []).forEach(c => {
-      const t = String(c.node);
-      if (flow[t] && depth[t] === undefined) { depth[t] = depth[cur] + 1; queue.push(t); }
-    }));
-  }
-  Object.keys(flow).forEach(id => { if (depth[id] === undefined) depth[id] = 1; });
-  // заметки — в строку своего блока
+  const roots = [];
+  if (startId && flow[startId]) roots.push(startId);
+  Object.keys(flow).sort((a, b) => +a - +b).forEach(id => roots.push(id));
+
+  roots.forEach(root => {
+    if (depth[root] !== undefined) return;
+    const g = group++;
+    depth[root] = 0;
+    groupOf[root] = g;
+    const queue = [root];
+    while (queue.length) {
+      const cur = queue.shift();
+      childrenOf(cur).forEach(t => {
+        if (depth[t] === undefined) {
+          depth[t] = depth[cur] + 1;
+          groupOf[t] = g;
+          queue.push(t);
+        }
+      });
+    }
+    // первая ветка продолжает столбец родителя, каждая следующая встаёт
+    // правее всего, что заняло предыдущее поддерево — так дорожки не лезут
+    // друг на друга даже при разной длине веток
+    (function columns(id, c) {
+      col[id] = c;
+      let max = c;
+      childrenOf(id).forEach((t, i) => {
+        if (col[t] !== undefined) return;   // ветки сошлись — узел уже размещён
+        max = Math.max(max, columns(t, i === 0 ? c : max + 1));
+      });
+      return max;
+    })(root, 0);
+  });
+
+  // заметки живут рядом со своим блоком, в свободных столбцах справа
   const notesByAbout = {};
+  const homeless = [];
   Object.entries(notes).forEach(([id, n]) => {
     const about = String((n.data || {}).about || '');
-    (notesByAbout[about] = notesByAbout[about] || []).push(id);
+    if (flow[about]) (notesByAbout[about] = notesByAbout[about] || []).push(id);
+    else homeless.push(id);
   });
-  const rows = {};
-  Object.keys(flow).sort((a, b) => +a - +b).forEach(id => {
-    (rows[depth[id]] = rows[depth[id]] || []).push(id);
-    (notesByAbout[id] || []).forEach(nid => rows[depth[id]].push(nid));
-  });
-  const orphan = Object.keys(notes).filter(id => !Object.values(notesByAbout).flat().includes(id) ||
-    !flow[String((notes[id].data || {}).about || '')]);
 
-  const X_STEP = 400, Y_GAP = 70;
-  let y = 60;
+  const X_STEP = 400, Y_GAP = 70, GROUP_GAP = 140;
   const place = (id, x, yy) => {
     const el = document.getElementById('node-' + id);
     if (!el) return 0;
-    el.style.left = x + 'px'; el.style.top = yy + 'px';
+    el.style.left = x + 'px';
+    el.style.top = yy + 'px';
     const n = editor.drawflow.drawflow.Home.data[id];
     if (n) { n.pos_x = x; n.pos_y = yy; }
     return el.offsetHeight || 120;
   };
-  Object.keys(rows).map(Number).sort((a, b) => a - b).forEach(d => {
+
+  const rows = {};                       // "группа:глубина" -> [id]
+  Object.keys(flow).forEach(id => {
+    const key = groupOf[id] + ':' + depth[id];
+    (rows[key] = rows[key] || []).push(id);
+  });
+  Object.values(rows).forEach(arr => arr.sort((a, b) => col[a] - col[b] || +a - +b));
+
+  let y = 60, prevGroup = 0;
+  Object.keys(rows).sort((a, b) => {
+    const [ga, da] = a.split(':').map(Number);
+    const [gb, db] = b.split(':').map(Number);
+    return ga - gb || da - db;
+  }).forEach(key => {
+    const g = +key.split(':')[0];
+    if (g !== prevGroup) { y += GROUP_GAP; prevGroup = g; }
     let maxH = 0;
-    rows[d].forEach((id, i) => { maxH = Math.max(maxH, place(id, 60 + i * X_STEP, y)); });
+    let freeCol = Math.max(...rows[key].map(id => col[id])) + 1;
+    rows[key].forEach(id => {
+      maxH = Math.max(maxH, place(id, 60 + col[id] * X_STEP, y));
+      (notesByAbout[id] || []).forEach(nid => {
+        maxH = Math.max(maxH, place(nid, 60 + freeCol++ * X_STEP, y));
+      });
+    });
     y += maxH + Y_GAP;
   });
-  orphan.forEach((id, i) => place(id, 60 + i * X_STEP, y));
-  // перерисовать все связи
-  Object.keys(df).forEach(id => { try { editor.updateConnectionNodes('node-' + id); } catch (e) {} });
-  decoratePorts();
-  flashStatus('Разложено сверху вниз');
-}
 
-// Переход внутрь цепочки — это уход с текущего холста, поэтому сначала
-// разбираемся с несохранёнными правками: молча их потерять хуже всего.
-async function openChainEditor(id) {
-  if (editorDirty()) {
-    const answer = confirm('В воронке есть несохранённые правки. Сохранить перед переходом?');
-    if (answer) await saveFunnel();
-    else if (!confirm('Перейти и потерять правки?')) return;
-  }
-  openEditor(+id);
+  // заметки, потерявшие свой блок, — отдельной строкой внизу
+  homeless.forEach((id, i) => place(id, 60 + i * X_STEP, y + GROUP_GAP));
+
+  Object.keys(df).forEach(id => {
+    try { editor.updateConnectionNodes('node-' + id); } catch (e) {}
+  });
+  decoratePorts();
+  refreshStepNumbers();
+  flashStatus('Разложено столбцами');
 }
 
 // ---------- сохранение ----------

@@ -166,8 +166,12 @@ th { background: #f8fafc; color: #7a8499; font-weight: 600; font-size: 12.5px; t
 .df-media-more { font-size: 11px; color: #7a8499; }
 .df-sub.empty { color: #c3c9d6; font-style: italic; }
 .df-btns { padding: 2px 12px 6px; display: flex; flex-direction: column; gap: 4px; }
+/* отступы по 26px с обеих сторон — место под кружок с номером порта. Подпись
+   стоит по центру, и без запаса длинная надпись наезжала бы на номер (а в
+   правосторонних языках — с другой стороны). */
 .df-btn { background: #eef3ff; border: 1px solid #d3e0ff; color: #2e6bff; border-radius: 8px;
-  padding: 5px 8px; font-size: 12px; text-align: center; position: relative; }
+  padding: 5px 26px; font-size: 12px; text-align: center; position: relative;
+  min-height: 15px; }
 .df-btn.url { color: #556; background: #f4f6fa; border-color: #e0e5ee; }
 .df-btn-port { position: absolute; left: 6px; top: 50%; transform: translateY(-50%);
   background: #2e6bff; color: #fff; border-radius: 50%; width: 15px; height: 15px;
@@ -596,7 +600,6 @@ th { background: #f8fafc; color: #7a8499; font-weight: 600; font-size: 12.5px; t
    целиком. text-align: start прижимает строку к нужному краю. */
 .rt-area,
 .drawflow .drawflow-node .df-sub,
-.drawflow .drawflow-node .df-btn,
 .df-order,
 .msg-bubble,
 .seg-value,
@@ -605,3 +608,7 @@ th { background: #f8fafc; color: #7a8499; font-weight: 600; font-size: 12.5px; t
   unicode-bidi: plaintext;
   text-align: start;
 }
+/* У подписи кнопки выравнивание своё — по центру, как на настоящей кнопке
+   Telegram. Направление всё равно определяется по содержимому, поэтому
+   арабский внутри читается справа налево. */
+.drawflow .drawflow-node .df-btn { unicode-bidi: plaintext; }
