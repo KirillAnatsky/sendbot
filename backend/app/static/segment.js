@@ -56,8 +56,15 @@ function makeSegment(containerEl, initial, opts) {
       return `<input class="seg-value inline-input" value="${esc(row.value ?? '')}" placeholder="значение">`;
     }
     if (fd.type === 'choice' || fd.type === 'select') {
-      const opts = (fd.options || []).map(o =>
-        `<option value="${o.v}" ${String(row.value) === String(o.v) ? 'selected' : ''}>${esc(o.l)}</option>`).join('');
+      const list = fd.options || [];
+      const cur = String(row.value ?? '');
+      // Значение, которого нет в списке (старый фильтр с кодом, набранным
+      // руками), оставляем отдельным пунктом. Иначе select молча подставил бы
+      // первый вариант и подменил условие.
+      const unknown = cur && !list.some(o => String(o.v) === cur);
+      const opts = list.map(o =>
+        `<option value="${esc(o.v)}" ${cur === String(o.v) ? 'selected' : ''}>${esc(o.l)}</option>`).join('')
+        + (unknown ? `<option value="${esc(cur)}" selected>${esc(cur)} — не из списка</option>` : '');
       return `<select class="seg-value inline-input">${opts || '<option value="">—</option>'}</select>`;
     }
     if (fd.type === 'weekdays') {

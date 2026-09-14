@@ -120,5 +120,10 @@ check('несколько картинок — сеткой', () => {
   has(many, 'df-media many');
 });
 
+check('картинку нельзя утащить вместо самого блока', () => {
+  const html = A.nodeHtml('message', { text: 'т', media: [{ type: 'photo', path: 'media/a.png' }] });
+  has(html, 'draggable="false"');   // иначе браузер тянет картинку, а блок стоит
+});
+
 console.log(failed ? `\n${failed} проверок упало` : '\nвсе проверки прошли');
 process.exit(failed ? 1 : 0);

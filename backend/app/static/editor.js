@@ -30,7 +30,9 @@ function nodeHtml(type, data) {
       mediaHtml = `<div class="df-media ${grid}">` + media.slice(0, 6).map(m => {
         if (m.type === 'photo') {
           const src = m.path.startsWith('http') ? m.path : '/' + m.path;
-          return `<img class="df-media-thumb" src="${esc(src)}" alt="">`;
+          // draggable=false — иначе браузер начинает своё перетаскивание
+          // картинки, и блок остаётся на месте
+          return `<img class="df-media-thumb" draggable="false" src="${esc(src)}" alt="">`;
         }
         return `<span class="df-media-thumb icon" title="${esc(m.type)}">${MEDIA_ICON[m.type] || '📎'}</span>`;
       }).join('') + (media.length > 6 ? `<span class="df-media-more">+${media.length - 6}</span>` : '') + `</div>`;
@@ -160,7 +162,11 @@ function summary(type, d) {
     return `Ждать ${d.amount || '?'} ${u}`;
   }
   if (type === 'condition') return `Есть тег «${tagName(d.tag)}»?`;
-  if (type === 'language') return `Язык: ${(d.languages || []).join(' / ') || '?'} / остальные`;
+  if (type === 'language') {
+    const names = (d.languages || []).map(l => String(l).split(',')
+      .map(c => languageName(c.trim())).join(' / '));
+    return `Язык: ${names.join(' / ') || '?'} / остальные`;
+  }
   if (type === 'filter') return segSummaryText(d.filter);
   if (type === 'note') return d.text || 'пустая заметка';
   if (type === 'action') return actionSummary(d);
@@ -838,11 +844,11 @@ function showProps(id) {
       </p>
       <label>Ветки (код языка; несколько через запятую)</label>
       <div id="p-langs">${langs.map(l => langRow(l)).join('')}</div>
-      <button class="btn" onclick="addLangRow()">+ язык</button>
-      <div class="lang-quick">
-        ${['ru', 'en', 'uk', 'pl', 'de', 'es', 'pt'].map(c =>
-          `<span class="pill gray" onclick="addLangRow('${c}')">${c}</span>`).join('')}
-      </div>
+      <select id="p-lang-pick" onchange="addLangRow(this.value); this.value=''">
+        <option value="">+ добавить язык из списка…</option>
+        ${languageOptions()}
+      </select>
+      <button class="btn" onclick="addLangRow()">+ пустая ветка</button>
       <div class="hint-box">
         Коды — как в Telegram: <code>ru</code>, <code>en</code>, <code>uk</code>,
         <code>pl</code>… Подписчик с <code>pt-br</code> попадёт в ветку
@@ -1003,6 +1009,26 @@ function setupImageUploader() {
     const imgs = [...(e.clipboardData.items || [])].filter(i => i.type.startsWith('image/')).map(i => i.getAsFile());
     if (imgs.length) { e.preventDefault(); uploadMediaFiles(imgs); }
   };
+}
+
+// Список языков берём оттуда же, откуда его берёт фильтр, — из справочника
+// полей сегмента. Один список на весь сервис: разъехавшиеся наборы языков
+// в двух местах сразу превращаются в «почему тут есть, а там нет».
+function languageList() {
+  const fields = (typeof SEG_FIELDS !== 'undefined' && SEG_FIELDS) || [];
+  const f = fields.find(x => x.key === 'language');
+  return (f && f.options) || [];
+}
+
+function languageOptions() {
+  return languageList().map(o =>
+    `<option value="${esc(o.v)}">${esc(o.l)} (${esc(o.v)})</option>`).join('');
+}
+
+function languageName(code) {
+  const c = String(code || '').trim().toLowerCase();
+  const o = languageList().find(x => String(x.v) === c);
+  return o ? o.l : code;
 }
 
 function langRow(value) {

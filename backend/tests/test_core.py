@@ -1299,6 +1299,67 @@ async def test_funnels_report_shows_step_numbers(session):
 
 
 @pytest.mark.asyncio
+async def test_language_filter_picks_regional_variants(session):
+    """Выбрал «Португальский» — попадают и pt, и pt-br. Иначе полбазы мимо."""
+    from sqlalchemy import select
+
+    from app import segment as seg
+    from app.models import Bot, Subscriber
+
+    b = Bot(name="B", token="t", is_active=True)
+    session.add(b)
+    await session.flush()
+    codes = ["pt", "pt-br", "es", "es-419", "en", "ru", None]
+    for i, code in enumerate(codes):
+        session.add(Subscriber(bot_id=b.id, tg_id=100 + i, first_name="X",
+                               is_active=True, language_code=code))
+    await session.flush()
+
+    async def found(value, op="equals"):
+        q = seg.build_query(b.id, {"conditions": [
+            {"field": "language", "op": op, "value": value}]})
+        return sorted(s.language_code or "—" for s in (await session.execute(q)).scalars())
+
+    # код без региона забирает и региональные варианты
+    assert await found("pt") == ["pt", "pt-br"]
+    assert await found("es") == ["es", "es-419"]
+    # код с регионом — только он сам
+    assert await found("pt-br") == ["pt-br"]
+    # ничего лишнего не прилипает
+    assert await found("en") == ["en"]
+    assert await found("ru") == ["ru"]
+
+    # «не равно» — это ровно отрицание, и неизвестный язык туда попадает
+    assert await found("pt", "not_equals") == ["en", "es", "es-419", "ru", "—"]
+
+
+def test_language_list_is_one_for_filter_and_node():
+    """Список языков — один на весь сервис, и коды в нём настоящие."""
+    from app import segment as seg
+
+    meta = {f["key"]: f for f in seg.fields_meta([], [], [])}
+    lang = meta["language"]
+    assert lang["type"] == "choice"          # выпадающий список, а не поле ввода
+    codes = [o["v"] for o in lang["options"]]
+
+    # то, чем реально пользуются, — на месте
+    for must in ("ru", "en", "uk", "es", "pt", "pt-br", "de", "pl", "tr", "ar"):
+        assert must in codes, must
+    assert len(codes) == len(set(codes)), "коды не должны повторяться"
+    # коды в том виде, в каком их присылает Telegram: нижний регистр, дефис
+    for c in codes:
+        assert c == c.lower() and "_" not in c, c
+
+    assert seg.language_label("pt-br") == "Португальский (Бразилия) (pt-br)"
+    assert seg.language_label("xx") == "xx"          # незнакомый — как есть
+
+    # человекочитаемое описание фильтра показывает язык словами
+    out = seg.describe({"conditions": [
+        {"field": "language", "op": "equals", "value": "ar"}]}, {}, {}, {})
+    assert out == ["язык: = Арабский (ar)"]
+
+
+@pytest.mark.asyncio
 async def test_subscribers_isolated_per_bot(session):
     from app.bot import runner
     from app.models import Bot
@@ -1514,7 +1575,8 @@ async def test_broadcast_detail(session):
     # условия сегмента расшифрованы словами, а не id
     assert d["audience_kind"] == "Сегмент"
     assert "тег: есть VIP" in d["audience"]
-    assert "язык: = ru" in d["audience"]
+    # язык в описании теперь словами, а не голым кодом
+    assert "язык: = Русский (ru)" in d["audience"]
     names = {r["name"] for r in d["recipients"]}
     assert names == {"Иван", "Пётр"}
 

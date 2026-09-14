@@ -155,7 +155,11 @@ th { background: #f8fafc; color: #7a8499; font-weight: 600; font-size: 12.5px; t
 .df-media.two { grid-template-columns: 1fr 1fr; }
 .df-media.many { grid-template-columns: repeat(3, 1fr); }
 .df-media-thumb { width: 100%; border-radius: 8px; object-fit: cover; border: 1px solid #e3e8f0;
-  background: #f4f6fb; }
+  background: #f4f6fb;
+  /* тянуть надо блок, а не картинку: без этого браузер начинает своё
+     перетаскивание изображения, и карточка остаётся на месте. pointer-events
+     отдаёт нажатие самой карточке — картинка тут только для глаз. */
+  -webkit-user-drag: none; user-select: none; pointer-events: none; }
 .df-media.one .df-media-thumb { height: 150px; }
 .df-media.two .df-media-thumb { height: 100px; }
 .df-media.many .df-media-thumb { height: 64px; }

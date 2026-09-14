@@ -398,7 +398,9 @@ def _html(ntype: str, d: dict, tag_names: dict) -> str:
             for m in media[:6]:
                 if m.get("type") == "photo":
                     src = m["path"] if str(m.get("path", "")).startswith("http") else "/" + m.get("path", "")
-                    thumbs.append(f'<img class="df-media-thumb" src="{h.escape(src)}" alt="">')
+                    thumbs.append(
+                        f'<img class="df-media-thumb" draggable="false" '
+                        f'src="{h.escape(src)}" alt="">')
                 else:
                     thumbs.append(f'<span class="df-media-thumb icon">{_MEDIA_ICON.get(m.get("type"), "📎")}</span>')
             grid = "one" if len(media) == 1 else ("two" if len(media) == 2 else "many")
