@@ -165,6 +165,42 @@ function check(name, got, want) {
   check('Ctrl+Z после оформления не стирает текст',
         (await html()).includes('было'), true);
 
+  console.log('\n--- 8. Арабский: направление письма не портит текст ---');
+
+  const ar = 'اضغط على الزر لتفعيل العجلة';
+  await scenario(async () => {
+    await type(ar);
+  });
+  check('арабский набирается и отдаётся как есть', await html(), ar);
+
+  await page.evaluate(a => { RT.setHtml(a); }, ar);
+  check('арабский из базы читается без изменений', await html(), ar);
+
+  await scenario(async () => {
+    await type(ar);
+    await page.evaluate(() => { selectText('الزر'); clickBtn('b'); });
+  });
+  check('жирный на арабском слове', await html(), ar.replace('الزر', '<b>الزر</b>'));
+
+  // смешанный текст: латиница внутри арабского не должна перевернуть строку
+  await scenario(async () => {
+    await type('اضغط WHEEL هنا');
+  });
+  check('арабский с латиницей внутри', await html(), 'اضغط WHEEL هنا');
+
+  await scenario(async () => {
+    await type('اضغط هنا');
+    await page.evaluate(() => { selectText('هنا'); clickBtn('spoiler'); });
+    await page.evaluate(() => caretToEnd());
+    await page.evaluate(() => clickBtn('spoiler'));
+    await type(' الآن');
+  });
+  check('спойлер на арабском выключается так же, как на русском',
+        await html(), 'اضغط <tg-spoiler>هنا</tg-spoiler> الآن');
+
+  check('в тексте не появилось служебных символов направления',
+        /[\u200e\u200f\u202a-\u202e\u2066-\u2069]/.test(await html()), false);
+
   await browser.close();
   console.log(failed ? `\n${failed} проверок упало` : '\nвсе проверки прошли');
   process.exit(failed ? 1 : 0);

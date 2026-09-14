@@ -401,7 +401,8 @@ def _html(ntype: str, d: dict, tag_names: dict) -> str:
                     thumbs.append(f'<img class="df-media-thumb" src="{h.escape(src)}" alt="">')
                 else:
                     thumbs.append(f'<span class="df-media-thumb icon">{_MEDIA_ICON.get(m.get("type"), "📎")}</span>')
-            media_html = '<div class="df-media">' + "".join(thumbs) + "</div>"
+            grid = "one" if len(media) == 1 else ("two" if len(media) == 2 else "many")
+            media_html = f'<div class="df-media {grid}">' + "".join(thumbs) + "</div>"
         text = (d.get("text") or "")[:500]
         toggle = (
             '<span class="df-toggle" onclick="toggleNodeExpand(event, this)">развернуть ▾</span>'
@@ -686,6 +687,14 @@ def _node_height(node: dict) -> int:
     long_text = lines > 4
     lines = min(lines, 4)  # свёрнутая карточка показывает до 4 строк
     buttons = len(node["data"].get("buttons") or []) if node["name"] == "message" else 0
+    if node["name"] == "message":
+        media = node["data"].get("media") or (
+            [1] if node["data"].get("photo_url") else [])
+        if media:
+            # одиночная картинка рисуется во всю ширину, сетка — двумя рядами
+            h_media = 150 if len(media) == 1 else (100 if len(media) <= 2 else 200)
+            lines += 0  # текст считается отдельно
+            node = dict(node, _media_h=h_media)
     if node["name"] == "filter":
         # у фильтра вместо текста — список условий, по строке на каждое
         buttons = len((node["data"].get("filter") or {}).get("conditions") or []) + 1
@@ -695,6 +704,7 @@ def _node_height(node: dict) -> int:
     if long_text:
         h += 22                        # строка «развернуть»
     h += max(buttons - 1, 0) * 15
+    h += node.get("_media_h", 0)
     return h
 
 

@@ -24,7 +24,10 @@ function nodeHtml(type, data) {
     const media = data.media || (data.photo_url ? [{ type: 'photo', path: data.photo_url }] : []);
     let mediaHtml = '';
     if (media.length) {
-      mediaHtml = `<div class="df-media">` + media.slice(0, 6).map(m => {
+      // одно вложение показываем крупно, во всю ширину карточки — по нему
+      // и узнают шаг; несколько складываем сеткой, как альбом в Telegram
+      const grid = media.length === 1 ? 'one' : (media.length === 2 ? 'two' : 'many');
+      mediaHtml = `<div class="df-media ${grid}">` + media.slice(0, 6).map(m => {
         if (m.type === 'photo') {
           const src = m.path.startsWith('http') ? m.path : '/' + m.path;
           return `<img class="df-media-thumb" src="${esc(src)}" alt="">`;
@@ -337,6 +340,7 @@ async function openEditor(id) {
     editor.addNode('start', 0, 1, 80, 150, 'start', {}, nodeHtml('start', {}), false);
   }
   document.getElementById('steps-drawer').classList.add('hidden');
+  redrawAllNodes();
   decoratePorts();
   refreshStepNumbers();
   loadFunnelStats();
@@ -668,8 +672,14 @@ function setupPaletteDnD() {
 
 function refreshNodeHtml(id) {
   const node = editor.getNodeFromId(id);
+  const html = nodeHtml(node.name, node.data);
   const el = document.querySelector(`#node-${id} .drawflow_content_node`);
-  if (el) el.innerHTML = nodeHtml(node.name, node.data);
+  if (el) el.innerHTML = html;
+  // Drawflow держит разметку карточки отдельно от DOM и отдаёт именно её
+  // при export(). Без этой строки в базу уезжала старая карточка: на экране
+  // текст новый, а после перезагрузки — снова прежний.
+  const stored = editor.drawflow.drawflow.Home.data[id];
+  if (stored) stored.html = html;
   // вернуть бейджи статистики и номер шага после перерисовки
   if (typeof applyStatsBadges === 'function') applyStatsBadges();
   refreshStepNumbers();
@@ -730,6 +740,16 @@ function decoratePorts() {
       }
     });
     try { editor.updateConnectionNodes('node-' + n.id); } catch (e) {}
+  });
+}
+
+// Перерисовать все карточки из данных узлов. Нужно после загрузки воронки:
+// в базе могла остаться разметка, отставшая от данных (старый баг сохранения),
+// и без этого человек видел бы прежний текст, пока не откроет каждый блок.
+function redrawAllNodes() {
+  const df = editor.drawflow.drawflow.Home.data;
+  Object.keys(df).forEach(id => {
+    try { refreshNodeHtml(id); } catch (e) { /* узел мог исчезнуть */ }
   });
 }
 
@@ -1184,6 +1204,7 @@ function applyFunnelToCanvas(f) {
   }
   // порты, статистика и связи — после отрисовки узлов
   setTimeout(() => {
+    redrawAllNodes();
     decoratePorts();
     refreshStepNumbers();
     loadFunnelStats();
