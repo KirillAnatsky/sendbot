@@ -834,6 +834,122 @@ async function saveTimezone() {
   alert('Часовой пояс сохранён: ' + r.tz);
 }
 
+// ---------- импорт базы из файла ----------
+// Двумя шагами: сначала показываем, что произойдёт, и только по кнопке пишем.
+// База — то, что терять больнее всего, и «загрузил и надеюсь» тут не годится.
+let IMPORT_FILE = null;
+
+async function toggleImportPanel() {
+  const el = document.getElementById('import-panel');
+  el.classList.toggle('hidden');
+  if (el.classList.contains('hidden')) return;
+  const bots = await api('/bots');
+  document.getElementById('imp-bot').innerHTML = bots.length
+    ? bots.map(b => `<option value="${b.id}">${esc(b.name)}</option>`).join('')
+    : '<option value="">нет ботов — сначала добавьте бота</option>';
+}
+
+async function importPreview(input) {
+  const file = input.files[0];
+  input.value = '';
+  if (!file) return;
+  const botId = document.getElementById('imp-bot').value;
+  if (!botId) { alert('Сначала выберите бота'); return; }
+  IMPORT_FILE = file;
+
+  const status = document.getElementById('imp-status');
+  const box = document.getElementById('imp-result');
+  status.textContent = 'Читаю файл…';
+  box.innerHTML = '';
+  try {
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('bot_id', botId);
+    const r = await fetch('/api/subscribers/import/preview', {
+      method: 'POST', headers: { Authorization: 'Bearer ' + TOKEN }, body: fd,
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.detail || 'Не удалось прочитать файл');
+    status.textContent = `Файл: ${file.name}`;
+    box.innerHTML = importPreviewHtml(d, file);
+  } catch (e) {
+    status.textContent = '';
+    IMPORT_FILE = null;
+    alert(e.message);
+  }
+}
+
+function importPreviewHtml(d, file) {
+  const problems = d.problems_total
+    ? `<div class="hint-box" style="border-color:#f0c36d;background:#fff8ec">
+         <b>Строк с проблемами: ${d.problems_total}</b> — они будут пропущены,
+         остальное импортируется.
+         <div style="margin-top:6px;font-size:12px;color:#8a6d3b">
+           ${d.problems.map(p => esc(p)).join('<br>')}
+           ${d.problems_total > d.problems.length ? '<br>…' : ''}
+         </div>
+       </div>` : '';
+  const tags = d.tags_total
+    ? `<div style="margin-top:8px;font-size:13px">Теги из файла (${d.tags_total}):
+         ${d.tags.map(t => `<span class="pill">${esc(t)}</span>`).join('')}
+         ${d.tags_total > d.tags.length ? '…' : ''}</div>` : '';
+  return `
+    <div class="panel" style="margin-top:12px;background:#f8fafc">
+      <div class="cards" style="margin-bottom:10px">
+        <div class="card"><div class="card-num">${d.total}</div><div class="card-label">строк в файле</div></div>
+        <div class="card"><div class="card-num">${d.new}</div><div class="card-label">новых</div></div>
+        <div class="card"><div class="card-num">${d.existing}</div><div class="card-label">уже есть</div></div>
+      </div>
+      ${problems}
+      ${tags}
+      <table style="margin-top:10px">
+        <tr><th>Telegram ID</th><th>Username</th><th>Имя</th><th>Теги</th><th>Статус</th></tr>
+        ${d.sample.map(r => `<tr>
+          <td>${r.tg_id}</td>
+          <td>${r.username ? '@' + esc(r.username) : '—'}</td>
+          <td>${esc(r.name || '—')}</td>
+          <td>${(r.tags || []).map(t => `<span class="pill">${esc(t)}</span>`).join('') || '—'}</td>
+          <td>${r.is_active ? '<span class="status-active">активен</span>' : '<span class="status-off">блок</span>'}</td>
+        </tr>`).join('')}
+      </table>
+      <p style="font-size:12.5px;color:#7a8499">Первые ${d.sample.length} строк — проверьте, что колонки разобрались верно.</p>
+      <button class="btn primary" onclick="importApply()">Импортировать ${d.total} строк</button>
+    </div>`;
+}
+
+async function importApply() {
+  if (!IMPORT_FILE) { alert('Сначала выберите файл'); return; }
+  const botId = document.getElementById('imp-bot').value;
+  const botName = document.getElementById('imp-bot').selectedOptions[0].textContent;
+  if (!confirm(`Импортировать в бота «${botName}»?`)) return;
+
+  const status = document.getElementById('imp-status');
+  status.textContent = 'Импортирую… на большой базе это может занять минуту';
+  try {
+    const fd = new FormData();
+    fd.append('file', IMPORT_FILE);
+    fd.append('bot_id', botId);
+    fd.append('update_existing', document.getElementById('imp-update').value);
+    const r = await fetch('/api/subscribers/import', {
+      method: 'POST', headers: { Authorization: 'Bearer ' + TOKEN }, body: fd,
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.detail || 'Импорт не прошёл');
+    status.textContent = '';
+    document.getElementById('imp-result').innerHTML = `
+      <div class="panel" style="margin-top:12px">
+        <b>Готово.</b> Добавлено: ${d.added}, обновлено: ${d.updated}, пропущено: ${d.skipped}.
+        ${d.problems_total ? `Строк с проблемами: ${d.problems_total}.` : ''}
+      </div>`;
+    IMPORT_FILE = null;
+    await loadTags(true);
+    await loadSubscribers();
+  } catch (e) {
+    status.textContent = '';
+    alert(e.message);
+  }
+}
+
 // ---------- воронки: список ----------
 const TRIGGER_LABEL = { start: '/start', keyword: 'слово', tag_added: 'тег', message: 'сообщение' };
 async function loadFunnels() {

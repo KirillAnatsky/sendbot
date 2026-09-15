@@ -2,7 +2,7 @@ import json
 import re
 from datetime import datetime, timedelta
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import case, delete, func, select
 from sqlalchemy.orm.attributes import flag_modified
@@ -1320,6 +1320,95 @@ class BulkActionIn(BaseModel):
     action: str  # delete | add_tag | remove_tag
     tag_id: int | None = None
     expected_total: int | None = None  # защита: сколько человек видел пользователь
+
+
+# Импорт базы из файла: Telegram не отдаёт боту список подписчиков, поэтому
+# при переезде с другого сервиса это единственный способ не потерять людей.
+# Выгрузка на 400 тысяч подписчиков весит около 60 МБ. Режем на 100, чтобы
+# база влезала целиком: делить файл руками — верный способ потерять часть
+# людей и не заметить этого.
+IMPORT_MAX_MB = 100
+
+
+async def _read_import(file: UploadFile) -> bytes:
+    name = (file.filename or "").lower()
+    if not name.endswith((".csv", ".txt", ".tsv")):
+        raise HTTPException(400, "Нужен файл CSV (выгрузка из таблицы: «Файл → "
+                                 "Скачать → CSV»)")
+    blob = await file.read()
+    if len(blob) > IMPORT_MAX_MB * 1024 * 1024:
+        raise HTTPException(400, f"Файл больше {IMPORT_MAX_MB} МБ — разбейте его на части")
+    if not blob:
+        raise HTTPException(400, "Файл пустой")
+    return blob
+
+
+@router.post("/subscribers/import/preview",
+             dependencies=[Depends(require("subscribers", "edit"))])
+async def subscribers_import_preview(bot_id: int = Form(...), file: UploadFile = File(...),
+                                     user=Depends(current_user), session=Depends(get_session)):
+    """Разобрать файл и показать, что будет, ничего не записывая."""
+    from sqlalchemy import func as sql_func
+
+    from . import subscriber_import as imp
+
+    await ensure_bot_access(user, bot_id)
+    blob = await _read_import(file)
+    try:
+        rows, problems, cols = imp.parse_rows(blob)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if not rows:
+        raise HTTPException(400, "В файле не нашлось ни одной строки с Telegram ID")
+
+    ids = [r["tg_id"] for r in rows]
+    known = 0
+    for start in range(0, len(ids), 1000):
+        known += (await session.execute(
+            select(sql_func.count()).select_from(Subscriber).where(
+                Subscriber.bot_id == bot_id,
+                Subscriber.tg_id.in_(ids[start:start + 1000]))
+        )).scalar() or 0
+
+    tags = sorted({t for r in rows for t in r["tags"]})
+    return {
+        "total": len(rows),
+        "new": len(rows) - known,
+        "existing": known,
+        "problems": problems[:50],
+        "problems_total": len(problems),
+        "columns": sorted(cols),
+        "tags": tags[:50],
+        "tags_total": len(tags),
+        "sample": [
+            {"tg_id": r["tg_id"], "username": r["username"],
+             "name": " ".join(x for x in (r["first_name"], r["last_name"]) if x),
+             "tags": r["tags"], "is_active": r["is_active"]}
+            for r in rows[:5]
+        ],
+    }
+
+
+@router.post("/subscribers/import", dependencies=[Depends(require("subscribers", "edit"))])
+async def subscribers_import(bot_id: int = Form(...), file: UploadFile = File(...),
+                             update_existing: bool = Form(True),
+                             user=Depends(current_user), session=Depends(get_session)):
+    from . import subscriber_import as imp
+
+    await ensure_bot_access(user, bot_id)
+    blob = await _read_import(file)
+    try:
+        rows, problems, _cols = imp.parse_rows(blob)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if not rows:
+        raise HTTPException(400, "В файле не нашлось ни одной строки с Telegram ID")
+
+    res = await imp.apply_rows(session, bot_id, rows, bool(update_existing))
+    res["problems"] = problems[:50]
+    res["problems_total"] = len(problems)
+    log.info("Импорт подписчиков в бота #%s: %s", bot_id, res)
+    return res
 
 
 @router.post("/subscribers/bulk", dependencies=[Depends(require("subscribers", "edit"))])

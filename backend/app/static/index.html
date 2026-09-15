@@ -285,6 +285,47 @@
         <input id="sub-search" class="inline-input" placeholder="Поиск по имени…" oninput="subsDebounce()">
         <select id="sub-bot-filter" onchange="loadSubscribers()"><option value="">Все боты</option></select>
         <button class="btn" onclick="toggleSegPanel()">🔎 Сегмент</button>
+        <button class="btn" onclick="toggleImportPanel()">📥 Импорт из файла</button>
+      </div>
+      <div id="import-panel" class="panel hidden">
+        <h3 style="margin-top:0">Импорт базы подписчиков</h3>
+        <p style="font-size:13px;color:#7a8499;max-width:720px">
+          Telegram не отдаёт боту список тех, кто на него подписан: бот узнаёт
+          о человеке только когда тот сам напишет или нажмёт кнопку. Поэтому
+          при переезде с другого сервиса базу переносят файлом.
+        </p>
+        <div class="hint-box" style="max-width:720px">
+          <b>Писать можно только тем, кто когда-то сам начал диалог именно
+          с этим ботом.</b> Переносите базу вместе с токеном того же бота —
+          тогда сообщения дойдут. Если бот новый, Telegram ответит отказом на
+          каждого, и рассылка пометит их заблокировавшими: импорт этого не
+          меняет, он лишь сохраняет список.
+        </div>
+        <div class="row" style="margin-top:12px">
+          <div>
+            <label>В какого бота</label>
+            <select id="imp-bot"></select>
+          </div>
+          <div>
+            <label>Уже известные подписчики</label>
+            <select id="imp-update">
+              <option value="1">дозаполнить пустые поля и теги</option>
+              <option value="">не трогать</option>
+            </select>
+          </div>
+        </div>
+        <input type="file" id="imp-file" accept=".csv,.tsv,.txt" class="hidden" onchange="importPreview(this)">
+        <button class="btn" onclick="document.getElementById('imp-file').click()">Выбрать CSV-файл</button>
+        <span id="imp-status" style="margin-left:10px;font-size:13px;color:#7a8499"></span>
+        <div id="imp-result"></div>
+        <div class="hint-box" style="max-width:720px;margin-top:12px">
+          Нужна колонка <code>telegram_id</code> — без неё бот не знает, кому
+          писать. Остальное необязательно и подхватится, если есть:
+          <code>username</code>, <code>full_name</code>, <code>status</code>,
+          <code>tags</code>, <code>subscribed at</code>,
+          <code>last activity at</code>. Разделитель — запятая, точка с запятой
+          или табуляция; кодировка UTF-8 или Windows-1251.
+        </div>
       </div>
       <div id="seg-panel" class="panel hidden">
         <div id="seg-builder"></div>

@@ -1359,6 +1359,161 @@ def test_language_list_is_one_for_filter_and_node():
     assert out == ["язык: = Арабский (ar)"]
 
 
+SENDPULSE_CSV = (
+    "telegram_id,id,username,full_name,status,last activity at,subscribed at,"
+    "tags,operator,campaign\n"
+    "6255797660,69d4f4f6de814a6fa80793ae,vadiml_smm,Vadim // Head Of SMM,active,"
+    "19/08/2026 14:51:24,07/04/2026 12:13:42,Английский,,promo\n"
+    "8352435188,69d66d7558338d761d0aa433,KseniaS,Ksenia S.,active,"
+    "08/09/2026 15:05:03,08/04/2026 15:00:05,\"Английский,Арабский\",operator1,\n"
+    "5921763711,69d81c42d8465320de0222f0,,Facundo Quintero,active,"
+    "09/04/2026 21:38:13,09/04/2026 21:38:10,Испанский,,\n"
+    "8209702571,69d66c2c2bc8717ef505a63e,smmadmin,smm_admin,blocked,"
+    "08/04/2026 14:54:36,08/04/2026 14:54:36,,,\n"
+)
+
+
+def test_import_reads_sendpulse_export():
+    """Выгрузка из SendPulse разбирается как есть, без ручной подготовки."""
+    from app import subscriber_import as imp
+
+    rows, problems, cols = imp.parse_rows(SENDPULSE_CSV.encode())
+    assert problems == []
+    assert len(rows) == 4
+    # колонка telegram_id выиграла у общей колонки «id» — это чужой id сервиса
+    assert rows[0]["tg_id"] == 6255797660
+
+    first = rows[0]
+    assert first["username"] == "vadiml_smm"
+    # должность и слэши в имени не режем: «фамилия» тут была бы мусором
+    assert first["first_name"] == "Vadim // Head Of SMM" and first["last_name"] is None
+    assert first["is_active"] is True
+    assert first["created_at"] == datetime(2026, 4, 7, 12, 13, 42)
+    assert first["last_active_at"] == datetime(2026, 8, 19, 14, 51, 24)
+    assert first["tags"] == ["Английский"]
+    # чужие колонки не выбрасываем, а складываем следом в params
+    assert first["params"]["import_id"] == "69d4f4f6de814a6fa80793ae"
+    assert first["params"]["import_campaign"] == "promo"
+    # пустая ячейка ключа не создаёт — незачем хранить пустоту
+    assert "import_operator" not in first["params"]
+    ksenia = next(r for r in rows if r["tg_id"] == 8352435188)
+    assert ksenia["params"]["import_operator"] == "operator1"
+
+    # «Имя Фамилия» из двух простых слов всё-таки разделяем
+    facundo = next(r for r in rows if r["tg_id"] == 5921763711)
+    assert (facundo["first_name"], facundo["last_name"]) == ("Facundo", "Quintero")
+
+    assert next(r for r in rows if r["tg_id"] == 8352435188)["tags"] == ["Английский", "Арабский"]
+    assert next(r for r in rows if r["tg_id"] == 8209702571)["is_active"] is False
+
+
+def test_import_survives_messy_files():
+    """Кривые строки не рушат импорт, а попадают в список проблем."""
+    from app import subscriber_import as imp
+
+    csv_text = (
+        "Telegram ID;Username;Subscribed at\n"
+        "123;alice;2026-04-07\n"
+        "не число;bob;2026-04-07\n"
+        "123;дубль;2026-04-08\n"
+        "\n"
+        "456;;непонятная дата\n"
+    )
+    rows, problems, _ = imp.parse_rows(csv_text.encode())
+    assert [r["tg_id"] for r in rows] == [123, 456]
+    assert any("не число" in p for p in problems)
+    assert any("уже был в файле" in p for p in problems)
+    # дату не разобрали — оставляем пустой, а не выдумываем
+    assert rows[1]["created_at"] is None
+    # пустая строка — не проблема, её просто нет
+    assert len(problems) == 2
+
+    # файл вообще без Telegram ID — понятный отказ
+    with pytest.raises(ValueError) as e:
+        imp.parse_rows(b"name,email\nVasya,v@mail.ru\n")
+    assert "Telegram ID" in str(e.value)
+
+    # Excel любит дописывать «.0» к числам
+    rows, _, _ = imp.parse_rows(b"telegram_id\n6255797660.0\n")
+    assert rows[0]["tg_id"] == 6255797660
+
+    # кириллица в cp1251 тоже читается
+    rows, _, _ = imp.parse_rows("telegram_id,tags\n777,Английский\n".encode("cp1251"))
+    assert rows[0]["tags"] == ["Английский"]
+
+
+@pytest.mark.asyncio
+async def test_import_writes_and_repeats_safely(session):
+    """Повторный импорт того же файла не плодит дублей и не портит живые данные."""
+    from sqlalchemy import func, select
+
+    from app import subscriber_import as imp
+    from app.models import Bot, Subscriber, SubscriberTag, Tag
+
+    b = Bot(name="B", token="t", is_active=True)
+    session.add(b)
+    await session.flush()
+
+    rows, _, _ = imp.parse_rows(SENDPULSE_CSV.encode())
+    res = await imp.apply_rows(session, b.id, rows, update_existing=True)
+    assert res["added"] == 4 and res["updated"] == 0
+
+    subs = (await session.execute(select(Subscriber))).scalars().all()
+    assert len(subs) == 4
+    vadim = next(s for s in subs if s.tg_id == 6255797660)
+    assert vadim.is_subscribed is True          # импортированные подписаны
+    assert vadim.created_at == datetime(2026, 4, 7, 12, 13, 42)
+
+    # теги созданы и привязаны
+    assert {t.name for t in (await session.execute(select(Tag))).scalars()} == {
+        "Английский", "Арабский", "Испанский"}
+    links = (await session.execute(select(func.count()).select_from(SubscriberTag))).scalar()
+    assert links == 4        # 1 + 2 + 1 + 0
+
+    # бот успел узнать настоящее имя — выгрузка не должна его затирать
+    vadim.first_name = "Вадим"
+    vadim.language_code = "ru"
+    await session.flush()
+
+    res2 = await imp.apply_rows(session, b.id, rows, update_existing=True)
+    assert res2["added"] == 0 and res2["updated"] == 4
+    assert (await session.execute(select(func.count()).select_from(Subscriber))).scalar() == 4
+    await session.refresh(vadim)
+    assert vadim.first_name == "Вадим"          # своё не перезаписано
+    assert vadim.language_code == "ru"
+    # теги тоже не задвоились
+    assert (await session.execute(select(func.count()).select_from(SubscriberTag))).scalar() == 4
+
+    # режим «не трогать существующих»
+    res3 = await imp.apply_rows(session, b.id, rows, update_existing=False)
+    assert res3 == {"added": 0, "updated": 0, "skipped": 4,
+                    "tags": ["Английский", "Арабский", "Испанский"]}
+
+
+@pytest.mark.asyncio
+async def test_import_is_per_bot(session):
+    """База привязана к боту: у другого бота те же люди — отдельные записи."""
+    from sqlalchemy import func, select
+
+    from app import subscriber_import as imp
+    from app.models import Bot, Subscriber
+
+    b1 = Bot(name="Первый", token="t1", is_active=True)
+    b2 = Bot(name="Второй", token="t2", is_active=True)
+    session.add_all([b1, b2])
+    await session.flush()
+
+    rows, _, _ = imp.parse_rows(b"telegram_id\n111\n222\n")
+    await imp.apply_rows(session, b1.id, rows, True)
+    await imp.apply_rows(session, b2.id, rows, True)
+
+    assert (await session.execute(select(func.count()).select_from(Subscriber))).scalar() == 4
+    for bot in (b1, b2):
+        got = (await session.execute(select(Subscriber).where(
+            Subscriber.bot_id == bot.id))).scalars().all()
+        assert sorted(s.tg_id for s in got) == [111, 222]
+
+
 @pytest.mark.asyncio
 async def test_subscribers_isolated_per_bot(session):
     from app.bot import runner
