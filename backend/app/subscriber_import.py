@@ -27,6 +27,30 @@ from .models import Subscriber, SubscriberTag, Tag
 
 log = logging.getLogger("sendbot.import")
 
+
+def insert_ignore(session, model, conflict_on: list):
+    """INSERT, который молча пропускает уже существующие строки.
+
+    Импорт большой базы уходит на сервер частями, и части перекрываются чаще,
+    чем кажется: человек нажал «Импортировать» дважды, браузер повторил
+    оборвавшийся запрос, файл залили заново после ошибки. Проверять «а нет ли
+    уже такой строки» отдельным запросом бесполезно — между проверкой и
+    вставкой успевает вклиниться соседний запрос, и вставка всё равно падает на
+    уникальном индексе. Ровно так весь импорт и обрывался: «duplicate key value
+    violates unique constraint "tags_name_key"», тег «Австрийский» уже был.
+
+    Пусть решает база: она умеет это атомарно, без гонок.
+    """
+    name = getattr(getattr(getattr(session, "bind", None), "dialect", None), "name", "")
+    if name == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert as _ins
+    elif name == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert as _ins
+    else:
+        return insert(model)          # незнакомая база — как раньше
+    return _ins(model).on_conflict_do_nothing(index_elements=conflict_on)
+
+
 # Сколько строк держим в памяти между сбросами в базу. На 400 тысячах строк
 # построчная запись заняла бы часы, а разом всё не влезет.
 CHUNK = 1000
@@ -209,15 +233,14 @@ async def apply_rows(session, bot_id: int, rows: list, update_existing: bool) ->
     wanted = {t for r in rows for t in r["tags"]}
     tag_ids = {}
     if wanted:
-        have = {t.name: t.id for t in (await session.execute(
+        # Сначала пробуем добавить все недостающие разом, разрешая базе
+        # пропустить те, что уже есть. Потом читаем id — и свои, и чужие.
+        await session.execute(
+            insert_ignore(session, Tag, ["name"]),
+            [{"name": n, "created_at": _dt.utcnow()} for n in sorted(wanted)])
+        await session.flush()
+        tag_ids = {t.name: t.id for t in (await session.execute(
             select(Tag).where(Tag.name.in_(wanted)))).scalars()}
-        for name in sorted(wanted):
-            if name not in have:
-                tag = Tag(name=name)
-                session.add(tag)
-                await session.flush()
-                have[name] = tag.id
-        tag_ids = have
 
     for start in range(0, len(rows), CHUNK):
         chunk = rows[start:start + CHUNK]
@@ -264,7 +287,8 @@ async def apply_rows(session, bot_id: int, rows: list, update_existing: bool) ->
             touched.append((sub.id, r))
 
         if to_insert:
-            await session.execute(insert(Subscriber), to_insert)
+            await session.execute(
+                insert_ignore(session, Subscriber, ["bot_id", "tg_id"]), to_insert)
         await session.flush()
 
         # теги вешаем только тем строкам, которые реально трогали
@@ -291,7 +315,9 @@ async def apply_rows(session, bot_id: int, rows: list, update_existing: bool) ->
                             links.append({"subscriber_id": sid, "tag_id": tid})
                             already.add((sid, tid))
             if links:
-                await session.execute(insert(SubscriberTag), links)
+                await session.execute(
+                    insert_ignore(session, SubscriberTag, ["subscriber_id", "tag_id"]),
+                    links)
                 await session.flush()
 
     log.info("Импорт в бота #%s: добавлено %s, обновлено %s, пропущено %s",

@@ -917,6 +917,32 @@ function importPreviewHtml(d, file) {
     </div>`;
 }
 
+// Строки CSV с учётом кавычек: внутри «"…"» перенос — часть значения,
+// а не конец строки. Резать по \n напрямую нельзя — порвём запись пополам.
+function csvLines(text) {
+  const out = [];
+  let start = 0, quoted = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === '"') {
+      if (quoted && text[i + 1] === '"') { i++; continue; }   // экранированная кавычка
+      quoted = !quoted;
+    } else if (!quoted && (ch === '\n' || ch === '\r')) {
+      if (i > start) out.push(text.slice(start, i));
+      if (ch === '\r' && text[i + 1] === '\n') i++;
+      start = i + 1;
+    }
+  }
+  if (start < text.length) out.push(text.slice(start));
+  return out;
+}
+
+// Сколько строк отправляем за один запрос. Целиком большой файл слать нельзя:
+// один долгий запрос упирается в таймаут и обрывается на полпути — браузер
+// показывает «Failed to fetch», а что успело записаться, непонятно. Частями
+// каждый запрос короткий, видно прогресс, и обрыв не теряет всё разом.
+const IMPORT_CHUNK = 4000;
+
 async function importApply() {
   if (!IMPORT_FILE) { alert('Сначала выберите файл'); return; }
   const botId = document.getElementById('imp-bot').value;
@@ -924,28 +950,55 @@ async function importApply() {
   if (!confirm(`Импортировать в бота «${botName}»?`)) return;
 
   const status = document.getElementById('imp-status');
-  status.textContent = 'Импортирую… на большой базе это может занять минуту';
+  const btn = document.querySelector('#imp-result .btn.primary');
+  if (btn) btn.disabled = true;
+
   try {
-    const fd = new FormData();
-    fd.append('file', IMPORT_FILE);
-    fd.append('bot_id', botId);
-    fd.append('update_existing', document.getElementById('imp-update').value);
-    const r = await fetch('/api/subscribers/import', {
-      method: 'POST', headers: { Authorization: 'Bearer ' + TOKEN }, body: fd,
-    });
-    const d = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(d.detail || 'Импорт не прошёл');
+    const text = await IMPORT_FILE.text();
+    const lines = csvLines(text);
+    const header = lines[0];
+    const body = lines.slice(1);
+    const total = body.length;
+    const totals = { added: 0, updated: 0, skipped: 0, problems_total: 0 };
+
+    for (let from = 0; from < total; from += IMPORT_CHUNK) {
+      const part = [header, ...body.slice(from, from + IMPORT_CHUNK)].join('\n');
+      status.textContent = `Импортирую… ${Math.min(from + IMPORT_CHUNK, total).toLocaleString('ru')}`
+        + ` из ${total.toLocaleString('ru')}`;
+
+      const fd = new FormData();
+      fd.append('file', new Blob([part], { type: 'text/csv' }), 'part.csv');
+      fd.append('bot_id', botId);
+      fd.append('update_existing', document.getElementById('imp-update').value);
+      const r = await fetch('/api/subscribers/import', {
+        method: 'POST', headers: { Authorization: 'Bearer ' + TOKEN }, body: fd,
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        throw new Error((d.detail || 'Импорт не прошёл')
+          + `\n\nОборвалось на строках ${from + 1}–${Math.min(from + IMPORT_CHUNK, total)}.`
+          + ` Раньше добавлено: ${totals.added}. Повторный импорт того же файла`
+          + ` дублей не создаст — можно просто запустить заново.`);
+      }
+      totals.added += d.added;
+      totals.updated += d.updated;
+      totals.skipped += d.skipped;
+      totals.problems_total += d.problems_total || 0;
+    }
+
     status.textContent = '';
     document.getElementById('imp-result').innerHTML = `
       <div class="panel" style="margin-top:12px">
-        <b>Готово.</b> Добавлено: ${d.added}, обновлено: ${d.updated}, пропущено: ${d.skipped}.
-        ${d.problems_total ? `Строк с проблемами: ${d.problems_total}.` : ''}
+        <b>Готово.</b> Добавлено: ${totals.added}, обновлено: ${totals.updated},
+        пропущено: ${totals.skipped}.
+        ${totals.problems_total ? `Строк с проблемами: ${totals.problems_total}.` : ''}
       </div>`;
     IMPORT_FILE = null;
     await loadTags(true);
     await loadSubscribers();
   } catch (e) {
     status.textContent = '';
+    if (btn) btn.disabled = false;
     alert(e.message);
   }
 }

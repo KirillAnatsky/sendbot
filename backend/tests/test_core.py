@@ -1491,6 +1491,64 @@ async def test_import_writes_and_repeats_safely(session):
 
 
 @pytest.mark.asyncio
+async def test_import_survives_collisions(session):
+    """Тот самый обвал на 34 тысячах строк.
+
+    Импорт большой базы идёт частями, и части перекрываются: повторный запрос
+    браузера, второй клик, залитый заново файл. Раньше код сначала спрашивал
+    «а нет ли уже такого тега», потом вставлял — и падал на уникальном индексе
+    («duplicate key ... tags_name_key», тег «Австрийский» уже был), унося с
+    собой весь импорт. Вставка должна пропускать существующее, а не падать.
+    """
+    from sqlalchemy import func, select
+
+    from app import subscriber_import as imp
+    from app.models import Bot, Subscriber, SubscriberTag, Tag
+
+    b = Bot(name="B", token="t", is_active=True)
+    session.add(b)
+    await session.flush()
+
+    # Тег уже существует — создан руками в интерфейсе или прошлой частью
+    session.add(Tag(name="Австрийский"))
+    await session.flush()
+
+    # 1. Ровно то место, где всё рвалось: вставка строки, которая уже есть.
+    # С обычным INSERT это IntegrityError и конец импорта.
+    await session.execute(
+        imp.insert_ignore(session, Tag, ["name"]),
+        [{"name": "Австрийский", "created_at": datetime(2026, 9, 16)}])
+    await session.flush()
+
+    # и страховка от тихого отката: если session.bind однажды перестанет
+    # отдавать диалект, insert_ignore выродится в обычный INSERT незаметно
+    assert "ON CONFLICT" in str(imp.insert_ignore(session, Tag, ["name"]).compile()).upper(), (
+        "insert_ignore откатился в обычный INSERT — импорт снова будет падать")
+
+    # 2. Теперь целиком: файл с этим тегом заезжает в базу
+
+    csv = ("telegram_id,tags\n"
+           "111,\"Австрийский,Немецкий\"\n"
+           "222,Австрийский\n").encode()
+    rows, _, _ = imp.parse_rows(csv)
+    res = await imp.apply_rows(session, b.id, rows, update_existing=True)
+    assert res["added"] == 2
+
+    # существующий тег переиспользован, а не задвоен
+    names = sorted(t.name for t in (await session.execute(select(Tag))).scalars())
+    assert names == ["Австрийский", "Немецкий"]
+
+    # 3. Та же часть приезжает второй раз — ни падения, ни дублей
+    await imp.apply_rows(session, b.id, rows, update_existing=True)
+    assert (await session.execute(
+        select(func.count()).select_from(Subscriber))).scalar() == 2
+    assert (await session.execute(
+        select(func.count()).select_from(Tag))).scalar() == 2
+    assert (await session.execute(
+        select(func.count()).select_from(SubscriberTag))).scalar() == 3   # 2 + 1
+
+
+@pytest.mark.asyncio
 async def test_import_is_per_bot(session):
     """База привязана к боту: у другого бота те же люди — отдельные записи."""
     from sqlalchemy import func, select

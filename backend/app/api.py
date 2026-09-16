@@ -3,6 +3,7 @@ import re
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from sqlalchemy import case, delete, func, select
 from sqlalchemy.orm.attributes import flag_modified
@@ -1355,7 +1356,7 @@ async def subscribers_import_preview(bot_id: int = Form(...), file: UploadFile =
     await ensure_bot_access(user, bot_id)
     blob = await _read_import(file)
     try:
-        rows, problems, cols = imp.parse_rows(blob)
+        rows, problems, cols = await run_in_threadpool(imp.parse_rows, blob)
     except ValueError as e:
         raise HTTPException(400, str(e))
     if not rows:
@@ -1398,7 +1399,9 @@ async def subscribers_import(bot_id: int = Form(...), file: UploadFile = File(..
     await ensure_bot_access(user, bot_id)
     blob = await _read_import(file)
     try:
-        rows, problems, _cols = imp.parse_rows(blob)
+        # разбор CSV — обычный синхронный код; в потоке, чтобы на время
+        # импорта не вставал весь сервер вместе с ботами
+        rows, problems, _cols = await run_in_threadpool(imp.parse_rows, blob)
     except ValueError as e:
         raise HTTPException(400, str(e))
     if not rows:
