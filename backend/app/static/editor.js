@@ -637,19 +637,31 @@ function addBlockAt(type, x, y) {
 
 // клик по палитре — как раньше, блок появляется в видимой части холста
 function addBlock(type) {
-  const x = (-editor.canvas_x + 260 + Math.random() * 120) / (editor.zoom || 1);
-  const y = (-editor.canvas_y + 120 + Math.random() * 200) / (editor.zoom || 1);
-  addBlockAt(type, x, y);
+  const rect = document.getElementById('drawflow').getBoundingClientRect();
+  const p = screenToCanvas(rect.left + 260 + Math.random() * 120,
+                           rect.top + 120 + Math.random() * 200);
+  addBlockAt(type, p.x, p.y);
+}
+
+// Точка экрана -> координаты холста Drawflow.
+//
+// Холст сдвигается и масштабируется CSS-трансформом
+// translate(canvas_x, canvas_y) scale(zoom), а масштаб идёт от ЦЕНТРА
+// холста (transform-origin по умолчанию), не от левого верхнего угла.
+// Раньше формула этого не учитывала: на 100% всё совпадало, а стоило
+// отдалить или приблизить холст — блок из палитры падал в сторону центра,
+// хотя отпускали его в другом месте. Поэтому считаем от фактического
+// положения холста на экране: его левый верхний угол уже учитывает и
+// сдвиг, и масштаб с любым центром — так же считает и сам Drawflow.
+function screenToCanvas(clientX, clientY) {
+  const pre = editor.precanvas.getBoundingClientRect();
+  const z = editor.zoom || 1;
+  return { x: (clientX - pre.left) / z, y: (clientY - pre.top) / z };
 }
 
 // координаты мыши -> координаты холста Drawflow (с учётом сдвига и зума)
 function canvasPoint(e) {
-  const rect = document.getElementById('drawflow').getBoundingClientRect();
-  const z = editor.zoom || 1;
-  return {
-    x: (e.clientX - rect.left - editor.canvas_x) / z,
-    y: (e.clientY - rect.top - editor.canvas_y) / z,
-  };
+  return screenToCanvas(e.clientX, e.clientY);
 }
 
 // перетаскивание из палитры: блок создаётся там, где отпустили

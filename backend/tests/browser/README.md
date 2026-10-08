@@ -86,3 +86,16 @@ node layout.test.js
 cd backend/tests/browser
 node import_chunks.test.js
 ```
+
+## palette_drop.test.js — блок из палитры падает под курсор
+
+Перетащенный из палитры блок обязан встать туда, где его отпустили, при любом
+масштабе и сдвиге холста. Раньше на 100% всё совпадало, а на отдалённом или
+приближенном холсте блок уезжал к центру: холст масштабируется от своего
+центра, а пересчёт координат считал от угла. Гоняется на настоящем Drawflow.
+
+```
+cd backend/tests/browser
+npm i playwright drawflow@0.0.60
+node palette_drop.test.js
+```
