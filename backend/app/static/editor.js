@@ -53,8 +53,10 @@ function nodeHtml(type, data) {
       btnsHtml = `<div class="df-btns">` + buttons.map(b => {
         const st = b.style ? ` st-${b.style}` : '';
         const off = b.disabled ? ' st-off' : '';
-        if (b.url) return `<div class="df-btn url${st}${off}">🔗 ${esc(b.label || 'ссылка')}</div>`;
-        return `<div class="df-btn${st}${off}"><span class="df-btn-port">${port++}</span>${esc(b.label || 'кнопка')}</div>`;
+        const icon = b.icon_custom_emoji_id && typeof emojiIconHtml === 'function'
+          ? emojiIconHtml(b.icon_custom_emoji_id) + ' ' : '';
+        if (b.url) return `<div class="df-btn url${st}${off}">🔗 ${icon}${esc(b.label || 'ссылка')}</div>`;
+        return `<div class="df-btn${st}${off}"><span class="df-btn-port">${port++}</span>${icon}${esc(b.label || 'кнопка')}</div>`;
       }).join('') + `</div>`;
     }
     // Номер шага ставим пустым: настоящий проставит refreshStepNumbers, когда
@@ -1059,6 +1061,7 @@ const BTN_STYLES = [
 function btnRow(b, i) {
   return `<div class="btn-row">
     <div class="btn-row-item">
+      ${btnIconPicker(b.icon_custom_emoji_id)}
       <input placeholder="Текст кнопки" class="p-btn-label" value="${esc(b.label || '')}">
       <button class="btn danger" title="убрать кнопку"
         onclick="this.closest('.btn-row').remove();scheduleAutoApply()">✕</button>
@@ -1095,6 +1098,8 @@ function applyProps() {
       };
       const style = row.querySelector('.p-btn-style').value;
       if (style) b.style = style;
+      const icon = row.querySelector('.btn-icon-pick').dataset.icon;
+      if (icon) b.icon_custom_emoji_id = icon;
       if (row.querySelector('.p-btn-disabled').checked) b.disabled = true;
       return b;
     }).filter(b => b.label);

@@ -2178,3 +2178,342 @@ async def test_sheets_rejects_bad_key():
         await get_access_token({"foo": "bar"})
     assert "client_email" in str(e.value)
     assert "сервисного аккаунта" in str(e.value)
+
+
+# ---------- премиум-эмодзи ----------
+
+def test_emoji_set_link_parsing():
+    from app.bot.premium_emoji import parse_set_name
+
+    assert parse_set_name("https://t.me/addemoji/RestrictedEmoji") == "RestrictedEmoji"
+    assert parse_set_name("t.me/addemoji/Some_Set/") == "Some_Set"
+    assert parse_set_name("tg://addemoji?set=abc") == "abc"
+    assert parse_set_name("  plain_name ") == "plain_name"
+    assert parse_set_name("https://t.me/addstickers/Pack") == "Pack"  # тип проверит Telegram
+    assert parse_set_name("https://example.com/addemoji/x") is None
+    assert parse_set_name("") is None
+
+
+def test_strip_tg_emoji():
+    from app.bot.premium_emoji import strip_tg_emoji
+
+    html = 'Привет <tg-emoji emoji-id="5368324170671202286">🔥</tg-emoji> и <b><tg-emoji emoji-id="1">🎁</tg-emoji></b>'
+    assert strip_tg_emoji(html) == "Привет 🔥 и <b>🎁</b>"
+    assert strip_tg_emoji(None) is None
+
+
+def _premium_msg(**kw):
+    from aiogram.methods import SendMessage
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+        text="Жми", url="https://x.y", icon_custom_emoji_id="555")]])
+    return SendMessage(chat_id=1, text='Акция <tg-emoji emoji-id="777">🎁</tg-emoji>',
+                       reply_markup=kb, **kw)
+
+
+async def test_emoji_guard_retries_without_premium():
+    """Telegram отверг премиум-эмодзи — то же сообщение уходит без них."""
+    from aiogram.exceptions import TelegramBadRequest
+
+    from app.bot.premium_emoji import PremiumEmojiGuard, emoji_report
+
+    sent = []
+
+    async def make_request(bot, method):
+        sent.append(method)
+        if "<tg-emoji" in method.text or method.reply_markup.inline_keyboard[0][0].icon_custom_emoji_id:
+            raise TelegramBadRequest(method=method, message="Bad Request: custom emoji not allowed")
+        return "ok"
+
+    report = []
+    tok = emoji_report.set(report)
+    try:
+        res = await PremiumEmojiGuard()(make_request, None, _premium_msg())
+    finally:
+        emoji_report.reset(tok)
+    assert res == "ok"
+    assert len(sent) == 2
+    assert sent[1].text == "Акция 🎁"
+    assert sent[1].reply_markup.inline_keyboard[0][0].icon_custom_emoji_id is None
+    assert sent[1].reply_markup.inline_keyboard[0][0].url == "https://x.y"
+    assert report and report[0]["kind"] == "rejected"
+
+
+async def test_emoji_guard_other_errors_are_not_masked():
+    """Ошибка не из-за эмодзи — после одного повтора отдаётся как есть."""
+    import pytest
+    from aiogram.exceptions import TelegramBadRequest
+
+    from app.bot.premium_emoji import PremiumEmojiGuard
+
+    calls = []
+
+    async def make_request(bot, method):
+        calls.append(method)
+        raise TelegramBadRequest(method=method, message="Bad Request: chat not found")
+
+    with pytest.raises(TelegramBadRequest):
+        await PremiumEmojiGuard()(make_request, None, _premium_msg())
+    assert len(calls) == 2
+
+
+async def test_emoji_guard_plain_messages_untouched_and_downgrade_noticed():
+    from aiogram.methods import SendMessage
+    from aiogram.types import MessageEntity
+
+    from app.bot.premium_emoji import PremiumEmojiGuard, emoji_report
+
+    class Msg:
+        message_id = 5
+        entities = []
+        caption_entities = None
+
+    calls = []
+
+    async def make_request(bot, method):
+        calls.append(method)
+        return Msg()
+
+    plain = SendMessage(chat_id=1, text="<b>просто</b> текст 🎁")
+    assert isinstance(await PremiumEmojiGuard()(make_request, None, plain), Msg)
+    assert calls == [plain]          # без премиум-эмодзи — ни копий, ни проверок
+
+    report = []
+    tok = emoji_report.set(report)
+    try:
+        await PremiumEmojiGuard()(make_request, None, _premium_msg())
+    finally:
+        emoji_report.reset(tok)
+    assert [r["kind"] for r in report] == ["downgraded"]
+
+    Msg.entities = [MessageEntity(type="custom_emoji", offset=6, length=2, custom_emoji_id="777")]
+    report = []
+    tok = emoji_report.set(report)
+    try:
+        await PremiumEmojiGuard()(make_request, None, _premium_msg())
+    finally:
+        emoji_report.reset(tok)
+    assert report == []
+
+
+async def test_emoji_guard_media_group_captions():
+    from aiogram.methods import SendMediaGroup
+    from aiogram.types import InputMediaPhoto
+
+    from app.bot.premium_emoji import method_uses_premium, strip_method
+
+    m = SendMediaGroup(chat_id=1, media=[
+        InputMediaPhoto(media="a", caption='x <tg-emoji emoji-id="9">⭐</tg-emoji>'),
+        InputMediaPhoto(media="b"),
+    ])
+    assert method_uses_premium(m)
+    s = strip_method(m)
+    assert s.media[0].caption == "x ⭐" and s.media[1].media == "b"
+    assert not method_uses_premium(s)
+
+
+async def test_emoji_set_import(tmp_path):
+    """Набор забирается целиком, миниатюры ложатся в media/emoji/."""
+    import pytest
+    from types import SimpleNamespace as NS
+
+    from app.bot.premium_emoji import fetch_set
+
+    class FakeBot:
+        def __init__(self, sticker_type="custom_emoji"):
+            self.sticker_type = sticker_type
+            self.downloaded = []
+
+        async def get_sticker_set(self, name):
+            return NS(name=name, title="Подарки", sticker_type=self.sticker_type, stickers=[
+                NS(custom_emoji_id="1", emoji="🎁", file_id="f1", is_animated=True,
+                   is_video=False, thumbnail=NS(file_id="t1")),
+                NS(custom_emoji_id="2", emoji="🔥", file_id="f2", is_animated=False,
+                   is_video=False, thumbnail=None),        # статичная: берём сам файл
+                NS(custom_emoji_id="3", emoji="✨", file_id="f3", is_animated=True,
+                   is_video=False, thumbnail=None),        # tgs без миниатюры: без картинки
+            ])
+
+        async def download(self, file_id, destination):
+            self.downloaded.append(file_id)
+            destination.write_bytes(b"RIFF....WEBP")
+
+    bot = FakeBot()
+    data = await fetch_set(bot, "Gifts", tmp_path)
+    assert data["title"] == "Подарки"
+    assert [(i["emoji_id"], i["emoji"], i["has_thumb"]) for i in data["items"]] == [
+        ("1", "🎁", True), ("2", "🔥", True), ("3", "✨", False)]
+    assert sorted(bot.downloaded) == ["f2", "t1"]
+    assert (tmp_path / "emoji" / "1.webp").is_file()
+
+    # второй раз уже скачанное не тянем
+    bot.downloaded.clear()
+    await fetch_set(bot, "Gifts", tmp_path)
+    assert bot.downloaded == []
+
+    with pytest.raises(ValueError, match="набор стикеров"):
+        await fetch_set(FakeBot("regular"), "Pack", tmp_path)
+
+
+async def test_broadcast_buttons_keep_only_numeric_icon():
+    from app.api import _clean_broadcast_buttons
+
+    out = _clean_broadcast_buttons([
+        {"label": "a", "url": "https://x", "icon_custom_emoji_id": "5368324170671202286"},
+        {"label": "b", "url": "https://x", "icon_custom_emoji_id": "<script>"},
+    ])
+    assert out[0]["icon_custom_emoji_id"] == "5368324170671202286"
+    assert "icon_custom_emoji_id" not in out[1]
+
+
+# ---------- причины недоставки рассылки ----------
+
+def test_delivery_error_classification():
+    from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError
+    from aiogram.methods import SendMessage
+
+    from app.bot.delivery import classify
+
+    m = SendMessage(chat_id=1, text="x")
+    cases = [
+        (TelegramForbiddenError(m, "Forbidden: bot was blocked by the user"), "blocked"),
+        (TelegramForbiddenError(m, "Forbidden: user is deactivated"), "deactivated"),
+        (TelegramForbiddenError(m, "Forbidden: bot can't initiate conversation with a user"), "chat_not_found"),
+        (TelegramBadRequest(m, "Bad Request: chat not found"), "chat_not_found"),
+        (TelegramBadRequest(m, "Bad Request: PEER_ID_INVALID"), "chat_not_found"),
+        (TelegramBadRequest(m, "Bad Request: wrong file identifier/HTTP URL specified"), "media"),
+        (TelegramBadRequest(m, "Bad Request: can't parse entities: unclosed tag"), "bad_request"),
+        (TelegramNetworkError(m, "Request timeout error"), "network"),
+        (RuntimeError("что-то странное"), "other"),
+    ]
+    for exc, code in cases:
+        assert classify(exc)[0] == code, (exc, code)
+
+
+async def test_broadcast_stores_failure_reasons(session, monkeypatch):
+    """Рассылка сохраняет причину у каждого недошедшего, недостижимых
+    помечает неактивными, а разбивка видна в карточке."""
+    from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+    from aiogram.methods import SendMessage
+    from sqlalchemy import select
+
+    from app.api import broadcast_detail
+    from app.bot import runner
+    from app.models import Bot, Broadcast, BroadcastRecipient, Subscriber
+
+    b = Bot(name="B", token="t", is_active=True)
+    session.add(b)
+    await session.flush()
+    subs = [Subscriber(bot_id=b.id, tg_id=tg, first_name=f"S{tg}", is_active=True) for tg in range(1, 7)]
+    session.add_all(subs)
+    bc = Broadcast(bot_id=b.id, name="Акция", text="hi", filters={"segment": {}}, status="running")
+    session.add(bc)
+    await session.commit()
+
+    m = SendMessage(chat_id=1, text="x")
+    errors = {
+        2: TelegramForbiddenError(m, "Forbidden: bot was blocked by the user"),
+        3: TelegramForbiddenError(m, "Forbidden: bot was blocked by the user"),
+        4: TelegramBadRequest(m, "Bad Request: chat not found"),
+        5: TelegramBadRequest(m, "Bad Request: message is too long"),
+    }
+
+    class FakeBot:
+        async def send_message(self, chat_id, *a, **k):
+            if chat_id in errors:
+                raise errors[chat_id]
+            return type("M", (), {"message_id": 1})()
+
+    monkeypatch.setattr(runner.settings, "broadcast_rate", 1000.0)
+    await runner._process_broadcast(session, FakeBot(), bc)
+    await session.commit()
+
+    rows = {r.subscriber_id: r for r in (await session.execute(select(BroadcastRecipient))).scalars()}
+    by_tg = {s.tg_id: s for s in subs}
+    assert rows[by_tg[1].id].delivered and rows[by_tg[1].id].error_code is None
+    assert rows[by_tg[2].id].error_code == "blocked"
+    assert rows[by_tg[4].id].error_code == "chat_not_found"
+    assert rows[by_tg[5].id].error_code == "bad_request"
+    assert "too long" in rows[by_tg[5].id].error_text
+    assert rows[by_tg[2].id].error_text is None      # понятным причинам текст не нужен
+    for s in subs:
+        await session.refresh(s)
+    # недостижимые больше не получают рассылки; «плохое сообщение» — не вина человека
+    assert [s.is_active for s in subs] == [True, False, False, False, True, True]
+    assert (bc.sent, bc.failed, bc.total) == (2, 4, 6)
+
+    d = await broadcast_detail(bc.id, _user("owner"), session)
+    got = {r["code"]: (r["count"], r["pct"]) for r in d["reasons"]}
+    assert got == {"blocked": (2, 50.0), "chat_not_found": (1, 25.0), "bad_request": (1, 25.0)}
+    assert d["reasons"][0]["code"] == "blocked"       # крупные сверху
+    assert any("too long" in t for t in d["error_samples"])
+
+    only = await broadcast_detail(bc.id, _user("owner"), session, only_failed=True)
+    assert len(only["recipients"]) == 4 and all(not r["delivered"] for r in only["recipients"])
+    assert {r["reason"] for r in only["recipients"]} >= {"заблокировал бота"}
+
+
+async def test_broadcast_reasons_for_old_broadcasts(session):
+    """У рассылок до учёта причин разбивка строится по статусу подписчика,
+    а аудитория не бывает меньше, чем отправлено + не дошло."""
+    from app.api import broadcast_detail
+    from app.models import Bot, Broadcast, BroadcastRecipient, Subscriber
+
+    b = Bot(name="B", token="t")
+    session.add(b)
+    await session.flush()
+    s1 = Subscriber(bot_id=b.id, tg_id=1, is_active=False)
+    s2 = Subscriber(bot_id=b.id, tg_id=2, is_active=True)
+    s3 = Subscriber(bot_id=b.id, tg_id=3, is_active=True)
+    session.add_all([s1, s2, s3])
+    bc = Broadcast(bot_id=b.id, name="Old", text="x", status="done", total=2, sent=1, failed=2)
+    session.add(bc)
+    await session.flush()
+    session.add_all([
+        BroadcastRecipient(broadcast_id=bc.id, subscriber_id=s1.id, delivered=False),
+        BroadcastRecipient(broadcast_id=bc.id, subscriber_id=s2.id, delivered=False),
+        BroadcastRecipient(broadcast_id=bc.id, subscriber_id=s3.id, delivered=True),
+    ])
+    await session.commit()
+
+    d = await broadcast_detail(bc.id, _user("owner"), session)
+    assert {r["code"]: r["count"] for r in d["reasons"]} == {"legacy_inactive": 1, "legacy_unknown": 1}
+    assert d["total"] == 3
+
+
+async def test_broadcast_resume_keeps_audience(session, monkeypatch):
+    """После обрыва аудитория = уже обработанные + оставшиеся, даже если
+    часть обработанных за это время стала неактивной."""
+    from sqlalchemy import select
+
+    from app.bot import runner
+    from app.models import Bot, Broadcast, BroadcastRecipient, Subscriber
+
+    b = Bot(name="B", token="t", is_active=True)
+    session.add(b)
+    await session.flush()
+    subs = [Subscriber(bot_id=b.id, tg_id=tg, is_active=True) for tg in range(1, 5)]
+    session.add_all(subs)
+    bc = Broadcast(bot_id=b.id, name="R", text="hi", filters={"segment": {}}, status="running",
+                   sent=1, failed=1)
+    session.add(bc)
+    await session.flush()
+    # первые двое уже обработаны до обрыва, второй заблокировал бота
+    subs[1].is_active = False
+    session.add_all([
+        BroadcastRecipient(broadcast_id=bc.id, subscriber_id=subs[0].id, delivered=True),
+        BroadcastRecipient(broadcast_id=bc.id, subscriber_id=subs[1].id, delivered=False,
+                           error_code="blocked"),
+    ])
+    await session.commit()
+
+    class FakeBot:
+        async def send_message(self, *a, **k):
+            return type("M", (), {"message_id": 1})()
+
+    monkeypatch.setattr(runner.settings, "broadcast_rate", 1000.0)
+    await runner._process_broadcast(session, FakeBot(), bc)
+    assert (bc.total, bc.sent, bc.failed) == (4, 3, 1)
+    n = len((await session.execute(select(BroadcastRecipient))).scalars().all())
+    assert n == 4

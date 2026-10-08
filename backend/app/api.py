@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
-from sqlalchemy import case, delete, func, select
+from sqlalchemy import case, delete, func, literal_column, select
 from sqlalchemy.orm.attributes import flag_modified
 
 from . import ai, exports, segment
@@ -23,6 +23,7 @@ from .models import (
     Broadcast,
     BroadcastRecipient,
     ButtonClick,
+    CustomEmoji,
     Funnel,
     FunnelBot,
     FunnelRun,
@@ -1986,6 +1987,101 @@ async def upload_media(file: UploadFile):
     return {"path": f"media/{fname}", "kind": kind, "name": orig}
 
 
+# ---------- библиотека премиум-эмодзи ----------
+# Telegram не даёт выбрать премиум-эмодзи из браузера — в сообщение нужен их
+# числовой id. Поэтому наборы забираются целиком по ссылке t.me/addemoji/…,
+# а в редакторе из них выбирают кнопкой ✨.
+
+def _emoji_public(e: CustomEmoji) -> dict:
+    return {"id": e.id, "emoji_id": e.emoji_id, "emoji": e.emoji,
+            "set_name": e.set_name, "set_title": e.set_title,
+            "thumb": f"/media/emoji/{e.emoji_id}.webp" if e.has_thumb else None}
+
+
+@router.get("/emoji", dependencies=[Depends(require_auth)])
+async def list_emoji(session=Depends(get_session)):
+    rows = (await session.execute(select(CustomEmoji).order_by(
+        CustomEmoji.created_at, CustomEmoji.set_name, CustomEmoji.position))).scalars().all()
+    return [_emoji_public(e) for e in rows]
+
+
+class EmojiImportIn(BaseModel):
+    link: str
+
+
+async def _bot_for_lookup(session):
+    """Любой бот, через которого можно спросить Telegram про набор.
+
+    Наборы эмодзи общие для всего Telegram, поэтому подходит любой бот
+    проекта. Запущенный — без лишнего соединения; иначе первый с токеном."""
+    from aiogram import Bot as AioBot
+
+    from .bot.runner import manager
+
+    for bot in manager.bots.values():
+        return bot, False
+    b = (await session.execute(select(Bot).where(Bot.token != "").order_by(
+        Bot.is_active.desc(), Bot.id))).scalars().first()
+    if b is None:
+        raise HTTPException(400, "Сначала добавьте бота в разделе «Боты» — "
+                                 "набор эмодзи запрашивается через него")
+    try:
+        return AioBot(token=b.token), True
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(400, f"У бота «{b.name}» некорректный токен") from e
+
+
+@router.post("/emoji/import", dependencies=[Depends(require_any_editor)])
+async def import_emoji_set(body: EmojiImportIn, session=Depends(get_session)):
+    """Забрать набор целиком по ссылке t.me/addemoji/<имя>."""
+    from .bot.premium_emoji import fetch_set, parse_set_name
+    from .config import settings
+
+    name = parse_set_name(body.link)
+    if not name:
+        raise HTTPException(400, "Нужна ссылка на набор эмодзи вида "
+                                 "https://t.me/addemoji/НазваниеНабора")
+    bot, temp = await _bot_for_lookup(session)
+    try:
+        data = await fetch_set(bot, name, settings.media_dir)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except Exception as e:  # noqa: BLE001
+        log.warning("Импорт набора эмодзи %s: %s", name, e)
+        raise HTTPException(502, f"Telegram не ответил: {e}") from e
+    finally:
+        if temp:
+            await bot.session.close()
+
+    have = {e.emoji_id: e for e in (await session.execute(select(CustomEmoji).where(
+        CustomEmoji.emoji_id.in_([i["emoji_id"] for i in data["items"]])))).scalars()}
+    added = 0
+    for it in data["items"]:
+        e = have.get(it["emoji_id"])
+        if e is None:
+            session.add(CustomEmoji(set_name=data["name"], set_title=data["title"], **it))
+            added += 1
+        else:
+            # повторный импорт освежает картинки и порядок, дублей не делает
+            e.has_thumb = e.has_thumb or it["has_thumb"]
+            e.emoji = it["emoji"]
+            e.position = it["position"]
+            e.set_name, e.set_title = data["name"], data["title"]
+    await session.flush()
+    log.info("Набор эмодзи %s: %s шт., новых %s", data["name"], len(data["items"]), added)
+    return {"name": data["name"], "title": data["title"],
+            "total": len(data["items"]), "added": added}
+
+
+@router.delete("/emoji/set/{set_name}",
+               dependencies=[Depends(require_any_editor), Depends(require_delete)])
+async def delete_emoji_set(set_name: str, session=Depends(get_session)):
+    """Убрать набор из библиотеки. Уже отправленные и сохранённые в текстах
+    эмодзи продолжают работать: их id лежат в самом тексте."""
+    r = await session.execute(delete(CustomEmoji).where(CustomEmoji.set_name == set_name))
+    return {"deleted": r.rowcount or 0}
+
+
 @router.post("/ai/extract_docx", dependencies=[Depends(require("ai", "edit"))])
 async def extract_docx(file: UploadFile):
     if not (file.filename or "").lower().endswith(".docx"):
@@ -2251,9 +2347,11 @@ def _clean_broadcast_buttons(raw: list | None) -> list:
                 item["reply"] = reply[:180]   # всплывашка Telegram короткая
         else:
             continue          # ни ссылки, ни тега — кнопке нечего делать
-        for k in ("style", "icon_custom_emoji_id"):
-            if b.get(k):
-                item[k] = str(b[k]).strip()
+        if b.get("style"):
+            item["style"] = str(b["style"]).strip()
+        icon = str(b.get("icon_custom_emoji_id") or "").strip()
+        if icon.isdigit():          # id премиум-эмодзи — всегда число
+            item["icon_custom_emoji_id"] = icon
         if b.get("disabled"):
             item["disabled"] = True
         out.append(item)
@@ -2314,14 +2412,25 @@ async def broadcast_preview(body: BroadcastPreviewIn, user=Depends(current_user)
             400, "Вы ещё не писали этому боту. Откройте его в Telegram, нажмите "
                  "/start и повторите — раньше бот не имеет права вам написать.")
 
+    from .bot.premium_emoji import emoji_report
+
     kb = build_broadcast_keyboard(_clean_broadcast_buttons(body.buttons), 0, sub)
-    ok = await send_message_content(
-        bot, session, sub, body.text, body.media or [], kb,
-        log_history=False, text_first=bool(body.text_first))
+    report = []
+    token = emoji_report.set(report)
+    try:
+        ok = await send_message_content(
+            bot, session, sub, body.text, body.media or [], kb,
+            log_history=False, text_first=bool(body.text_first))
+    finally:
+        emoji_report.reset(token)
     if not ok:
         raise HTTPException(400, "Не удалось отправить — проверьте текст и вложения")
     log.info("Предпросмотр рассылки отправлен пользователю %s", me.login)
-    return {"ok": True}
+    # Премиум-эмодзи — то, что предпросмотр должен проверить в первую
+    # очередь: без Premium у владельца бота они уходят обычными
+    kinds = {r["kind"] for r in report}
+    emoji = "rejected" if "rejected" in kinds else ("downgraded" if "downgraded" in kinds else None)
+    return {"ok": True, "premium_emoji": emoji}
 
 
 @router.get("/broadcasts", dependencies=[Depends(require("broadcasts", "view"))])
@@ -2343,7 +2452,7 @@ async def list_broadcasts(bot_id: int | None = None, user=Depends(current_user),
             "text": b.text,
             "bot": bot_names.get(b.bot_id, "—"),
             "status": b.status,
-            "total": b.total,
+            "total": max(b.total or 0, (b.sent or 0) + (b.failed or 0)),
             "sent": b.sent,
             "failed": b.failed,
             "created_at": b.created_at.isoformat(),
@@ -2354,7 +2463,7 @@ async def list_broadcasts(bot_id: int | None = None, user=Depends(current_user),
 
 @router.get("/broadcasts/{bc_id}", dependencies=[Depends(require("broadcasts", "view"))])
 async def broadcast_detail(bc_id: int, user=Depends(current_user),
-                           session=Depends(get_session)):
+                           session=Depends(get_session), only_failed: bool = False):
     """Карточка рассылки: что отправляли, кому и с каким результатом."""
     bc = await session.get(Broadcast, bc_id)
     if not bc:
@@ -2392,13 +2501,47 @@ async def broadcast_detail(bc_id: int, user=Depends(current_user),
         ).where(BroadcastRecipient.broadcast_id == bc_id)
     )).one()
 
-    # первые 100 получателей — чтобы можно было глазами проверить, кому ушло
+    # Почему не дошло. У рассылок до учёта причин кода нет — тогда судим по
+    # статусу подписчика: заблокировавших рассыльщик и раньше помечал
+    # неактивными, а остальное честно называем «неизвестно».
+    from .bot.delivery import REASONS
+
+    # константы — литералами, а не параметрами: иначе Postgres видит в SELECT
+    # и в GROUP BY разные $1/$2 и отказывается группировать
+    reason_col = func.coalesce(BroadcastRecipient.error_code, case(
+        (Subscriber.is_active == False, literal_column("'legacy_inactive'")),  # noqa: E712
+        else_=literal_column("'legacy_unknown'")))
+    reason_rows = (await session.execute(
+        select(reason_col, func.count())
+        .join(Subscriber, Subscriber.id == BroadcastRecipient.subscriber_id)
+        .where(BroadcastRecipient.broadcast_id == bc_id,
+               BroadcastRecipient.delivered == False)  # noqa: E712
+        .group_by(reason_col)
+    )).all()
+    failed_total = sum(n for _, n in reason_rows) or 0
+    reasons = sorted(
+        ({"code": c, "label": REASONS.get(c, c), "count": n,
+          "pct": round(100 * n / failed_total, 1) if failed_total else 0}
+         for c, n in reason_rows),
+        key=lambda r: -r["count"])
+    # примеры непонятных ошибок — чтобы было с чем идти разбираться
+    samples = [t for (t,) in (await session.execute(
+        select(BroadcastRecipient.error_text)
+        .where(BroadcastRecipient.broadcast_id == bc_id,
+               BroadcastRecipient.error_text.is_not(None))
+        .group_by(BroadcastRecipient.error_text)
+        .order_by(func.count().desc()).limit(5))).all()]
+
+    # первые 100 получателей — чтобы можно было глазами проверить, кому ушло;
+    # с only_failed — только те, кому не дошло, с причиной
+    rq = (select(Subscriber, BroadcastRecipient.delivered, BroadcastRecipient.created_at,
+                 BroadcastRecipient.error_code)
+          .join(BroadcastRecipient, BroadcastRecipient.subscriber_id == Subscriber.id)
+          .where(BroadcastRecipient.broadcast_id == bc_id))
+    if only_failed:
+        rq = rq.where(BroadcastRecipient.delivered == False)  # noqa: E712
     rows = (await session.execute(
-        select(Subscriber, BroadcastRecipient.delivered, BroadcastRecipient.created_at)
-        .join(BroadcastRecipient, BroadcastRecipient.subscriber_id == Subscriber.id)
-        .where(BroadcastRecipient.broadcast_id == bc_id)
-        .order_by(BroadcastRecipient.created_at.desc())
-        .limit(100)
+        rq.order_by(BroadcastRecipient.created_at.desc(), BroadcastRecipient.id.desc()).limit(100)
     )).all()
 
     return {
@@ -2416,7 +2559,9 @@ async def broadcast_detail(bc_id: int, user=Depends(current_user),
         "bot": bot.name if bot else "—",
         "bot_id": bc.bot_id,
         "status": bc.status,
-        "total": bc.total,
+        # у рассылок, переживших рестарт до исправления, аудитория могла
+        # пересчитаться меньше, чем обработано на деле
+        "total": max(bc.total or 0, (bc.sent or 0) + (bc.failed or 0)),
         "sent": bc.sent,
         "failed": bc.failed,
         "delivered": int(delivered or 0),
@@ -2424,15 +2569,20 @@ async def broadcast_detail(bc_id: int, user=Depends(current_user),
         "created_at": bc.created_at.isoformat(),
         "audience_kind": audience_kind,
         "audience": audience,
+        "reasons": reasons,
+        "error_samples": samples,
+        "only_failed": only_failed,
         "recipients": [
             {
                 "id": s.id,
                 "name": (f"{s.first_name or ''} {s.last_name or ''}").strip() or "—",
                 "username": s.username,
                 "delivered": bool(d),
+                "reason": None if d else REASONS.get(
+                    code or ("legacy_inactive" if not s.is_active else "legacy_unknown")),
                 "at": (at or bc.created_at).isoformat(),
             }
-            for s, d, at in rows
+            for s, d, at, code in rows
         ],
     }
 

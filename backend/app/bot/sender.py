@@ -8,6 +8,7 @@ from aiogram.types import DisabledButton, InlineKeyboardButton, InlineKeyboardMa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import Subscriber
+from .delivery import UNREACHABLE, note, note_code
 
 log = logging.getLogger("sendbot.sender")
 
@@ -162,6 +163,22 @@ def build_keyboard(buttons: list, run_id: int, node_id: str, sub: Subscriber | N
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+async def _on_fail(e: Exception, session, sub) -> None:
+    """Неудачная отправка: запомнить причину и, если человек недостижим,
+    больше ему не писать.
+
+    Раньше неактивным помечали только заблокировавших. А «чата нет» (человек
+    не запускал бота — частый случай у импортированной базы) и «аккаунт
+    удалён» оставались активными и снова и снова тратили время каждой
+    рассылки. Написав боту, человек снова станет активным сам."""
+    code = note(e)
+    if code in UNREACHABLE:
+        sub.is_active = False
+        await session.flush()
+    else:
+        log.warning("Не отправилось tg_id=%s: %s", sub.tg_id, e)
+
+
 async def _log_out(session, sub, text, is_operator):
     from ..models import Message
 
@@ -208,12 +225,8 @@ async def send_to_subscriber(
     except TelegramRetryAfter as e:
         await asyncio.sleep(e.retry_after + 1)
         return await send_to_subscriber(bot, session, sub, text, photo_url, keyboard, is_operator)
-    except TelegramForbiddenError:
-        sub.is_active = False
-        await session.flush()
-        return False
     except Exception as e:  # noqa: BLE001
-        log.warning("Не отправилось tg_id=%s: %s", sub.tg_id, e)
+        await _on_fail(e, session, sub)
         return False
 
 
@@ -262,12 +275,8 @@ async def _deliver(coro_factory, bot, session, sub) -> bool:
     except TelegramRetryAfter as e:
         await asyncio.sleep(e.retry_after + 1)
         return await _deliver(coro_factory, bot, session, sub)
-    except TelegramForbiddenError:
-        sub.is_active = False
-        await session.flush()
-        return False
     except Exception as e:  # noqa: BLE001
-        log.warning("Не отправилось tg_id=%s: %s", sub.tg_id, e)
+        await _on_fail(e, session, sub)
         return False
 
 
@@ -305,12 +314,8 @@ async def _deliver_result(coro_factory, bot, session, sub):
     except TelegramRetryAfter as e:
         await asyncio.sleep(e.retry_after + 1)
         return await _deliver_result(coro_factory, bot, session, sub)
-    except TelegramForbiddenError:
-        sub.is_active = False
-        await session.flush()
-        return None
     except Exception as e:  # noqa: BLE001
-        log.warning("Не отправилось tg_id=%s: %s", sub.tg_id, e)
+        await _on_fail(e, session, sub)
         return None
 
 
@@ -438,6 +443,7 @@ async def _send_one(bot, session, sub, kind, items, caption, markup, track=None,
     arg, cache_path = await _media_arg(session, bot_id, m)
     if arg is None:
         log.warning("Файл вложения не найден: %s", m.get("path"))
+        note_code("media", f"файл не найден: {m.get('path')}")
         return False
     html = ParseMode.HTML
     # подпись над вложением просим только там, где Telegram это умеет

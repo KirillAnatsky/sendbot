@@ -26,6 +26,9 @@ from .. import segment as seg
 from . import engine as fx
 from .sender import build_broadcast_keyboard, send_message_content, send_to_subscriber
 
+from .delivery import last_error
+from .premium_emoji import install_guard
+
 log = logging.getLogger("sendbot.bot")
 
 
@@ -69,6 +72,8 @@ class BotManager:
             return
         try:
             bot = Bot(token=token)  # кривой формат токена кидает исключение прямо тут
+            # премиум-эмодзи не прошли — сообщение уходит без них, а не теряется
+            install_guard(bot)
         except Exception as e:  # noqa: BLE001
             log.warning("Бот #%s: некорректный токен: %s", bot_id, e)
             await self._save_error(bot_id, f"некорректный токен: {e}")
@@ -503,10 +508,25 @@ async def _process_broadcast(session, bot, bc: Broadcast):
             q = q.where(Subscriber.id.notin_(
                 select(SubscriberTag.subscriber_id).where(SubscriberTag.tag_id.in_(exclude))))
 
+    # Если рассылку оборвал рестарт — продолжаем с места обрыва. Идём строго
+    # по возрастанию id, поэтому максимальный уже записанный получатель и есть
+    # граница: всё до него разослано.
+    last_id = (await session.execute(
+        select(func.max(BroadcastRecipient.subscriber_id))
+        .where(BroadcastRecipient.broadcast_id == bc.id))).scalar() or 0
+
     # Размер аудитории берём COUNT'ом, а не длиной списка: на 400 тысячах
     # `.all()` притащил бы в память все объекты подписчиков разом.
-    bc.total = (await session.execute(
-        select(func.count()).select_from(q.subquery()))).scalar() or 0
+    # После обрыва аудитория = уже обработанные + оставшиеся. Пересчитать её
+    # заново по активным нельзя: заблокировавшие за это время выпали бы из
+    # «аудитории», и отправлено + не дошло стало бы больше неё.
+    remaining = (await session.execute(select(func.count()).select_from(
+        q.where(Subscriber.id > last_id).subquery()))).scalar() or 0
+    done_already = 0
+    if last_id:
+        done_already = (await session.execute(select(func.count(BroadcastRecipient.id))
+            .where(BroadcastRecipient.broadcast_id == bc.id))).scalar() or 0
+    bc.total = done_already + remaining
     await session.commit()
 
     # медиа: новый формат bc.media, иначе одиночное photo_url (обратная совместимость)
@@ -514,12 +534,6 @@ async def _process_broadcast(session, bot, bc: Broadcast):
     if not media and bc.photo_url:
         media = [{"type": "photo", "path": bc.photo_url}]
 
-    # Если рассылку оборвал рестарт — продолжаем с места обрыва. Идём строго
-    # по возрастанию id, поэтому максимальный уже записанный получатель и есть
-    # граница: всё до него разослано.
-    last_id = (await session.execute(
-        select(func.max(BroadcastRecipient.subscriber_id))
-        .where(BroadcastRecipient.broadcast_id == bc.id))).scalar() or 0
     if last_id:
         log.info("Рассылка «%s»: продолжаю после обрыва, с подписчика #%s", bc.name, last_id)
 
@@ -537,13 +551,17 @@ async def _process_broadcast(session, bot, bc: Broadcast):
         for sub in chunk:
             last_id = sub.id
             kb = build_broadcast_keyboard(bc.buttons or [], bc.id, sub)
+            last_error.set(None)
             ok = await send_message_content(
                 bot, session, sub, bc.text, media, kb,
                 log_history=False, text_first=bool(bc.text_first))
             bc.sent += 1 if ok else 0
             bc.failed += 0 if ok else 1
+            # причину храним, чтобы в карточке было видно, почему не дошло
+            code, text = (last_error.get() or ("other", "")) if not ok else (None, None)
             session.add(BroadcastRecipient(
-                broadcast_id=bc.id, subscriber_id=sub.id, delivered=ok))
+                broadcast_id=bc.id, subscriber_id=sub.id, delivered=ok,
+                error_code=code, error_text=(text or None) if code in ("other", "bad_request", "media") else None))
             since_commit += 1
             if since_commit >= COMMIT_EVERY:
                 await session.commit()

@@ -68,6 +68,8 @@ def _migrate(conn):
     add("broadcasts", "buttons", "buttons JSON")
     add("broadcasts", "text_first", "text_first BOOLEAN DEFAULT FALSE")
     add("broadcast_recipients", "created_at", "created_at TIMESTAMP")
+    add("broadcast_recipients", "error_code", "error_code VARCHAR(24)")
+    add("broadcast_recipients", "error_text", "error_text VARCHAR(200)")
     add("funnels", "is_chain", "is_chain BOOLEAN DEFAULT FALSE")
     add("funnel_runs", "parent_run_id", "parent_run_id INTEGER")
     add("funnel_runs", "return_node", "return_node VARCHAR(32)")

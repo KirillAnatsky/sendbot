@@ -9,6 +9,7 @@ const { chromium } = require('playwright');
 const STATIC = path.join(__dirname, '..', '..', 'app', 'static');
 const DIR = fs.mkdtempSync(path.join(require('os').tmpdir(), 'rt-stand-'));
 fs.copyFileSync(path.join(STATIC, 'richtext.js'), path.join(DIR, 'richtext.js'));
+fs.copyFileSync(path.join(STATIC, 'emoji.js'), path.join(DIR, 'emoji.js'));
 fs.copyFileSync(path.join(__dirname, 'rt_editor.harness.html'), path.join(DIR, 'index.html'));
 
 // путь к Chromium: у Playwright свой, в контейнере — заранее распакованный
@@ -200,6 +201,113 @@ function check(name, got, want) {
 
   check('в тексте не появилось служебных символов направления',
         /[\u200e\u200f\u202a-\u202e\u2066-\u2069]/.test(await html()), false);
+
+  console.log('\n--- 9. Премиум-эмодзи ---');
+
+  const E1 = '<tg-emoji emoji-id="111">🎁</tg-emoji>';
+  const E2 = '<tg-emoji emoji-id="222">🔥</tg-emoji>';
+
+  await page.evaluate(h => RT.setHtml(h), `Акция ${E1} <b>сегодня ${E2}</b>`);
+  check('эмодзи из базы читаются и отдаются без изменений', await html(),
+        `Акция ${E1} <b>сегодня ${E2}</b>`);
+  check('в редакторе это картинки', await page.evaluate(() =>
+        rtArea.querySelectorAll('img.rt-emoji').length), 2);
+  check('у эмодзи без миниатюры — заглушка с обычной эмодзи', await page.evaluate(() =>
+        rtArea.querySelector('img[data-emoji-id="222"]').getAttribute('src').startsWith('data:image/svg')), true);
+
+  // выбор из окна: каретка там, где стояла, эмодзи встаёт ровно туда
+  await scenario(async () => {
+    await type('скидка  сегодня');
+    await page.evaluate(() => {
+      const t = rtArea.firstChild;
+      const r = document.createRange();
+      r.setStart(t, 7); r.collapse(true);
+      getSelection().removeAllRanges(); getSelection().addRange(r);
+      clickBtn('emoji');
+    });
+    await page.waitForSelector('.emoji-cell[data-id="111"]');
+    await page.click('.emoji-cell[data-id="111"]');
+  });
+  check('✨ вставляет эмодзи в место каретки', await html(), `скидка ${E1} сегодня`);
+  check('окно выбора закрылось', await page.evaluate(() => !document.querySelector('.emoji-pop')), true);
+
+  await page.keyboard.type('!');
+  check('печать продолжается сразу после эмодзи', await html(), `скидка ${E1}! сегодня`);
+
+  await page.keyboard.press('Backspace');
+  await page.keyboard.press('Backspace');
+  check('Backspace стирает эмодзи целиком', await html(), 'скидка  сегодня');
+
+  // оформление поверх эмодзи
+  await page.evaluate(h => RT.setHtml(h), `раз ${E1} два`);
+  await page.evaluate(() => {
+    const r = document.createRange();
+    r.selectNodeContents(rtArea);
+    getSelection().removeAllRanges(); getSelection().addRange(r);
+    rtArea.focus();
+    clickBtn('b');
+  });
+  check('жирный захватывает и эмодзи', await html(), `<b>раз ${E1} два</b>`);
+  await page.evaluate(() => {
+    const r = document.createRange();
+    r.selectNodeContents(rtArea);
+    getSelection().removeAllRanges(); getSelection().addRange(r);
+    clickBtn('clear');
+  });
+  check('✕ снимает оформление, эмодзи остаётся', await html(), `раз ${E1} два`);
+
+  // окно открывается и без выделения в поле — эмодзи встаёт в конец
+  await page.evaluate(h => { RT.setHtml(h); document.activeElement.blur(); getSelection().removeAllRanges(); }, 'конец');
+  await page.evaluate(() => clickBtn('emoji'));
+  await page.waitForSelector('.emoji-cell[data-id="222"]');
+  await page.click('.emoji-cell[data-id="222"]');
+  check('без каретки эмодзи встаёт в конец', await html(), `конец${E2}`);
+
+  // мусор и подделки
+  await page.evaluate(() => RT.setHtml('x <tg-emoji emoji-id="abc">🎁</tg-emoji> <img src="y" onerror="window.HACK=1"> <tg-emoji emoji-id="5">&lt;b&gt;</tg-emoji>'));
+  check('id не число — остаётся обычная эмодзи, чужие картинки выброшены',
+        await html(), 'x 🎁  <tg-emoji emoji-id="5">⭐</tg-emoji>');
+  await page.waitForTimeout(100);
+  check('onerror из текста не выполнился', await page.evaluate(() => window.HACK), undefined);
+
+  // вставка куска из своего же редактора сохраняет премиум-эмодзи
+  await scenario(async () => {
+    await page.evaluate(E => {
+      const dt = new DataTransfer();
+      dt.setData('text/html', `<meta charset="utf-8"><span style="color:red">ну </span><img class="rt-emoji" data-emoji-id="111" alt="🎁" src="x"><b> да</b>`);
+      dt.setData('text/plain', 'ну 🎁 да');
+      rtArea.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+    });
+  });
+  check('вставка своего куска сохраняет эмодзи и оформление', await html(), `ну ${E1}<b> да</b>`);
+
+  await scenario(async () => {
+    await page.evaluate(() => {
+      const dt = new DataTransfer();
+      dt.setData('text/html', '<b style="font-size:40px">из Word</b>');
+      dt.setData('text/plain', 'из Word');
+      rtArea.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+    });
+  });
+  check('обычная вставка по-прежнему только текстом', await html(), 'из Word');
+
+  check('plainText показывает обычную эмодзи', await page.evaluate(E =>
+        plainText(`Акция ${E}!`), E1), 'Акция 🎁!');
+
+  // иконка у кнопки: выбор и «без иконки»
+  await page.evaluate(() => {
+    document.body.insertAdjacentHTML('beforeend', `<div id="brow">${btnIconPicker('')}</div>`);
+    document.querySelector('#brow .btn-icon-pick').click();
+  });
+  await page.waitForSelector('.emoji-cell[data-id="111"]');
+  await page.click('.emoji-cell[data-id="111"]');
+  check('иконка кнопки выбрана', await page.evaluate(() =>
+        document.querySelector('#brow .btn-icon-pick').dataset.icon), '111');
+  await page.evaluate(() => document.querySelector('#brow .btn-icon-pick').click());
+  await page.waitForSelector('.emoji-clear');
+  await page.click('.emoji-clear');
+  check('«Без иконки» снимает иконку', await page.evaluate(() =>
+        document.querySelector('#brow .btn-icon-pick').dataset.icon), '');
 
   await browser.close();
   console.log(failed ? `\n${failed} проверок упало` : '\nвсе проверки прошли');

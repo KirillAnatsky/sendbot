@@ -21,6 +21,49 @@ const RT_DROP = new Set([
   'template', 'head', 'title', 'meta', 'link',
 ]);
 
+// ---------- премиум-эмодзи ----------
+// В Telegram это <tg-emoji emoji-id="…">🔥</tg-emoji>: id картинки и обычная
+// эмодзи на случай, если премиальную показать нельзя. В редакторе — картинка
+// <img class="rt-emoji">: одна «буква», стирается целиком, и её видно.
+
+// Обычная эмодзи картинкой — когда своей миниатюры у эмодзи нет
+function rtEmojiSvg(alt) {
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">` +
+    `<text x="10" y="16" font-size="16" text-anchor="middle">${esc(alt)}</text></svg>`;
+  return 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+}
+
+function rtEmojiSrc(id, alt) {
+  // библиотека (emoji.js) знает миниатюры; без неё — обычная эмодзи
+  return (typeof emojiSrc === 'function' ? emojiSrc(id, alt) : null) || rtEmojiSvg(alt);
+}
+
+function rtEmojiHtml(id, alt) {
+  id = String(id || '').replace(/\D/g, '');
+  alt = alt || '⭐';
+  return `<img class="rt-emoji" data-emoji-id="${id}" alt="${esc(alt)}" ` +
+    `title="премиум-эмодзи" draggable="false" src="${esc(rtEmojiSrc(id, alt))}">`;
+}
+
+function rtIsEmoji(n) {
+  return n.nodeType === Node.ELEMENT_NODE && n.tagName === 'IMG'
+    && n.classList.contains('rt-emoji') && /^\d+$/.test(n.dataset.emojiId || '');
+}
+
+// Обычная эмодзи внутри тега: Telegram требует там именно эмодзи, а не текст
+function rtEmojiAlt(s) {
+  s = String(s || '').trim();
+  return s && !/[<>&"]/.test(s) && [...s].length <= 8 ? s : '⭐';
+}
+
+// Перерисовать миниатюры, когда библиотека догрузилась или пополнилась
+function rtRefreshEmoji(root) {
+  (root || document).querySelectorAll('img.rt-emoji').forEach(img => {
+    const src = rtEmojiSrc(img.dataset.emojiId, img.alt);
+    if (img.getAttribute('src') !== src) img.setAttribute('src', src);
+  });
+}
+
 // Из HTML редактора — в HTML, который поймёт Telegram.
 function rtToTelegram(root) {
   const out = [];
@@ -36,6 +79,12 @@ function rtToTelegram(root) {
       const tag = n.tagName.toLowerCase();
       if (RT_DROP.has(tag)) continue;
       if (tag === 'br') { out.push('\n'); continue; }
+      if (tag === 'img') {
+        if (rtIsEmoji(n)) {
+          out.push(`<tg-emoji emoji-id="${n.dataset.emojiId}">${esc(rtEmojiAlt(n.alt))}</tg-emoji>`);
+        }
+        continue;   // другие картинки в текст сообщения не попадают
+      }
 
       // блочные переводим в перенос строки: <div>, <p> из вставки
       const block = tag === 'div' || tag === 'p';
@@ -84,7 +133,9 @@ function rtToTelegram(root) {
 // Обратно: HTML из базы — в содержимое редактора. Чужие теги режем здесь же,
 // чтобы в редактор не попало то, что мы потом не сможем отправить.
 function rtFromTelegram(html) {
-  const tmp = document.createElement('div');
+  // <template>, а не <div>: разметка в нём «мёртвая» — картинки не грузятся
+  // и onerror не срабатывает, пока мы её не почистили
+  const tmp = document.createElement('template');
   tmp.innerHTML = String(html || '').replace(/\n/g, '<br>');
 
   (function clean(node) {
@@ -92,8 +143,26 @@ function rtFromTelegram(html) {
       if (n.nodeType === Node.ELEMENT_NODE) {
         const tag = n.tagName.toLowerCase();
         if (RT_DROP.has(tag)) { n.parentNode.removeChild(n); continue; }
+        // премиум-эмодзи: из базы приходит <tg-emoji>, из своей же вставки — <img>
+        if (tag === 'tg-emoji' || tag === 'img') {
+          const id = tag === 'img'
+            ? (rtIsEmoji(n) ? n.dataset.emojiId : '')
+            : (n.getAttribute('emoji-id') || '').trim();
+          if (/^\d+$/.test(id)) {
+            const t = document.createElement('template');
+            t.innerHTML = rtEmojiHtml(id, rtEmojiAlt(tag === 'img' ? n.alt : n.textContent));
+            n.parentNode.replaceChild(t.content.firstChild, n);
+          } else if (tag === 'tg-emoji') {
+            n.parentNode.replaceChild(document.createTextNode(n.textContent), n);
+          } else {
+            n.parentNode.removeChild(n);
+          }
+          continue;
+        }
         if (tag !== 'br' && !RT_TAGS[tag]) {
-          // не наш тег — оставляем содержимое, сам тег убираем
+          // не наш тег — оставляем содержимое, сам тег убираем. Содержимое
+          // чистим до того, как вынуть: потом обход его уже не увидит
+          clean(n);
           const parent = n.parentNode;
           while (n.firstChild) parent.insertBefore(n.firstChild, n);
           parent.removeChild(n);
@@ -109,7 +178,7 @@ function rtFromTelegram(html) {
         clean(n);
       }
     }
-  })(tmp);
+  })(tmp.content);
 
   return tmp.innerHTML;
 }
@@ -161,6 +230,12 @@ function rtChars(root) {
       const tag = n.tagName.toLowerCase();
       if (RT_DROP.has(tag)) continue;
       if (tag === 'br') { push('\n', marks, href, n, 0); continue; }
+      if (rtIsEmoji(n)) {
+        push(rtEmojiAlt(n.alt), marks, href, n, 0);
+        chars[chars.length - 1].emoji = n.dataset.emojiId;
+        continue;
+      }
+      if (tag === 'img') continue;
 
       // Enter в contenteditable заворачивает строку в <div> — это перенос
       if ((tag === 'div' || tag === 'p') && chars.length
@@ -187,6 +262,17 @@ function rtOuterMark(c, applied) {
   return c.href && !applied.has('link') ? 'link' : null;
 }
 
+// Кусок без оформления: текст как есть, премиум-эмодзи — картинкой
+function rtPlainRun(part) {
+  let out = '', buf = '';
+  const flush = () => { out += esc(buf).replace(/\n/g, '<br>'); buf = ''; };
+  for (const c of part) {
+    if (c.emoji) { flush(); out += rtEmojiHtml(c.emoji, c.ch); } else buf += c.ch;
+  }
+  flush();
+  return out;
+}
+
 function rtHtml(chars, applied) {
   applied = applied || new Set();
   let out = '';
@@ -196,7 +282,7 @@ function rtHtml(chars, applied) {
     if (!mark) {
       let j = i;
       while (j < chars.length && !rtOuterMark(chars[j], applied)) j++;
-      out += esc(chars.slice(i, j).map(x => x.ch).join('')).replace(/\n/g, '<br>');
+      out += rtPlainRun(chars.slice(i, j));
       i = j;
       continue;
     }
@@ -354,14 +440,17 @@ const RT_TOOLS = [
   ['spoiler', '👁', 'Спойлер — текст под замазкой'],
   ['link', '🔗', 'Ссылка (Ctrl/⌘+K)'],
   ['clear', '✕', 'Убрать всё оформление с выделенного'],
+  ['emoji', '✨', 'Премиум-эмодзи из библиотеки'],
 ];
 
 // Монтирует редактор в контейнер. Возвращает { getHtml, setHtml, focus }.
 function mountRichText(container, initialHtml, onChange) {
+  // без библиотеки (например, на тестовом стенде) кнопку ✨ не показываем
+  const tools = RT_TOOLS.filter(([cmd]) => cmd !== 'emoji' || typeof openEmojiPicker === 'function');
   container.innerHTML = `
     <div class="rt">
       <div class="rt-bar">
-        ${RT_TOOLS.map(([cmd, label, title]) =>
+        ${tools.map(([cmd, label, title]) =>
           `<button type="button" class="rt-btn" data-cmd="${cmd}" title="${esc(title)}">${label}</button>`).join('')}
       </div>
       <div class="rt-area" contenteditable="true" spellcheck="true"></div>
@@ -395,7 +484,36 @@ function mountRichText(container, initialHtml, onChange) {
     });
   }
 
+  // Вставить премиум-эмодзи туда, где стояла каретка. Пока открыт выбор,
+  // фокус уходит в окно выбора, поэтому место запоминаем заранее.
+  function insertEmoji(e, range) {
+    area.focus();
+    const sel = document.getSelection();
+    sel.removeAllRanges();
+    if (range && area.contains(range.commonAncestorContainer)) {
+      sel.addRange(range);
+    } else {
+      const r = document.createRange();
+      r.selectNodeContents(area);
+      r.collapse(false);
+      sel.addRange(r);
+    }
+    // insertHTML, а не ручная вставка узла: так работает Ctrl/⌘+Z
+    document.execCommand('insertHTML', false, rtEmojiHtml(e.emoji_id, e.emoji));
+    stepped.clear();
+    paintButtons();
+    fire();
+  }
+
   function exec(cmd) {
+    if (cmd === 'emoji') {
+      const sel = document.getSelection();
+      const range = sel && sel.rangeCount && area.contains(sel.getRangeAt(0).commonAncestorContainer)
+        ? sel.getRangeAt(0).cloneRange() : null;
+      openEmojiPicker(container.querySelector('.rt-btn[data-cmd="emoji"]'),
+                      e => insertEmoji(e, range));
+      return;
+    }
     area.focus();
     const sel = document.getSelection();
     const collapsed = !sel || !sel.rangeCount || sel.isCollapsed;
@@ -475,7 +593,21 @@ function mountRichText(container, initialHtml, onChange) {
   });
   // вставка — только текстом: из Word иначе прилетает мусорная разметка
   area.addEventListener('paste', e => {
-    const text = (e.clipboardData || window.clipboardData).getData('text/plain');
+    const cd = e.clipboardData || window.clipboardData;
+    // Исключение — кусок из нашего же редактора с премиум-эмодзи: текстом
+    // они превратились бы в обычные. Пропускаем через тот же белый список.
+    const html = cd.getData && cd.getData('text/html');
+    if (html && html.includes('data-emoji-id')) {
+      const t = document.createElement('template');   // разметка в нём инертна
+      t.innerHTML = html;
+      const clean = rtFromTelegram(rtToTelegram(t.content));
+      if (clean) {
+        e.preventDefault();
+        document.execCommand('insertHTML', false, clean);
+        return;
+      }
+    }
+    const text = cd.getData('text/plain');
     if (text == null) return;
     e.preventDefault();
     document.execCommand('insertText', false, text);
@@ -499,7 +631,10 @@ function rtPreview(html) {
 
 // Только текст, без разметки — для узких мест вроде строки в списке рассылок.
 function plainText(html) {
-  const d = document.createElement('div');
+  const d = document.createElement('template');
   d.innerHTML = rtFromTelegram(html);
-  return d.textContent || '';
+  // премиум-эмодзи — картинка, у неё нет текста; подставляем обычную
+  d.content.querySelectorAll('img.rt-emoji').forEach(img =>
+    img.replaceWith(document.createTextNode(img.alt || '')));
+  return d.content.textContent || '';
 }

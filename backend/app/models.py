@@ -215,6 +215,11 @@ class BroadcastRecipient(Base):
     broadcast_id: Mapped[int] = mapped_column(ForeignKey("broadcasts.id", ondelete="CASCADE"), index=True)
     subscriber_id: Mapped[int] = mapped_column(ForeignKey("subscribers.id", ondelete="CASCADE"), index=True)
     delivered: Mapped[bool] = mapped_column(Boolean, default=True)
+    # почему не дошло: blocked, deactivated, chat_not_found, bad_request, … —
+    # см. bot/delivery.py. У старых рассылок пусто: причину тогда не хранили
+    error_code: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    # текст ошибки Telegram — только для непонятных, чтобы было что разобрать
+    error_text: Mapped[str | None] = mapped_column(String(200), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
@@ -246,6 +251,30 @@ class MediaFileId(Base):
     bot_id: Mapped[int] = mapped_column(Integer, index=True)
     path: Mapped[str] = mapped_column(String(512), index=True)
     file_id: Mapped[str] = mapped_column(String(256))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class CustomEmoji(Base):
+    """Премиум-эмодзи из библиотеки проекта.
+
+    Telegram не даёт выбирать их из браузера: в сообщение нужен числовой
+    custom_emoji_id. Поэтому наборы забираются целиком по ссылке
+    t.me/addemoji/<имя> и хранятся здесь вместе с миниатюрой для редактора.
+    id эмодзи общие для всего Telegram, поэтому библиотека одна на проект,
+    а не своя у каждого бота."""
+    __tablename__ = "custom_emoji"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    emoji_id: Mapped[str] = mapped_column(String(32), unique=True, index=True)
+    # обычная эмодзи, которую Telegram покажет, если премиальная недоступна;
+    # она же стоит внутри тега <tg-emoji> и видна в превью админки
+    emoji: Mapped[str] = mapped_column(String(16), default="⭐")
+    set_name: Mapped[str] = mapped_column(String(64), index=True)
+    set_title: Mapped[str] = mapped_column(String(128), default="")
+    position: Mapped[int] = mapped_column(Integer, default=0)
+    # есть ли картинка media/emoji/<emoji_id>.webp; у части анимированных
+    # эмодзи миниатюры нет — тогда в редакторе рисуется обычная эмодзи
+    has_thumb: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 

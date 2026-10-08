@@ -32,6 +32,8 @@ function showLogin() {
   setupTelegramLogin();
 }
 function showApp() {
+  // библиотека премиум-эмодзи нужна редактору и превью — тянем заранее
+  if (typeof loadEmojiLib === 'function') loadEmojiLib(true);
   document.getElementById('login-screen').classList.add('hidden');
   document.getElementById('app').classList.remove('hidden');
   // если в адресе уже есть раздел (#broadcasts) и он доступен — открываем его
@@ -1092,6 +1094,7 @@ function bcButtonRow(b = {}) {
   const isTag = !b.url && (b.tag_id || b.tag_id === 0);
   return `<div class="bc-btn-row">
     <div class="row1">
+      ${btnIconPicker(b.icon_custom_emoji_id)}
       <input class="bc-label inline-input" placeholder="Текст кнопки" value="${esc(b.label || '')}">
       <select class="bc-style inline-input" style="flex:0 0 130px">
         ${BC_BTN_STYLES.map(([v, l]) =>
@@ -1135,6 +1138,8 @@ function collectBcButtons() {
     const b = { label: row.querySelector('.bc-label').value.trim() };
     const style = row.querySelector('.bc-style').value;
     if (style) b.style = style;
+    const icon = row.querySelector('.btn-icon-pick').dataset.icon;
+    if (icon) b.icon_custom_emoji_id = icon;
     if (row.querySelector('.bc-kind').value === 'tag') {
       const tag = row.querySelector('.bc-tag').value;
       if (tag) b.tag_id = +tag;
@@ -1161,14 +1166,21 @@ async function previewBroadcast() {
   const btn = document.getElementById('bc-preview-btn');
   btn.disabled = true;
   try {
-    await api('/broadcasts/preview', { method: 'POST', body: {
+    const r = await api('/broadcasts/preview', { method: 'POST', body: {
       bot_id: botId,
       text: BC_TEXT ? BC_TEXT.getHtml() : '',
       media: BC_MEDIA ? BC_MEDIA.getItems() : [],
       buttons: collectBcButtons(),
       text_first: document.getElementById('bc-order').value === '1',
     }});
-    alert('Отправлено вам в Telegram — проверьте, как выглядит.\n\nКнопки в предпросмотре ничего не делают: теги вешаются только в настоящей рассылке.');
+    // премиум-эмодзи без Premium у владельца бота уходят обычными — об этом
+    // надо узнать здесь, а не от подписчиков
+    const emojiNote = r.premium_emoji === 'rejected'
+      ? '\n\n⚠️ Telegram не принял премиум-эмодзи — сообщение ушло с обычными. Скорее всего, у владельца бота (аккаунта в @BotFather) нет Telegram Premium.'
+      : r.premium_emoji === 'downgraded'
+        ? '\n\n⚠️ Премиум-эмодзи пришли обычными. Скорее всего, у владельца бота (аккаунта в @BotFather) нет Telegram Premium.'
+        : '';
+    alert('Отправлено вам в Telegram — проверьте, как выглядит.\n\nКнопки в предпросмотре ничего не делают: теги вешаются только в настоящей рассылке.' + emojiNote);
   } catch (e) { /* alert показан в api() */ }
   finally { btn.disabled = false; }
 }
@@ -1229,16 +1241,32 @@ async function loadBroadcasts() {
 }
 
 // ---------- карточка рассылки ----------
-async function openBroadcast(id) {
+async function openBroadcast(id, onlyFailed) {
   let b;
-  try { b = await api('/broadcasts/' + id); } catch (e) { return; }
+  try { b = await api('/broadcasts/' + id + (onlyFailed ? '?only_failed=1' : '')); } catch (e) { return; }
 
   const media = (b.media || []).length
     ? b.media
     : (b.photo_url ? [{ type: 'photo', path: b.photo_url, name: '' }] : []);
 
-  const pct = b.total ? Math.round(100 * (b.sent + b.failed) / b.total) : 0;
+  const pct = b.total ? Math.min(100, Math.round(100 * (b.sent + b.failed) / b.total)) : 0;
   const rec = b.recipients || [];
+  // почему не дошло — крупные причины сверху
+  const reasons = b.reasons || [];
+  const reasonsHtml = reasons.length ? `
+        <div class="bc-section-title">Почему не дошло</div>
+        <div class="bc-reasons">
+          ${reasons.map(r => `
+            <div class="bc-reason">
+              <span>${esc(r.label)}</span><b>${r.count}</b><span class="pct">${r.pct}%</span>
+              <div class="bc-reason-bar"><i style="width:${r.pct}%"></i></div>
+            </div>`).join('')}
+          ${reasons.some(r => r.code.startsWith('legacy_')) ? `<div class="bc-hint">
+            Эта рассылка ушла до того, как начали сохранять причины. «По статусу» —
+            те, кого бот к этому моменту знает как недоступных.</div>` : ''}
+          ${(b.error_samples || []).length ? `<div class="bc-samples">Что отвечал Telegram:
+            ${b.error_samples.map(t => `<code>${esc(t)}</code>`).join('')}</div>` : ''}
+        </div>` : '';
 
   document.getElementById('bc-detail-body').innerHTML = `
     <div class="bc-grid">
@@ -1270,6 +1298,7 @@ async function openBroadcast(id) {
           <div class="bc-stat"><span>${b.total ? Math.round(100 * b.sent / b.total) : 0}%</span><label>доставляемость</label></div>
         </div>
         <div class="progress" style="margin:10px 0"><i style="width:${pct}%"></i></div>
+        ${reasonsHtml}
 
         <div class="bc-section-title">Кому</div>
         <div class="chat-info-row"><span>Бот</span><b>${esc(b.bot)}</b></div>
@@ -1281,14 +1310,19 @@ async function openBroadcast(id) {
     </div>
 
     <div class="bc-section-title" style="margin-top:16px">
-      Получатели${rec.length ? ` <span style="font-weight:400;color:#7a8499">— показаны ${rec.length}${b.total > rec.length ? ` из ${b.total}` : ''}</span>` : ''}
+      Получатели${rec.length ? ` <span style="font-weight:400;color:#7a8499">— показаны ${rec.length}${!b.only_failed && b.total > rec.length ? ` из ${b.total}` : ''}${b.only_failed ? ` из ${b.failed} недошедших` : ''}</span>` : ''}
+      ${b.failed ? `<span class="bc-rec-tabs">
+        <button class="btn ${b.only_failed ? '' : 'on'}" onclick="openBroadcast(${b.id}, false)">все</button>
+        <button class="btn ${b.only_failed ? 'on' : ''}" onclick="openBroadcast(${b.id}, true)">не дошло</button>
+      </span>` : ''}
     </div>
     ${rec.length ? `<table>
       <tr><th>Имя</th><th>Username</th><th>Доставлено</th><th>Время</th></tr>
       ${rec.map(r => `<tr>
         <td><a href="#" onclick="closeBroadcast();openChat(${r.id});return false">${esc(r.name)}</a></td>
         <td>${r.username ? '@' + esc(r.username) : '—'}</td>
-        <td>${r.delivered ? '<span class="status-active">да</span>' : '<span class="status-off">нет</span>'}</td>
+        <td>${r.delivered ? '<span class="status-active">да</span>'
+          : `<span class="status-off">нет${r.reason ? ` <small>· ${esc(r.reason)}</small>` : ''}</span>`}</td>
         <td>${new Date(r.at + 'Z').toLocaleString('ru')}</td>
       </tr>`).join('')}
     </table>` : '<div class="panel">Пока никому не отправлено.</div>'}`;

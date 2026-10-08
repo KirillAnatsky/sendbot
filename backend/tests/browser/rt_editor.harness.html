@@ -15,6 +15,18 @@
 </script>
 <script src="richtext.js"></script>
 <script>
+  // библиотека премиум-эмодзи: вместо сервера — два набора из памяти
+  window.api = async path => {
+    if (path === '/emoji') return [
+      { emoji_id: '111', emoji: '🎁', set_name: 'Gifts', set_title: 'Подарки', thumb: 'data:image/gif;base64,R0lGODlhAQABAAAAACw=' },
+      { emoji_id: '222', emoji: '🔥', set_name: 'Gifts', set_title: 'Подарки', thumb: null },
+    ];
+    throw new Error('нет такого запроса в стенде: ' + path);
+  };
+  window.canDelete = () => false;
+</script>
+<script src="emoji.js"></script>
+<script>
   window.RT = mountRichText(document.getElementById('host'), '', () => {});
   window.rtArea = document.querySelector('.rt-area');
   // помощник для тестов: выделить текст по подстроке внутри области

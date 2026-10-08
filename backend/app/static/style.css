@@ -378,9 +378,30 @@ th { background: #f8fafc; color: #7a8499; font-weight: 600; font-size: 12.5px; t
 .bc-detail {
   position: fixed; top: 4vh; left: 50%; transform: translateX(-50%);
   width: min(1000px, 94vw); max-height: 92vh; overflow: auto;
-  background: #fff; border-radius: 14px; z-index: 60;
+  background: #fff; border-radius: 14px;
+  /* выше своего затемнения (#bc-overlay), но ниже чата: из карточки по
+     клику на получателя открывается переписка, и она должна лечь сверху.
+     Раньше здесь стояло 60 при затемнении 900 — карточка оказывалась ПОД
+     серым слоем и ни на что нельзя было нажать */
+  z-index: 895;
   box-shadow: 0 20px 60px rgba(20,25,45,.28);
 }
+#bc-overlay { z-index: 890; }
+
+.bc-reasons { margin: 4px 0 14px; }
+.bc-reason { display: grid; grid-template-columns: 1fr auto 46px; gap: 8px; align-items: center;
+  font-size: 13px; padding: 4px 0; }
+.bc-reason-bar { grid-column: 1 / -1; height: 4px; background: #f1f3f8; border-radius: 3px; overflow: hidden; margin-top: -2px; }
+.bc-reason-bar i { display: block; height: 100%; background: #e57373; }
+.bc-reason b { font-weight: 600; text-align: right; }
+.bc-reason .pct { color: #8a93a6; text-align: right; font-size: 12px; }
+.bc-samples { font-size: 11.5px; color: #7a8499; margin-top: 6px; }
+.bc-samples code { display: block; background: #f6f8fc; border-radius: 6px; padding: 3px 6px; margin-top: 3px;
+  white-space: normal; word-break: break-word; }
+.bc-rec-tabs { display: inline-flex; gap: 4px; margin-left: 10px; vertical-align: middle; }
+.bc-rec-tabs .btn { padding: 2px 10px; font-size: 12px; text-transform: none; letter-spacing: 0; }
+.bc-rec-tabs .btn.on { background: #2e6bff; color: #fff; border-color: #2e6bff; }
+.status-off small { color: #8a93a6; font-weight: 400; }
 .bc-detail-head {
   position: sticky; top: 0; background: #fff; z-index: 1;
   display: flex; align-items: center; justify-content: space-between;
@@ -616,3 +637,40 @@ th { background: #f8fafc; color: #7a8499; font-weight: 600; font-size: 12.5px; t
    Telegram. Направление всё равно определяется по содержимому, поэтому
    арабский внутри читается справа налево. */
 .drawflow .drawflow-node .df-btn { unicode-bidi: plaintext; }
+
+/* ---------- премиум-эмодзи ---------- */
+/* в тексте — как буква: высотой со строку, на базовой линии */
+img.rt-emoji { width: 1.25em; height: 1.25em; vertical-align: -0.25em; object-fit: contain;
+  margin: 0 1px; }
+.rt-area img.rt-emoji { cursor: default; }
+
+.emoji-pop { position: fixed; z-index: 1000; width: 340px; max-width: calc(100vw - 16px);
+  max-height: 420px; display: flex; flex-direction: column; background: #fff;
+  border: 1px solid #d9e0ec; border-radius: 12px; box-shadow: 0 10px 30px rgba(20, 30, 60, .16);
+  padding: 10px; gap: 8px; }
+.emoji-pop-add { display: flex; gap: 6px; }
+.emoji-pop-add input { flex: 1; min-width: 0; font-size: 12px; }
+.emoji-pop-add .btn { white-space: nowrap; font-size: 12px; }
+.emoji-pop-msg { font-size: 12px; color: #556; background: #f4f7fd; border-radius: 8px; padding: 6px 8px; }
+.emoji-pop-sets { overflow-y: auto; min-height: 0; }
+.emoji-set + .emoji-set { margin-top: 10px; }
+.emoji-set-head { display: flex; justify-content: space-between; align-items: center;
+  font-size: 12px; font-weight: 600; color: #445; margin-bottom: 4px; }
+.emoji-set-n { color: #99a3b5; font-weight: 400; }
+.emoji-set-del { border: none; background: none; color: #99a3b5; cursor: pointer; font-size: 12px; }
+.emoji-set-del:hover { color: #d33; }
+.emoji-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(34px, 1fr)); gap: 2px; }
+.emoji-cell { height: 34px; border: 1px solid transparent; border-radius: 8px; background: none;
+  cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 0; font-size: 20px; }
+.emoji-cell:hover { background: #eef3ff; border-color: #d3e0ff; }
+.emoji-cell img { width: 26px; height: 26px; object-fit: contain; }
+.emoji-empty { font-size: 13px; color: #667; line-height: 1.45; padding: 4px 2px; }
+.emoji-clear { align-self: flex-start; font-size: 12px; }
+
+/* иконка перед текстом кнопки */
+.btn-icon-pick { flex: 0 0 34px; width: 34px; padding: 0; display: inline-flex;
+  align-items: center; justify-content: center; }
+.btn-icon-pick img.rt-emoji { width: 20px; height: 20px; margin: 0; vertical-align: middle; }
+.btn-icon-none { color: #b0b8c8; font-size: 16px; }
+.df-btn img.rt-emoji { width: 1.1em; height: 1.1em; }
+.bc-col .progress { width: 100%; max-width: none; }
