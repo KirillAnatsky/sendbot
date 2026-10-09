@@ -582,9 +582,10 @@ function mountRichText(container, initialHtml, onChange) {
   area.addEventListener('focus', paintButtons);
   area.addEventListener('keydown', e => {
     if (!(e.ctrlKey || e.metaKey)) return;
-    const k = e.key.toLowerCase();
+    // по физической клавише: на русской раскладке e.key — «и», «ш», «г», «л»
+    const k = ({ KeyB: 'b', KeyI: 'i', KeyU: 'u', KeyK: 'k' })[e.code] || e.key.toLowerCase();
     if (k === 'k') { e.preventDefault(); exec('link'); }
-    else if ('biu'.includes(k)) {
+    else if (k.length === 1 && 'biu'.includes(k)) {
       // перехватываем сами: браузерная команда сделала бы то же, но мимо
       // модели, и кнопки показывали бы не то состояние
       e.preventDefault();

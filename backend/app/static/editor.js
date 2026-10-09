@@ -274,12 +274,29 @@ function editorDirty() {
 // не дать закрыть вкладку с несохранённой воронкой
 window.addEventListener('beforeunload', e => {
   if (!document.getElementById('page-editor').classList.contains('hidden') && editorDirty()) {
+    saveDraft();   // даже если человек подтвердит уход — изменения не пропадут
     e.preventDefault();
     e.returnValue = '';
   }
 });
 
+// Из блока «Цепочка» — сразу в редактор этой цепочки. Кнопка была, а
+// функции не было: клик молча падал с ошибкой.
+function openChainEditor(id) {
+  openEditor(+id);
+}
+
 async function openEditor(id) {
+  // переход из одной воронки в другую (например, в цепочку) — тот же уход
+  // из редактора, что и кнопка «Назад»: несохранённое не теряем
+  const edPage = document.getElementById('page-editor');
+  if (editor && !edPage.classList.contains('hidden') && currentFunnelId !== id) {
+    flushAutoApply();
+    if (editorDirty()) {
+      saveDraft();
+      if (!confirm('Есть несохранённые изменения — перейти без сохранения?\n\nОни останутся черновиком: при следующем открытии воронки их можно будет восстановить.')) return;
+    }
+  }
   // запоминаем, откуда пришли (список воронок или экран бота)
   editorReturnTo = !document.getElementById('page-bot').classList.contains('hidden') ? 'bot' : 'funnels';
   await loadTags();
@@ -288,6 +305,9 @@ async function openEditor(id) {
   const [f, bots] = await Promise.all([api('/funnels/' + id), api('/bots')]);
   await loadChains();
   IS_CHAIN = !!f.is_chain;
+  FUNNEL_LIVE = !!f.is_active || IS_CHAIN;
+  setAutosaveStatus('');
+  if (!_autosaveTimer) _autosaveTimer = setInterval(autosaveTick, AUTOSAVE_MS);
 
   document.querySelectorAll('.page').forEach(p => p.classList.add('hidden'));
   document.getElementById('page-editor').classList.remove('hidden');
@@ -328,6 +348,19 @@ async function openEditor(id) {
       return _origMove(e);
     };
     editor.on('nodeSelected', id => { onNodeSelected(id); showProps(id); });
+    // Drawflow узнаёт об отпускании кнопки только по mouseup на самом холсте.
+    // А клик по блоку у правого края открывает панель свойств прямо под
+    // курсором — кнопку отпускают уже над панелью, Drawflow этого не видит
+    // и считает, что блок всё ещё тащат: блок «прилипает» к мыши. Отпустили
+    // где угодно за пределами холста — завершаем перетаскивание сами.
+    document.addEventListener('mouseup', e => {
+      if (!editor || document.getElementById('drawflow').contains(e.target)) return;
+      if (editor.drag || editor.drag_point || editor.editor_selected || editor.connection) {
+        try { editor.dragEnd(e); } catch (err) {
+          editor.drag = editor.drag_point = editor.editor_selected = false;
+        }
+      }
+    });
     // Drawflow шлёт nodeUnselected и при перевыборе другого блока — группу
     // при этом сбрасывать нельзя (это и ломало групповое перетаскивание).
     // Пустой фон снимает выделение сам (см. setupMarquee).
@@ -353,6 +386,7 @@ async function openEditor(id) {
   refreshStepNumbers();
   loadFunnelStats();
   EDITOR_SNAPSHOT = editorStateJson();
+  offerDraft();
 }
 
 // ---------- статистика шагов ----------
@@ -516,8 +550,11 @@ async function toggleStepsDrawer() {
 }
 
 function closeEditor() {
+  flushAutoApply();
+  // черновик — до вопроса: «да, выйти» мог быть нажат по ошибке
+  if (editorDirty()) saveDraft();
   if (editorDirty() &&
-      !confirm('Есть несохранённые изменения — выйти без сохранения?\n\n(Сохранить: кнопка «💾 Сохранить» или Ctrl/⌘+S)')) return;
+      !confirm('Есть несохранённые изменения — выйти без сохранения?\n\nОни останутся черновиком: при следующем открытии воронки их можно будет восстановить.\n(Сохранить: кнопка «💾 Сохранить» или Ctrl/⌘+S)')) return;
   EDITOR_SNAPSHOT = null;
   if (editorReturnTo === 'bot' && typeof BOT_ID !== 'undefined' && BOT_ID) openBot(BOT_ID);
   else go('funnels');
@@ -934,9 +971,19 @@ let RT_TEXT = null;   // визуальный редактор текущего 
 let NODE_SEG = null;  // конструктор условий текущего узла «Фильтр»
 
 let _autoApplyTimer = null;
+// применить отложенные правки панели прямо сейчас (перед копированием и сохранением)
+function flushAutoApply() {
+  if (!_autoApplyTimer) return;
+  clearTimeout(_autoApplyTimer);
+  _autoApplyTimer = null;
+  if (selectedNodeId != null && !document.getElementById('props').classList.contains('hidden')) {
+    try { applyProps(); } catch (e) { /* панель могла закрыться */ }
+  }
+}
 function scheduleAutoApply() {
   clearTimeout(_autoApplyTimer);
   _autoApplyTimer = setTimeout(() => {
+    _autoApplyTimer = null;
     if (selectedNodeId != null && !document.getElementById('props').classList.contains('hidden')) {
       try { applyProps(); } catch (e) { /* панель могла закрыться */ }
     }
@@ -1384,7 +1431,10 @@ function arrangeVertical() {
 }
 
 // ---------- сохранение ----------
-async function saveFunnel() {
+// silent — для автосохранения: без всплывающих окон, итог пишется рядом с
+// кнопкой «Сохранить». Возвращает true, если сохранилось.
+async function saveFunnel(silent) {
+  flushAutoApply();   // правки панели, которые ещё не успели примениться
   const trigger = document.getElementById('funnel-trigger').value;
   let triggerValue = null;
   if (trigger === 'keyword') triggerValue = document.getElementById('funnel-trigger-value').value.trim();
@@ -1398,20 +1448,146 @@ async function saveFunnel() {
   }
   const botIds = [...document.querySelectorAll('#funnel-bots .pill.on')].map(p => +p.dataset.id);
 
-  try {
-    await api('/funnels/' + currentFunnelId, {
-      method: 'PUT',
-      body: {
-        name: document.getElementById('funnel-name').value || 'Без названия',
-        trigger_type: trigger,
-        trigger_value: triggerValue,
-        graph_ui: editor.export(),
-        bot_ids: botIds,
-      },
-    });
-    EDITOR_SNAPSHOT = editorStateJson();
+  const body = {
+    name: document.getElementById('funnel-name').value || 'Без названия',
+    trigger_type: trigger,
+    trigger_value: triggerValue,
+    graph_ui: editor.export(),
+    bot_ids: botIds,
+  };
+  const state = editorStateJson();
+  const funnelId = currentFunnelId;
+  if (silent) {
+    // не через api(): тот показывает alert, а автосохранение не должно
+    // выскакивать окном посреди работы
+    try {
+      const r = await fetch('/api/funnels/' + funnelId, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + TOKEN },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) {
+        const d = await r.json().catch(() => ({}));
+        throw new Error(d.detail || ('ошибка ' + r.status));
+      }
+    } catch (e) {
+      saveDraft();
+      setAutosaveStatus(`⚠️ не сохранено: ${e.message}`, 'warn',
+        `Не сохранилось на сервер: ${e.message}. Изменения лежат черновиком в браузере.`);
+      return false;
+    }
+  } else {
+    try {
+      await api('/funnels/' + funnelId, { method: 'PUT', body });
+    } catch (e) { return false; /* alert уже показан */ }
     flashStatus('Сохранено ✅');
-  } catch (e) { /* alert уже показан */ }
+  }
+  if (funnelId !== currentFunnelId) return true;   // пока сохраняли, открыли другую
+  EDITOR_SNAPSHOT = state;
+  dropDraft(funnelId);
+  setAutosaveStatus(silent ? 'автосохранено ' + hhmm() : 'сохранено ' + hhmm());
+  return true;
+}
+
+// ---------- автосохранение ----------
+// Раз в минуту несохранённые изменения сохраняются сами. Но не везде на
+// сервер: включённая воронка и цепочка работают на живых подписчиках, и
+// полуготовая правка ушла бы людям прямо посреди редактирования. Их
+// изменения минута за минутой ложатся черновиком в браузер, а к людям
+// попадают только по кнопке «Сохранить». Черновик пишется всегда — он же
+// страхует от ошибки сервера и закрытой вкладки — и предлагается к
+// восстановлению при следующем открытии воронки.
+const AUTOSAVE_MS = 60 * 1000;
+let FUNNEL_LIVE = false;   // включена или цепочка — сервер только вручную
+let _autosaving = false;
+
+function hhmm() {
+  return new Date().toLocaleTimeString('ru', { hour: '2-digit', minute: '2-digit' });
+}
+
+function setAutosaveStatus(text, kind, hint) {
+  const el = document.getElementById('autosave-status');
+  if (!el) return;
+  el.textContent = text;
+  el.title = hint || text;
+  el.className = 'autosave-status' + (kind ? ' ' + kind : '');
+}
+
+function draftKey(id) { return 'sb_funnel_draft_' + id; }
+
+function saveDraft() {
+  if (currentFunnelId == null || !editor) return;
+  const state = editorStateJson();
+  if (!state) return;
+  try {
+    localStorage.setItem(draftKey(currentFunnelId),
+      JSON.stringify({ state, base: EDITOR_SNAPSHOT, at: Date.now() }));
+  } catch (e) { /* хранилище недоступно или переполнено — черновика не будет */ }
+}
+
+function dropDraft(id) {
+  try { localStorage.removeItem(draftKey(id)); } catch (e) {}
+}
+
+function readDraft(id) {
+  try { return JSON.parse(localStorage.getItem(draftKey(id)) || 'null'); } catch (e) { return null; }
+}
+
+async function autosaveTick() {
+  if (_autosaving || !editor) return;
+  if (document.getElementById('page-editor').classList.contains('hidden')) return;
+  flushAutoApply();
+  if (!editorDirty()) return;
+  _autosaving = true;
+  try {
+    if (FUNNEL_LIVE) {
+      saveDraft();
+      setAutosaveStatus(`черновик ${hhmm()}`, 'draft',
+        'Воронка включена: изменения сохранены черновиком в браузере. Подписчики увидят их только после «Сохранить».');
+    } else {
+      await saveFunnel(true);
+    }
+  } finally { _autosaving = false; }
+}
+let _autosaveTimer = null;   // заводится при первом открытии редактора
+
+// Есть черновик, отличающийся от того, что пришло с сервера — предлагаем.
+function offerDraft() {
+  const bar = document.getElementById('draft-bar');
+  if (!bar) return;
+  bar.classList.add('hidden');
+  const d = readDraft(currentFunnelId);
+  if (!d || !d.state || d.state === EDITOR_SNAPSHOT) { if (d) dropDraft(currentFunnelId); return; }
+  // Воронку после черновика сохранили (другой вкладкой или человеком) —
+  // черновик устарел, восстанавливать его поверх новой версии опасно
+  const changedOnServer = d.base && d.base !== EDITOR_SNAPSHOT;
+  const when = new Date(d.at).toLocaleString('ru', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+  bar.innerHTML = `
+    <span>📝 Есть несохранённые изменения от ${when}${changedOnServer
+      ? ' — <b>но воронку с тех пор уже сохраняли</b>, восстановление заменит более новую версию' : ''}.</span>
+    <button class="btn primary" onclick="restoreDraft()">Восстановить</button>
+    <button class="btn" onclick="discardDraft()">Удалить черновик</button>`;
+  bar.classList.remove('hidden');
+}
+
+function restoreDraft() {
+  const d = readDraft(currentFunnelId);
+  document.getElementById('draft-bar').classList.add('hidden');
+  if (!d) return;
+  let st;
+  try { st = JSON.parse(d.state); } catch (e) { return; }
+  applyFunnelToCanvas({ name: st.name, trigger_type: st.trigger,
+    trigger_value: st.trigger === 'keyword' ? st.triggerValue : st.triggerTag, graph_ui: st.graph });
+  const on = new Set(st.bots || []);
+  document.querySelectorAll('#funnel-bots .pill').forEach(pill =>
+    pill.classList.toggle('on', on.has(pill.dataset.id)));
+  // снимок не трогаем: восстановленное — это несохранённые изменения
+  setAutosaveStatus('черновик восстановлен', 'draft', 'Черновик восстановлен — чтобы применить, нажмите «Сохранить».');
+}
+
+function discardDraft() {
+  dropDraft(currentFunnelId);
+  document.getElementById('draft-bar').classList.add('hidden');
 }
 
 // ---------- мультивыделение + копирование/вставка ----------
@@ -1461,6 +1637,14 @@ function isTypingIn(el) {
   return !!(el.closest && el.closest('[contenteditable="true"]'));
 }
 
+// Сочетание Ctrl/⌘+буква на любой раскладке. e.key на русской раскладке —
+// кириллица («с» вместо «c»), поэтому Ctrl+C, Ctrl+V и Ctrl+S молча не
+// срабатывали, стоило переключить язык. e.code — физическая клавиша, он от
+// раскладки не зависит; e.key оставлен для раскладок вроде Dvorak.
+function hotkey(e, letter) {
+  return e.code === 'Key' + letter.toUpperCase() || (e.key || '').toLowerCase() === letter;
+}
+
 function setupClipboard() {
   document.getElementById('drawflow').addEventListener('mousedown', e => {
     lastClickCtrl = e.ctrlKey || e.metaKey;
@@ -1472,11 +1656,11 @@ function setupClipboard() {
     const inField = isTypingIn(e.target);
     const mod = e.ctrlKey || e.metaKey;
     // Ctrl/⌘+S сохраняет даже из поля ввода — рука сама тянется
-    if (mod && e.key.toLowerCase() === 's') { e.preventDefault(); saveFunnel(); return; }
+    if (mod && hotkey(e, 's')) { e.preventDefault(); saveFunnel(); return; }
     if (inField) return;
-    if (mod && e.key.toLowerCase() === 'c') { e.preventDefault(); copyNodes(); }
-    else if (mod && e.key.toLowerCase() === 'v') { e.preventDefault(); pasteNodes(); }
-    else if (mod && e.key.toLowerCase() === 'd') { e.preventDefault(); copyNodes(); pasteNodes(); }
+    if (mod && hotkey(e, 'c')) { e.preventDefault(); copyNodes(); }
+    else if (mod && hotkey(e, 'v')) { e.preventDefault(); pasteNodes(); }
+    else if (mod && hotkey(e, 'd')) { e.preventDefault(); copyNodes(); pasteNodes(); }
     else if (e.key === 'Delete' || e.key === 'Backspace') {
       // 1) выделенная связь; 2) мультивыделение; 3) одиночный блок
       if (editor && editor.connection_selected) {
@@ -1784,6 +1968,9 @@ function setupLinkDropMenu() {
 }
 
 function copyNodes() {
+  // Правки в панели свойств применяются с задержкой 350 мс. Скопировать
+  // блок сразу после правки — значит скопировать его без неё.
+  flushAutoApply();
   const ids = multiSelection.size ? [...multiSelection] : (selectedNodeId != null ? [String(selectedNodeId)] : []);
   if (!ids.length) return;
   const nodes = ids.map(id => editor.getNodeFromId(id)).filter(Boolean);

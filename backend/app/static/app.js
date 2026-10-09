@@ -259,6 +259,18 @@ function go(page) {
     return;
   }
   if (page === 'team' && !(ME && ME.role === 'owner')) return;
+  // Уход из редактора воронки через меню раньше молча терял несохранённое:
+  // спрашивала только кнопка «Назад». Черновик пишем до вопроса — на случай,
+  // если «да» нажато по ошибке.
+  const edPage = document.getElementById('page-editor');
+  if (edPage && !edPage.classList.contains('hidden') && typeof editorDirty === 'function') {
+    if (typeof flushAutoApply === 'function') flushAutoApply();
+    if (editorDirty()) {
+      saveDraft();
+      if (!confirm('Есть несохранённые изменения в воронке — уйти без сохранения?\n\nОни останутся черновиком: при следующем открытии воронки их можно будет восстановить.')) return;
+    }
+    EDITOR_SNAPSHOT = null;
+  }
   if (page !== 'logs' && typeof closeLogs === 'function') closeLogs();
   document.querySelectorAll('.page').forEach(p => p.classList.add('hidden'));
   document.getElementById('page-' + page).classList.remove('hidden');

@@ -674,3 +674,16 @@ img.rt-emoji { width: 1.25em; height: 1.25em; vertical-align: -0.25em; object-fi
 .btn-icon-none { color: #b0b8c8; font-size: 16px; }
 .df-btn img.rt-emoji { width: 1.1em; height: 1.1em; }
 .bc-col .progress { width: 100%; max-width: none; }
+
+/* ---------- автосохранение воронки ---------- */
+/* Строкой под кнопкой «Сохранить»: в самой панели места нет — на ширине
+   1280 она заполнена до края, и любой текст сдвигал «Сохранить» за экран */
+.editor-toolbar { position: relative; }
+.autosave-status { position: absolute; right: 2px; top: calc(100% + 1px); font-size: 11px;
+  color: #8a93a6; white-space: nowrap; max-width: 60%; overflow: hidden; text-overflow: ellipsis;
+  cursor: default; pointer-events: auto; z-index: 2; }
+.autosave-status.draft { color: #b7791f; }
+.autosave-status.warn { color: #d33; }
+.draft-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 0 0 10px;
+  padding: 10px 14px; background: #fff8e6; border: 1px solid #f3dca4; border-radius: 10px; font-size: 13px; }
+.draft-bar span { flex: 1; min-width: 240px; }

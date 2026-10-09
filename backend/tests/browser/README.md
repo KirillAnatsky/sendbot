@@ -99,3 +99,14 @@ cd backend/tests/browser
 npm i playwright drawflow@0.0.60
 node palette_drop.test.js
 ```
+
+## hotkeys.test.js — сочетания клавиш на любой раскладке
+
+Ctrl/⌘+C, V, S, D в редакторе воронок обязаны срабатывать и на русской
+раскладке. Раньше копирование блоков «иногда» не работало — ровно когда был
+включён русский язык. Чистая функция, без браузера:
+
+```
+cd backend/tests/browser
+node hotkeys.test.js
+```
