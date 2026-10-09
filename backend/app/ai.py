@@ -880,8 +880,36 @@ def graph_to_spec(funnel) -> dict:
     }
 
 
-EDIT_SYSTEM_PROMPT = """Ты — AI-редактор воронок телеграм-бота. Тебе дают ТЕКУЩУЮ воронку в JSON и просьбу пользователя (перевести, изменить, дополнить).
+EDIT_SYSTEM_PROMPT = """Ты — AI-помощник внутри редактора воронки телеграм-бота. Тебе дают ТЕКУЩУЮ воронку в JSON, диалог с пользователем и иногда скриншоты.
 
+Что ты умеешь:
+1. Менять содержимое: переводить на другие языки, править и сокращать тексты, добавлять, убирать и переставлять шаги, кнопки, задержки, условия, теги, дожимы.
+2. Менять РАСПОЛОЖЕНИЕ блоков на холсте — «разложи удобно», «слишком близко», «куча перепутанных связей», «сделай как на скрине», «в строку», «столбиками». Это не правка воронки: тексты и связи не трогаются, двигаются только карточки.
+3. Отвечать на вопросы о воронке: что где происходит, куда ведёт кнопка, сколько шагов в ветке.
+
+Отвечай ТОЛЬКО JSON без markdown-ограждений:
+{"reply": "короткий ответ пользователю по-русски: что сделал или что уточнить",
+ "spec": null | {"name": ..., "trigger_type": ..., "trigger_value": ..., "nodes": [...]},
+ "layout": null | {"direction": "vertical" | "horizontal", "spacing": "compact" | "normal" | "wide"}}
+
+КОГДА ЧТО ЗАПОЛНЯТЬ
+- Просят только расположение — spec: null, layout заполнен. НЕ пересобирай воронку ради раскладки: любая пересборка рискует потерять текст.
+- Просят изменить содержимое — spec заполнен. Можно вместе с layout, если просят и то и другое.
+- Просто вопрос — spec: null, layout: null.
+- Не понял, чего хотят, — спроси одним коротким вопросом и предложи варианты (spec и layout — null). Но если просьба похожа на «разложи/упорядочь/сделай аккуратно/связи путаются» — это раскладка, действуй, не переспрашивай.
+
+РАСКЛАДКА
+- "vertical" — шаги идут сверху вниз, параллельные ветки (языки, варианты кнопок) стоят столбцами рядом друг с другом.
+- "horizontal" — шаги идут слева направо, ветки лежат строками друг под другом. Удобно для длинных цепочек сообщений и для нескольких языковых веток.
+- spacing: "compact" — плотнее, "normal" — как обычно, "wide" — просторнее (если жалуются, что всё слишком близко или связи сливаются).
+- Если направление не названо: длинные ветки (больше 6–7 шагов подряд) — "horizontal", иначе — "vertical".
+- Если приложен скриншот-пример — смотри, куда на нём идут шаги (вниз или вправо) и где стоят ветки, и выбирай то же направление. Если на скриншоте сама эта воронка в беспорядке — выбери раскладку, которая его исправит.
+- В reply скажи, как разложено, одной-двумя фразами, и что сохранить можно кнопкой «Сохранить».
+
+СКРИНШОТЫ
+Пользователь может приложить картинки: пример желаемого вида, текущий холст, чужую воронку, макет сообщения. Используй их как образец. Чего не видно или не разобрать — не выдумывай, скажи об этом в reply.
+
+ПРАВКА СОДЕРЖИМОГО (spec)
 Схема узлов — та же, что у конструктора: message (text, buttons, photo_url,
 text_first), delay, condition, action (add_tag, remove_tag, unsubscribe,
 check_subscription, delete_message), filter (conditions, yes, no), chain
@@ -889,13 +917,8 @@ check_subscription, delete_message), filter (conditions, yes, no), chain
 пользователь не просил трогать, возвращай как есть — вместе со всеми их
 полями. Потерянный блок — это пропавший кусок сценария у живых людей.
 
-Отвечай ТОЛЬКО JSON без markdown-ограждений:
-{"reply": "короткий ответ пользователю по-русски: что сделал/что уточнить",
- "spec": null | {"name": ..., "trigger_type": ..., "trigger_value": ..., "nodes": [...]}}
+Если меняешь — верни ПОЛНУЮ новую спеку всех узлов (формат узлов тот же, что во входных данных; поле "entry" не возвращай — первый узел списка станет входом).
 
-spec = null, если менять нечего (просто вопрос). Если меняешь — верни ПОЛНУЮ новую спеку всех узлов (формат узлов тот же, что во входных данных; поле "entry" не возвращай — первый узел списка станет входом).
-
-Правила:
 - Сохраняй существующие id узлов, которые не менял; новым давай id вида "n1","n2".
 - Тексты, которые не просили менять, переноси ДОСЛОВНО.
 - В условиях/действиях поле tag — ИМЯ тега (латинский slug). Несуществующие теги создадутся автоматически.
@@ -904,9 +927,29 @@ spec = null, если менять нечего (просто вопрос). Е�
 - next: null — конец ветки.
 """
 
+LAYOUT_DIRECTIONS = {"vertical", "horizontal"}
+LAYOUT_SPACINGS = {"compact", "normal", "wide"}
 
-async def chat_edit_funnel(session, funnel, tags_list, user_messages: list, provider, api_key, model):
-    """-> (reply_text, new_fields | None, in_tokens, out_tokens)"""
+
+def clean_layout(raw) -> dict | None:
+    """Команда раскладки от модели — только из известных значений."""
+    if not isinstance(raw, dict):
+        return None
+    direction = str(raw.get("direction") or "").strip().lower()
+    if direction not in LAYOUT_DIRECTIONS:
+        return None
+    spacing = str(raw.get("spacing") or "normal").strip().lower()
+    if spacing not in LAYOUT_SPACINGS:
+        spacing = "normal"
+    return {"direction": direction, "spacing": spacing}
+
+
+async def chat_edit_funnel(session, funnel, tags_list, user_messages: list, provider, api_key, model,
+                           images: list | None = None, graph: dict | None = None):
+    """-> (reply_text, new_fields | None, layout | None, in_tokens, out_tokens)
+
+    images — скриншоты к последнему сообщению; graph — скомпилированный граф
+    того, что сейчас на холсте (с несохранёнными правками), если он есть."""
     import json as _json
 
     from .models import Funnel
@@ -917,7 +960,14 @@ async def chat_edit_funnel(session, funnel, tags_list, user_messages: list, prov
     chain_names = {str(fid): name for fid, name in (await session.execute(
         select(Funnel.id, Funnel.name).where(Funnel.is_chain == True)  # noqa: E712
     )).all()}
-    spec = graph_to_spec(funnel)
+    # модель смотрит на то, что человек видит на холсте, а не на последнее
+    # сохранение: иначе несохранённые правки молча терялись бы при ответе
+    src = funnel
+    if graph:
+        from types import SimpleNamespace
+        src = SimpleNamespace(graph=graph, name=funnel.name, trigger_type=funnel.trigger_type,
+                              trigger_value=funnel.trigger_value)
+    spec = graph_to_spec(src)
     for n in spec["nodes"]:
         if n.get("tag") is not None:
             n["tag"] = id2name.get(str(n["tag"]), str(n["tag"]))
@@ -930,11 +980,16 @@ async def chat_edit_funnel(session, funnel, tags_list, user_messages: list, prov
     convo = "ТЕКУЩАЯ ВОРОНКА:\n" + _json.dumps(spec, ensure_ascii=False) + "\n\nДИАЛОГ:\n"
     for m in user_messages[-12:]:
         role = "Пользователь" if m.get("role") == "user" else "Ассистент"
-        convo += f"{role}: {m.get('content','')}\n"
+        shots = " [приложены скриншоты]" if m.get("images") else ""
+        convo += f"{role}: {m.get('content','')}{shots}\n"
+    if images:
+        convo += f"\n(К последнему сообщению приложено скриншотов: {len(images)} — они выше.)\n"
 
-    text, tin, tout = await call_llm_system(provider, api_key, model, EDIT_SYSTEM_PROMPT, convo)
+    text, tin, tout = await call_llm_system(provider, api_key, model, EDIT_SYSTEM_PROMPT, convo,
+                                            images=images)
     data = parse_llm_json(text)
     reply = data.get("reply") or "Готово."
+    layout = clean_layout(data.get("layout"))
     new_spec = data.get("spec")
     fields = None
     if new_spec:
@@ -946,11 +1001,12 @@ async def chat_edit_funnel(session, funnel, tags_list, user_messages: list, prov
         if not new_spec.get("trigger_type"):
             fields["trigger_type"] = funnel.trigger_type
             fields["trigger_value"] = funnel.trigger_value
-    return reply, fields, tin, tout
+    return reply, fields, layout, tin, tout
 
 
-async def call_llm_system(provider, api_key, model, system, user_text):
-    """Как call_llm, но с произвольным системным промптом."""
+async def call_llm_system(provider, api_key, model, system, user_text, images=None):
+    """Как call_llm, но с произвольным системным промптом. images — картинки
+    перед текстом, как в сборке по скриншотам."""
     timeout = aiohttp.ClientTimeout(total=300)
     async with aiohttp.ClientSession(timeout=timeout) as http:
         if provider == "anthropic":
@@ -959,7 +1015,8 @@ async def call_llm_system(provider, api_key, model, system, user_text):
                 headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
                          "content-type": "application/json"},
                 json={"model": model, "max_tokens": 16000, "system": system,
-                      "messages": [{"role": "user", "content": user_text}]},
+                      "messages": [{"role": "user",
+                                    "content": _anthropic_content(user_text, images)}]},
             )
             data = await r.json()
             if r.status != 200:
@@ -973,7 +1030,7 @@ async def call_llm_system(provider, api_key, model, system, user_text):
                 headers={"Authorization": f"Bearer {api_key}"},
                 json={"model": model, "messages": [
                     {"role": "system", "content": system},
-                    {"role": "user", "content": user_text}]},
+                    {"role": "user", "content": _openai_content(user_text, images)}]},
             )
             data = await r.json()
             if r.status != 200:

@@ -1230,6 +1230,7 @@ function toggleAiChat() {
   const el = document.getElementById('ai-chat');
   el.classList.toggle('hidden');
   if (!el.classList.contains('hidden')) {
+    setupAiChatShots();
     renderAiChat();
     document.getElementById('ai-chat-text').focus();
   }
@@ -1238,19 +1239,86 @@ function toggleAiChat() {
 function renderAiChat() {
   const box = document.getElementById('ai-chat-msgs');
   const hist = AI_CHAT_HISTORY[currentFunnelId] || [];
-  const intro = box.querySelector('.aim.intro-keep') ? '' : box.children[0]?.outerHTML || '';
-  box.innerHTML = intro + hist.map(m =>
-    `<div class="aim ${m.role}">${esc(m.content)}</div>`).join('');
+  if (!box._intro) box._intro = box.children[0]?.outerHTML || '';
+  box.innerHTML = box._intro + hist.map(m =>
+    `<div class="aim ${m.role}">${(m.images || []).length ? `<div class="aim-shots">${
+      m.images.map(im => `<img src="/${esc(im.path)}" alt="">`).join('')}</div>` : ''}${esc(m.content)}</div>`).join('');
   box.scrollTop = box.scrollHeight;
+  renderAiChatShots();
+}
+
+// ---------- скриншоты в AI-чате ----------
+// Пример того, как должно выглядеть, объяснить словами трудно — проще
+// показать. Картинки грузятся сразу (тот же /ai/screens, что у сборки по
+// скриншотам) и уходят модели вместе со следующим сообщением.
+const AI_CHAT_MAX_SHOTS = 4;
+let AI_CHAT_SHOTS = [];   // [{path, name}]
+
+function renderAiChatShots() {
+  const box = document.getElementById('ai-chat-shots');
+  if (!box) return;
+  box.classList.toggle('hidden', !AI_CHAT_SHOTS.length);
+  box.innerHTML = AI_CHAT_SHOTS.map((im, i) => `
+    <div class="ai-shot"><img src="/${esc(im.path)}" alt="">
+      <button type="button" title="убрать" onclick="AI_CHAT_SHOTS.splice(${i},1);renderAiChatShots()">✕</button></div>`).join('');
+}
+
+async function aiChatAttach(files) {
+  files = files.filter(f => /^image\/(png|jpeg|webp|gif)$/.test(f.type));
+  if (!files.length) return;
+  const room = AI_CHAT_MAX_SHOTS - AI_CHAT_SHOTS.length;
+  if (room <= 0) { alert(`Не больше ${AI_CHAT_MAX_SHOTS} скриншотов к одному сообщению`); return; }
+  files = files.slice(0, room);
+  const fd = new FormData();
+  // у вставки из буфера нет имени — даём, иначе сервер не поймёт формат
+  files.forEach((f, i) => fd.append('files', f,
+    f.name && /\.\w+$/.test(f.name) ? f.name : `screen${i}.${(f.type.split('/')[1] || 'png').replace('jpeg', 'jpg')}`));
+  const box = document.getElementById('ai-chat-shots');
+  box.classList.remove('hidden');
+  box.insertAdjacentHTML('beforeend', '<div class="ai-shot loading">загрузка…</div>');
+  try {
+    const r = await fetch('/api/ai/screens', {
+      method: 'POST', headers: { 'Authorization': 'Bearer ' + TOKEN }, body: fd });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.detail || 'Не удалось загрузить картинку');
+    AI_CHAT_SHOTS = AI_CHAT_SHOTS.concat(data.images.map(im => ({ path: im.path, name: im.name })));
+  } catch (e) { alert(e.message); }
+  renderAiChatShots();
+}
+
+function setupAiChatShots() {
+  const chat = document.getElementById('ai-chat');
+  if (!chat || chat._shotsReady) return;
+  chat._shotsReady = true;
+  // Ctrl/⌘+V картинки — прямо в поле ввода
+  document.getElementById('ai-chat-text').addEventListener('paste', e => {
+    const files = [...(e.clipboardData || {}).files || []].filter(f => f.type.startsWith('image/'));
+    if (files.length) { e.preventDefault(); aiChatAttach(files); }
+  });
+  // перетащить в окно чата
+  chat.addEventListener('dragover', e => {
+    if ([...e.dataTransfer.types].includes('Files')) { e.preventDefault(); chat.classList.add('drag'); }
+  });
+  chat.addEventListener('dragleave', e => { if (!chat.contains(e.relatedTarget)) chat.classList.remove('drag'); });
+  chat.addEventListener('drop', e => {
+    if (![...e.dataTransfer.types].includes('Files')) return;
+    e.preventDefault();
+    chat.classList.remove('drag');
+    aiChatAttach([...e.dataTransfer.files]);
+  });
 }
 
 async function aiChatSend() {
   const ta = document.getElementById('ai-chat-text');
-  const text = ta.value.trim();
-  if (!text) return;
+  let text = ta.value.trim();
+  const shots = AI_CHAT_SHOTS;
+  if (!text && !shots.length) return;
+  if (!text) text = 'Сделай как на скриншоте';
   ta.value = '';
+  AI_CHAT_SHOTS = [];
+  flushAutoApply();
   const hist = (AI_CHAT_HISTORY[currentFunnelId] = AI_CHAT_HISTORY[currentFunnelId] || []);
-  hist.push({ role: 'user', content: text });
+  hist.push({ role: 'user', content: text, images: shots });
   renderAiChat();
   const box = document.getElementById('ai-chat-msgs');
   box.insertAdjacentHTML('beforeend', '<div class="aim assistant typing">думаю…</div>');
@@ -1258,17 +1326,33 @@ async function aiChatSend() {
   document.getElementById('ai-chat-send').disabled = true;
   try {
     const r = await api('/ai/edit', { method: 'POST', body: {
-      funnel_id: currentFunnelId, messages: hist } });
+      funnel_id: currentFunnelId,
+      // картинки модель получает только к последнему сообщению — в истории
+      // остаётся пометка, что они были
+      messages: hist.map(m => ({ role: m.role, content: m.content, images: (m.images || []).length })),
+      image_paths: shots.map(im => im.path),
+      // то, что на холсте сейчас, с несохранёнными правками
+      graph_ui: editor.export(),
+    } });
     hist.push({ role: 'assistant', content: r.reply });
     renderAiChat();
     if (r.updated) {
       // граф приходит прямо в ответе — рисуем сразу, без второго запроса
       const f = r.funnel || await api('/funnels/' + currentFunnelId);
       applyFunnelToCanvas(f);
-      setTimeout(() => { EDITOR_SNAPSHOT = editorStateJson(); }, 120);
+      setTimeout(() => {
+        EDITOR_SNAPSHOT = editorStateJson();
+        if (r.layout) arrangeFunnel(r.layout);   // раскладка — поверх сохранённой
+      }, 120);
       flashStatus('Воронка обновлена ✅');
+    } else if (r.layout) {
+      // только расположение: двигаем карточки, содержимое не трогаем.
+      // На сервер не уходит само — это обычная несохранённая правка
+      arrangeFunnel(r.layout);
     }
   } catch (e) {
+    // картинки не пропадают: можно поправить запрос и отправить снова
+    if (!AI_CHAT_SHOTS.length) AI_CHAT_SHOTS = shots;
     hist.push({ role: 'assistant', content: '⚠️ ' + (e.message || 'ошибка') });
     renderAiChat();
   } finally {
@@ -1306,13 +1390,25 @@ function applyFunnelToCanvas(f) {
   }, 50);
 }
 
-// ---------- вертикальная авторасстановка ----------
-// Ветки воронки раскладываем столбцами: каждая ветка — своя вертикальная
-// дорожка, глубина — ряд. Именно ради этого кнопка и нужна: у воронки с
-// десятью языками получается десять параллельных столбцов, а не каша.
-// Раньше все узлы одной глубины просто выстраивались в ряд, и на длинных
-// ветках соседние дорожки перемешивались между собой.
-function arrangeVertical() {
+// ---------- авторасстановка ----------
+// Две раскладки одной и той же структуры:
+//   vertical   — шаги идут сверху вниз, ветки (языки, кнопки) — столбцами;
+//   horizontal — шаги идут слева направо, ветки — строками сверху вниз.
+// Ради столбцов кнопка «Разложить» и появилась: у воронки с десятью языками
+// получается десять параллельных дорожек, а не каша. Раньше все узлы одной
+// глубины просто выстраивались в ряд, и на длинных ветках соседние дорожки
+// перемешивались между собой.
+//
+// spacing — плотность: compact | normal | wide. Меняет только промежутки,
+// карточки остаются своего размера.
+const LAYOUT_SPACING = { compact: 0.6, normal: 1, wide: 1.6 };
+
+function arrangeVertical() { arrangeFunnel({ direction: 'vertical' }); }
+
+function arrangeFunnel(opts) {
+  opts = opts || {};
+  const direction = opts.direction === 'horizontal' ? 'horizontal' : 'vertical';
+  const k = LAYOUT_SPACING[opts.spacing] || 1;
   const df = editor.export().drawflow.Home.data;
   const flow = {}, notes = {};
   Object.values(df).forEach(n => {
@@ -1320,7 +1416,7 @@ function arrangeVertical() {
   });
 
   // потомки в порядке портов: output_1, output_2 … — это порядок веток
-  // на карточке, и столбцы должны идти так же, как кнопки сверху вниз
+  // на карточке, и дорожки должны идти так же, как кнопки сверху вниз
   const childrenOf = id => {
     const node = df[id] || {};
     const out = [];
@@ -1337,7 +1433,7 @@ function arrangeVertical() {
   let group = 0;
 
   // Стартуем от «Старта», потом отдельными группами разбираем всё, до чего
-  // из него не дойти: оторванный кусок должен лечь под воронкой, а не влезть
+  // из него не дойти: оторванный кусок должен лечь после воронки, а не влезть
   // первым рядом в середину (раньше он получал глубину 1 и всё ломал).
   let startId = null;
   Object.values(df).forEach(n => { if (n.name === 'start') startId = String(n.id); });
@@ -1361,21 +1457,21 @@ function arrangeVertical() {
         }
       });
     }
-    // первая ветка продолжает столбец родителя, каждая следующая встаёт
-    // правее всего, что заняло предыдущее поддерево — так дорожки не лезут
+    // первая ветка продолжает дорожку родителя, каждая следующая встаёт
+    // за всем, что заняло предыдущее поддерево — так дорожки не лезут
     // друг на друга даже при разной длине веток
-    (function columns(id, c) {
+    (function lanes(id, c) {
       col[id] = c;
       let max = c;
       childrenOf(id).forEach((t, i) => {
         if (col[t] !== undefined) return;   // ветки сошлись — узел уже размещён
-        max = Math.max(max, columns(t, i === 0 ? c : max + 1));
+        max = Math.max(max, lanes(t, i === 0 ? c : max + 1));
       });
       return max;
     })(root, 0);
   });
 
-  // заметки живут рядом со своим блоком, в свободных столбцах справа
+  // заметки живут рядом со своим блоком
   const notesByAbout = {};
   const homeless = [];
   Object.entries(notes).forEach(([id, n]) => {
@@ -1384,52 +1480,123 @@ function arrangeVertical() {
     else homeless.push(id);
   });
 
-  const X_STEP = 400, Y_GAP = 70, GROUP_GAP = 140;
+  const sizeOf = id => {
+    const el = document.getElementById('node-' + id);
+    return { w: (el && el.offsetWidth) || 240, h: (el && el.offsetHeight) || 120 };
+  };
   const place = (id, x, yy) => {
     const el = document.getElementById('node-' + id);
-    if (!el) return 0;
+    if (!el) return;
     el.style.left = x + 'px';
     el.style.top = yy + 'px';
     const n = editor.drawflow.drawflow.Home.data[id];
     if (n) { n.pos_x = x; n.pos_y = yy; }
-    return el.offsetHeight || 120;
   };
 
-  const rows = {};                       // "группа:глубина" -> [id]
-  Object.keys(flow).forEach(id => {
-    const key = groupOf[id] + ':' + depth[id];
-    (rows[key] = rows[key] || []).push(id);
-  });
-  Object.values(rows).forEach(arr => arr.sort((a, b) => col[a] - col[b] || +a - +b));
+  const GROUP_GAP = Math.round(140 * k);
+  let farEdge = 60;   // куда класть заметки, потерявшие свой блок
 
-  let y = 60, prevGroup = 0;
-  Object.keys(rows).sort((a, b) => {
-    const [ga, da] = a.split(':').map(Number);
-    const [gb, db] = b.split(':').map(Number);
-    return ga - gb || da - db;
-  }).forEach(key => {
-    const g = +key.split(':')[0];
-    if (g !== prevGroup) { y += GROUP_GAP; prevGroup = g; }
-    let maxH = 0;
-    let freeCol = Math.max(...rows[key].map(id => col[id])) + 1;
-    rows[key].forEach(id => {
-      maxH = Math.max(maxH, place(id, 60 + col[id] * X_STEP, y));
-      (notesByAbout[id] || []).forEach(nid => {
-        maxH = Math.max(maxH, place(nid, 60 + freeCol++ * X_STEP, y));
-      });
+  if (direction === 'vertical') {
+    // глубина — ряд, дорожка — столбец
+    const X_STEP = Math.round(Math.max(...Object.keys(df).map(id => sizeOf(id).w), 220) + 180 * k);
+    const Y_GAP = Math.round(70 * k);
+    const rows = {};                       // "группа:глубина" -> [id]
+    Object.keys(flow).forEach(id => {
+      const key = groupOf[id] + ':' + depth[id];
+      (rows[key] = rows[key] || []).push(id);
     });
-    y += maxH + Y_GAP;
-  });
+    Object.values(rows).forEach(arr => arr.sort((a, b) => col[a] - col[b] || +a - +b));
 
-  // заметки, потерявшие свой блок, — отдельной строкой внизу
-  homeless.forEach((id, i) => place(id, 60 + i * X_STEP, y + GROUP_GAP));
+    let y = 60, prevGroup = 0;
+    Object.keys(rows).sort((a, b) => {
+      const [ga, da] = a.split(':').map(Number);
+      const [gb, db] = b.split(':').map(Number);
+      return ga - gb || da - db;
+    }).forEach(key => {
+      const g = +key.split(':')[0];
+      if (g !== prevGroup) { y += GROUP_GAP; prevGroup = g; }
+      let maxH = 0;
+      let freeCol = Math.max(...rows[key].map(id => col[id])) + 1;
+      rows[key].forEach(id => {
+        place(id, 60 + col[id] * X_STEP, y);
+        maxH = Math.max(maxH, sizeOf(id).h);
+        (notesByAbout[id] || []).forEach(nid => {
+          place(nid, 60 + freeCol++ * X_STEP, y);
+          maxH = Math.max(maxH, sizeOf(nid).h);
+        });
+      });
+      y += maxH + Y_GAP;
+    });
+    farEdge = y + GROUP_GAP;
+    homeless.forEach((id, i) => place(id, 60 + i * X_STEP, farEdge));
+  } else {
+    // глубина — столбец, дорожка — строка; высота строки — по самой
+    // высокой карточке в ней (вместе с заметками, которые висят под блоком)
+    const X_STEP = Math.round(Math.max(...Object.keys(flow).map(id => sizeOf(id).w), 220) + 120 * k);
+    const Y_GAP = Math.round(60 * k);
+    const NOTE_GAP = Math.round(16 * k);
+    const lanes = {};                      // "группа:дорожка" -> [id]
+    Object.keys(flow).forEach(id => {
+      const key = groupOf[id] + ':' + col[id];
+      (lanes[key] = lanes[key] || []).push(id);
+    });
+    let y = 60, prevGroup = 0;
+    Object.keys(lanes).sort((a, b) => {
+      const [ga, ca] = a.split(':').map(Number);
+      const [gb, cb] = b.split(':').map(Number);
+      return ga - gb || ca - cb;
+    }).forEach(key => {
+      const g = +key.split(':')[0];
+      if (g !== prevGroup) { y += GROUP_GAP; prevGroup = g; }
+      let laneH = 0;
+      lanes[key].forEach(id => {
+        const x = 60 + depth[id] * X_STEP;
+        place(id, x, y);
+        let h = sizeOf(id).h;
+        (notesByAbout[id] || []).forEach(nid => {
+          place(nid, x, y + h + NOTE_GAP);
+          h += NOTE_GAP + sizeOf(nid).h;
+        });
+        laneH = Math.max(laneH, h);
+      });
+      y += laneH + Y_GAP;
+    });
+    farEdge = y + GROUP_GAP;
+    homeless.forEach((id, i) => place(id, 60 + i * X_STEP, farEdge));
+  }
 
   Object.keys(df).forEach(id => {
     try { editor.updateConnectionNodes('node-' + id); } catch (e) {}
   });
   decoratePorts();
   refreshStepNumbers();
-  flashStatus('Разложено столбцами');
+  if (typeof syncQuickActions === 'function') syncQuickActions();
+  flashStatus(direction === 'vertical' ? 'Разложено столбцами' : 'Разложено строками');
+}
+
+// Меню у кнопки «Разложить»: столбцами или строками
+function toggleArrangeMenu(btn) {
+  let m = document.getElementById('arrange-menu');
+  if (m) { m.remove(); return; }
+  m = document.createElement('div');
+  m.id = 'arrange-menu';
+  m.className = 'arrange-menu';
+  m.innerHTML = `
+    <button type="button" data-d="vertical">⬇️ Столбцами <small>шаги сверху вниз, ветки рядом</small></button>
+    <button type="button" data-d="horizontal">➡️ Строками <small>шаги слева направо, ветки друг под другом</small></button>
+    <label><input type="checkbox" id="arrange-wide"> просторнее</label>`;
+  const r = btn.getBoundingClientRect();
+  m.style.left = r.left + 'px';
+  m.style.top = (r.bottom + 4) + 'px';
+  document.body.appendChild(m);
+  m.querySelectorAll('[data-d]').forEach(b => b.onclick = () => {
+    const wide = m.querySelector('#arrange-wide').checked;
+    m.remove();
+    arrangeFunnel({ direction: b.dataset.d, spacing: wide ? 'wide' : 'normal' });
+  });
+  setTimeout(() => document.addEventListener('mousedown', function off(e) {
+    if (!m.contains(e.target) && e.target !== btn) { m.remove(); document.removeEventListener('mousedown', off); }
+  }), 0);
 }
 
 // ---------- сохранение ----------

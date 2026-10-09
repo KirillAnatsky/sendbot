@@ -6,7 +6,7 @@
 <title>SendBot — админка</title>
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/drawflow@0.0.60/dist/drawflow.min.css">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 100 100%27%3E%3Ctext y=%27.9em%27 font-size=%2790%27%3E%F0%9F%A4%96%3C/text%3E%3C/svg%3E">
-<link rel="stylesheet" href="style.css?v=52">
+<link rel="stylesheet" href="style.css?v=53">
 </head>
 <body>
 
@@ -225,7 +225,7 @@
         <span id="trigger-tag-hint" class="hint-inline hidden">запускать воронку, когда подписчику добавляют этот тег</span>
         <span id="chain-hint" class="hint-inline hidden">Цепочка. Сама не запускается — работает, когда её вызывает блок «Цепочка» в воронке, под её ботом.</span>
         <span class="spacer"></span>
-        <button class="btn" onclick="arrangeVertical()">🧹 Разложить</button>
+        <button class="btn" onclick="toggleArrangeMenu(this)">🧹 Разложить ▾</button>
         <button class="btn" onclick="toggleStepsDrawer()">📊 Шаги</button>
         <button class="btn" onclick="toggleAiChat()">🤖 AI</button>
         <span id="autosave-status" class="autosave-status"></span>
@@ -239,11 +239,18 @@
           <button class="btn" onclick="toggleAiChat()">✕</button>
         </div>
         <div id="ai-chat-msgs" class="ai-chat-msgs">
-          <div class="aim assistant">Могу перевести воронку на другие языки, изменить тексты,
-          добавить шаги. Примеры: «переведи воронку на английский и испанский — в начале спроси язык кнопками»,
-          «добавь дожим через день после оффера», «сделай тексты короче».</div>
+          <div class="aim assistant">Могу менять воронку и её вид на холсте:
+          <br>• переводить на другие языки, править и сокращать тексты, добавлять шаги и дожимы;
+          <br>• раскладывать блоки аккуратно — «разложи удобно, связи путаются», «шаги слева направо», «сделай просторнее»;
+          <br>• отвечать на вопросы о воронке.
+          <br>Можно приложить скриншот с примером, как должно выглядеть, — 📎, вставка Ctrl/⌘+V или перетащить в окно.</div>
         </div>
+        <div id="ai-chat-shots" class="ai-chat-shots hidden"></div>
         <div class="ai-chat-input">
+          <button class="btn ai-chat-clip" type="button" title="Приложить скриншот"
+            onclick="document.getElementById('ai-chat-file').click()">📎</button>
+          <input type="file" id="ai-chat-file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden
+            onchange="aiChatAttach([...this.files]); this.value=''">
           <textarea id="ai-chat-text" rows="2" placeholder="Что сделать с воронкой?"
             onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();aiChatSend()}"></textarea>
           <button class="btn primary" id="ai-chat-send" onclick="aiChatSend()">➤</button>
@@ -723,15 +730,15 @@
 
 <script src="https://cdn.jsdelivr.net/npm/drawflow@0.0.60/dist/drawflow.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-<script src="app.js?v=52"></script>
-<script src="richtext.js?v=52"></script>
-<script src="emoji.js?v=52"></script>
-<script src="media.js?v=52"></script>
-<script src="segment.js?v=52"></script>
-<script src="bot.js?v=52"></script>
-<script src="dashboard.js?v=52"></script>
-<script src="sheets.js?v=52"></script>
-<script src="analysis.js?v=52"></script>
-<script src="editor.js?v=52"></script>
+<script src="app.js?v=53"></script>
+<script src="richtext.js?v=53"></script>
+<script src="emoji.js?v=53"></script>
+<script src="media.js?v=53"></script>
+<script src="segment.js?v=53"></script>
+<script src="bot.js?v=53"></script>
+<script src="dashboard.js?v=53"></script>
+<script src="sheets.js?v=53"></script>
+<script src="analysis.js?v=53"></script>
+<script src="editor.js?v=53"></script>
 </body>
 </html>

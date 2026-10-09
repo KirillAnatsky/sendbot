@@ -2265,7 +2265,11 @@ async def ai_generate(body: GenerateIn, session=Depends(get_session)):
 
 class AIEditIn(BaseModel):
     funnel_id: int
-    messages: list  # [{role: user|assistant, content: str}]
+    messages: list  # [{role: user|assistant, content: str, images?: [path]}]
+    # скриншоты к последнему сообщению (пути из /ai/screens)
+    image_paths: list[str] = []
+    # то, что сейчас на холсте, вместе с несохранёнными правками
+    graph_ui: dict | None = None
 
 
 @router.post("/ai/edit", dependencies=[Depends(require("ai", "edit"))])
@@ -2285,9 +2289,17 @@ async def ai_edit(body: AIEditIn, session=Depends(get_session)):
     req = AIRequest(provider=provider, model=model)
     session.add(req)
     await session.flush()
+    images = _load_screens(body.image_paths) if body.image_paths else None
+    graph = None
+    if body.graph_ui:
+        try:
+            graph = compile_graph(body.graph_ui)
+        except GraphError:
+            graph = None   # на холсте недоделанная воронка — берём сохранённую
     try:
-        reply, fields, tin, tout = await ai.chat_edit_funnel(
-            session, funnel, tags_list, body.messages, provider, s["api_key"], model
+        reply, fields, layout, tin, tout = await ai.chat_edit_funnel(
+            session, funnel, tags_list, body.messages, provider, s["api_key"], model,
+            images=images, graph=graph,
         )
         req.input_tokens, req.output_tokens = tin, tout
         req.funnel_id = funnel.id
@@ -2314,6 +2326,7 @@ async def ai_edit(body: AIEditIn, session=Depends(get_session)):
     return {
         "reply": reply,
         "updated": updated,
+        "layout": layout,
         "tokens": req.input_tokens + req.output_tokens,
         "funnel": {
             "id": funnel.id,

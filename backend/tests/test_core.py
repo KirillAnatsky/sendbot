@@ -2517,3 +2517,102 @@ async def test_broadcast_resume_keeps_audience(session, monkeypatch):
     assert (bc.total, bc.sent, bc.failed) == (4, 3, 1)
     n = len((await session.execute(select(BroadcastRecipient))).scalars().all())
     assert n == 4
+
+
+# ---------- AI-чат воронки: раскладка и скриншоты ----------
+
+def test_ai_layout_command_is_sanitized():
+    from app.ai import clean_layout
+
+    assert clean_layout({"direction": "horizontal", "spacing": "wide"}) == \
+        {"direction": "horizontal", "spacing": "wide"}
+    assert clean_layout({"direction": "VERTICAL"}) == {"direction": "vertical", "spacing": "normal"}
+    assert clean_layout({"direction": "vertical", "spacing": "huge"})["spacing"] == "normal"
+    assert clean_layout({"direction": "diagonal"}) is None
+    assert clean_layout(None) is None
+    assert clean_layout("horizontal") is None
+
+
+async def test_ai_chat_layout_only_does_not_rebuild_funnel(session, monkeypatch):
+    """Просьба «разложи удобно» не пересобирает воронку: модель отдаёт
+    только команду раскладки, а тексты и связи остаются как были."""
+    import json
+
+    from app import ai
+    from app.graph import compile_graph
+    from app.models import Funnel
+
+    graph_ui = {"drawflow": {"Home": {"data": {
+        "1": {"id": 1, "name": "start", "data": {}, "inputs": {},
+              "outputs": {"output_1": {"connections": [{"node": "2", "output": "input_1"}]}},
+              "pos_x": 0, "pos_y": 0},
+        "2": {"id": 2, "name": "message", "data": {"text": "Привет"},
+              "inputs": {"input_1": {"connections": [{"node": "1", "input": "output_1"}]}},
+              "outputs": {"output_1": {"connections": []}}, "pos_x": 0, "pos_y": 0},
+    }}}}
+    f = Funnel(name="F", trigger_type="start", graph_ui=graph_ui, graph=compile_graph(graph_ui))
+    session.add(f)
+    await session.commit()
+
+    seen = {}
+
+    async def fake_llm(provider, key, model, system, text, images=None):
+        seen.update(system=system, text=text, images=images)
+        return json.dumps({"reply": "Разложил строками", "spec": None,
+                           "layout": {"direction": "horizontal", "spacing": "wide"}}), 10, 5
+
+    monkeypatch.setattr(ai, "call_llm_system", fake_llm)
+    shots = [{"media_type": "image/png", "data": "AAAA"}]
+    reply, fields, layout, tin, tout = await ai.chat_edit_funnel(
+        session, f, [], [{"role": "user", "content": "разложи удобно, связи путаются"}],
+        "anthropic", "k", "m", images=shots)
+    assert fields is None                      # воронку не трогали
+    assert layout == {"direction": "horizontal", "spacing": "wide"}
+    assert reply == "Разложил строками"
+    assert seen["images"] == shots             # скриншот дошёл до модели
+    assert "скриншотов: 1" in seen["text"]
+    assert "РАСКЛАДКА" in seen["system"] and "layout" in seen["system"]
+
+
+async def test_ai_chat_sees_unsaved_canvas(session, monkeypatch):
+    """Модель видит то, что сейчас на холсте, а не последнее сохранение."""
+    import json
+
+    from app import ai
+    from app.graph import compile_graph
+    from app.models import Funnel
+
+    def gui(text):
+        return {"drawflow": {"Home": {"data": {
+            "1": {"id": 1, "name": "start", "data": {}, "inputs": {},
+                  "outputs": {"output_1": {"connections": [{"node": "2", "output": "input_1"}]}}},
+            "2": {"id": 2, "name": "message", "data": {"text": text},
+                  "inputs": {"input_1": {"connections": [{"node": "1", "input": "output_1"}]}},
+                  "outputs": {"output_1": {"connections": []}}},
+        }}}}
+
+    f = Funnel(name="F", trigger_type="start", graph_ui=gui("старый текст"),
+               graph=compile_graph(gui("старый текст")))
+    session.add(f)
+    await session.commit()
+    seen = {}
+
+    async def fake_llm(provider, key, model, system, text, images=None):
+        seen["text"] = text
+        return json.dumps({"reply": "ок", "spec": None, "layout": None}), 1, 1
+
+    monkeypatch.setattr(ai, "call_llm_system", fake_llm)
+    await ai.chat_edit_funnel(session, f, [], [{"role": "user", "content": "что тут?"}],
+                              "anthropic", "k", "m", graph=compile_graph(gui("несохранённая правка")))
+    assert "несохранённая правка" in seen["text"] and "старый текст" not in seen["text"]
+
+
+def test_llm_content_puts_images_before_text():
+    from app.ai import _anthropic_content, _openai_content
+
+    im = [{"media_type": "image/png", "data": "QQ=="}]
+    a = _anthropic_content("сделай так", im)
+    assert a[0]["type"] == "image" and a[-1] == {"type": "text", "text": "сделай так"}
+    o = _openai_content("сделай так", im)
+    assert o[0]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert _anthropic_content("без картинок", None) == "без картинок"

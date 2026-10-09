@@ -52,7 +52,7 @@ const ctx = {
 };
 const vm = require('vm');
 vm.createContext(ctx);
-vm.runInContext(src + '\n;__api = {arrangeVertical};', ctx);
+vm.runInContext(src + '\n;__api = {arrangeVertical, arrangeFunnel};', ctx);
 
 let failed = 0;
 function check(name, fn) {
@@ -218,6 +218,83 @@ check('заметка встаёт рядом со своим блоком, а �
   const p = pos(d);
   eq(p['7'].y, p['2'].y, 'в одном ряду со своим блоком:');
   eq(p['7'].x > p['2'].x, true, 'и правее него:');
+});
+
+// ---------- раскладка строками: шаги слева направо, ветки друг под другом ----------
+
+function langFunnel(branches, steps) {
+  // старт -> «Язык» с N ветками, в каждой цепочка из steps сообщений
+  const outs = {};
+  const nodes = [['1', 'start', { output_1: ['2'] }]];
+  for (let b = 0; b < branches; b++) {
+    const first = 100 + b * 10;
+    outs['output_' + (b + 1)] = [String(first)];
+    for (let k = 0; k < steps; k++) {
+      const id = first + k;
+      nodes.push([String(id), 'message', k < steps - 1 ? { output_1: [String(id + 1)] } : {}]);
+    }
+  }
+  nodes.splice(1, 0, ['2', 'language', outs]);
+  return build(nodes);
+}
+
+check('строками: каждая языковая ветка — своя строка, шаги идут вправо', () => {
+  const d = langFunnel(3, 8);
+  ctx.__api.arrangeFunnel({ direction: 'horizontal' });
+  const p = pos(d);
+  for (let b = 0; b < 3; b++) {
+    const ids = [...Array(8)].map((_, k) => String(100 + b * 10 + k));
+    eq(new Set(ids.map(id => p[id].y)).size, 1, `ветка ${b + 1} в одну строку:`);
+    const xs = ids.map(id => p[id].x);
+    eq(xs.every((v, i) => i === 0 || v > xs[i - 1]), true, `ветка ${b + 1} строго вправо:`);
+  }
+  const rowY = [0, 1, 2].map(b => p[String(100 + b * 10)].y);
+  eq(rowY[0] < rowY[1] && rowY[1] < rowY[2], true, 'ветки строками сверху вниз по порядку:');
+  // соседние шаги одной глубины — в одном столбце у всех веток
+  eq(p['103'].x === p['113'].x && p['113'].x === p['123'].x, true, 'шаг N у всех веток под одним столбцом:');
+});
+
+check('строками: карточки не налезают друг на друга', () => {
+  CARD_H['101'] = 260;                 // высокая карточка в первой ветке
+  const d = langFunnel(2, 4);
+  ctx.__api.arrangeFunnel({ direction: 'horizontal' });
+  const p = pos(d);
+  eq(p['110'].y - p['100'].y >= 260, true, 'вторая ветка ниже самой высокой карточки первой:');
+  delete CARD_H['101'];
+});
+
+check('плотность меняет только промежутки', () => {
+  const gap = spacing => {
+    const d = langFunnel(2, 3);
+    ctx.__api.arrangeFunnel({ direction: 'horizontal', spacing });
+    const p = pos(d);
+    return { dx: p['101'].x - p['100'].x, dy: p['110'].y - p['100'].y };
+  };
+  const c = gap('compact'), n = gap('normal'), w = gap('wide');
+  eq(c.dx < n.dx && n.dx < w.dx, true, 'по горизонтали:');
+  eq(c.dy < n.dy && n.dy < w.dy, true, 'по вертикали:');
+});
+
+check('столбцами через arrangeFunnel — то же, что кнопка «Разложить»', () => {
+  const d1 = langFunnel(3, 3);
+  ctx.__api.arrangeVertical();
+  const a = JSON.stringify(pos(d1));
+  const d2 = langFunnel(3, 3);
+  ctx.__api.arrangeFunnel({ direction: 'vertical' });
+  eq(JSON.stringify(pos(d2)), a);
+});
+
+check('строками: заметка висит под своим блоком', () => {
+  const d = build([
+    ['1', 'start', { output_1: ['2'] }],
+    ['2', 'message', {}],
+  ]);
+  d['7'] = { id: 7, name: 'note', data: { text: 'внимание', about: '2' },
+             inputs: {}, outputs: {}, pos_x: 0, pos_y: 0 };
+  ctx.__api.arrangeFunnel({ direction: 'horizontal' });
+  const p = pos(d);
+  eq(p['7'].x, p['2'].x, 'в одном столбце со своим блоком:');
+  eq(p['7'].y > p['2'].y, true, 'и под ним:');
 });
 
 console.log(failed ? `\n${failed} проверок упало` : '\nвсе проверки прошли');
