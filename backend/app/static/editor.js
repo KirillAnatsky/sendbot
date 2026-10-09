@@ -370,6 +370,7 @@ async function openEditor(id) {
     ['nodeCreated', 'connectionCreated', 'connectionRemoved']
       .forEach(ev => editor.on(ev, () => refreshStepNumbers()));
     setupClipboard();
+    setupQuickActions();
   }
   editor.clear();
   clearMultiSelection();
@@ -743,6 +744,7 @@ function refreshNodeHtml(id) {
   decoratePorts();
   // связи могли сместиться из-за изменившейся высоты карточки
   try { editor.updateConnectionNodes('node-' + id); } catch (e) {}
+  syncQuickActions();   // кнопки под блоком — под новой высотой
 }
 
 // ---------- подписи и выравнивание портов ----------
@@ -1660,7 +1662,11 @@ function setupClipboard() {
     if (inField) return;
     if (mod && hotkey(e, 'c')) { e.preventDefault(); copyNodes(); }
     else if (mod && hotkey(e, 'v')) { e.preventDefault(); pasteNodes(); }
-    else if (mod && hotkey(e, 'd')) { e.preventDefault(); copyNodes(); pasteNodes(); }
+    else if (mod && hotkey(e, 'd')) {
+      e.preventDefault();   // дубль — мимо буфера, Ctrl/⌘+C не затирается
+      duplicateNodes(multiSelection.size ? [...multiSelection]
+        : (selectedNodeId != null ? [String(selectedNodeId)] : []));
+    }
     else if (e.key === 'Delete' || e.key === 'Backspace') {
       // 1) выделенная связь; 2) мультивыделение; 3) одиночный блок
       if (editor && editor.connection_selected) {
@@ -1672,6 +1678,7 @@ function setupClipboard() {
       } else if (editor && editor.node_selected) {
         e.preventDefault();
         editor.removeNodeId(editor.node_selected.id);
+        editor.node_selected = null;   // иначе Drawflow держит удалённый блок «выделенным»
         hideProps();
         clearMultiSelection();
       }
@@ -1778,7 +1785,13 @@ function setupMarquee() {
     if (e.button !== 0 || spaceHeld) return;   // ЛКМ и не режим «рука»
     // только по пустому фону: не по блоку, не по связи, не по порту
     if (e.target.closest('.drawflow-node') || e.target.closest('svg')) return;
-    if (!e.shiftKey && !e.ctrlKey && !e.metaKey) clearMultiSelection();  // без модификаторов — заново
+    if (e.target.closest('.df-actions')) return;   // кнопки под блоком и на связи
+    if (!e.shiftKey && !e.ctrlKey && !e.metaKey) {
+      clearMultiSelection();  // без модификаторов — заново
+      // Клик по фону до Drawflow не доходит (ниже stopPropagation), и он не
+      // снимал выделение с блока и связи: подсветка и панель оставались.
+      dropDrawflowSelection();
+    }
     active = true; sx = e.clientX; sy = e.clientY;
     box = document.createElement('div');
     box.className = 'marquee-box';
@@ -1972,7 +1985,16 @@ function copyNodes() {
   // блок сразу после правки — значит скопировать его без неё.
   flushAutoApply();
   const ids = multiSelection.size ? [...multiSelection] : (selectedNodeId != null ? [String(selectedNodeId)] : []);
-  if (!ids.length) return;
+  const payload = clipPayload(ids);
+  if (!payload.length) return;
+  try { localStorage.setItem(CLIPBOARD_KEY, JSON.stringify(payload)); } catch {}
+  flashStatus(`Скопировано блоков: ${payload.length}`);
+}
+
+// Блоки в виде, пригодном для вставки: данные, порты, позиции и связи
+// только между ними самими.
+function clipPayload(ids) {
+  if (!ids.length) return [];
   const nodes = ids.map(id => editor.getNodeFromId(id)).filter(Boolean);
   const idSet = new Set(ids);
   const payload = nodes.map(n => ({
@@ -1986,13 +2008,24 @@ function copyNodes() {
     conns: Object.entries(n.outputs).flatMap(([port, pd]) =>
       pd.connections.filter(c => idSet.has(String(c.node))).map(c => ({ from_port: port, to: String(c.node) }))),
   }));
-  try { localStorage.setItem(CLIPBOARD_KEY, JSON.stringify(payload)); } catch {}
-  flashStatus(`Скопировано блоков: ${payload.length}`);
+  // JSON — чтобы копия не делила объекты data с оригиналом
+  return JSON.parse(JSON.stringify(payload));
 }
 
 function pasteNodes() {
   let payload;
   try { payload = JSON.parse(localStorage.getItem(CLIPBOARD_KEY) || '[]'); } catch { return; }
+  pastePayload(payload);
+}
+
+// Копия рядом, мимо буфера: кнопка «Копировать» под блоком не должна
+// затирать то, что человек положил в буфер через Ctrl/⌘+C.
+function duplicateNodes(ids) {
+  flushAutoApply();
+  pastePayload(clipPayload(ids));
+}
+
+function pastePayload(payload) {
   if (!payload || !payload.length) return;
 
   const OFF = 60;
@@ -2036,4 +2069,159 @@ function flashStatus(text) {
   el.classList.add('show');
   clearTimeout(el._t);
   el._t = setTimeout(() => el.classList.remove('show'), 1800);
+}
+
+
+// ---------- кнопки под выделенным блоком и на выделенной связи ----------
+// То же, что Ctrl/⌘+D и Delete, но мышью: выделил блок — под ним
+// «Копировать» и «Удалить»; выделил связь — на ней «Удалить». Нужно и тем,
+// кто не помнит сочетаний, и на случай, когда клавиатура не доходит до
+// холста (фокус застрял в поле).
+//
+// Кнопки живут внутри холста Drawflow (precanvas), поэтому двигаются и
+// масштабируются вместе с ним. editor.clear() стирает холст целиком —
+// элементы пересоздаются по требованию.
+
+// Снять выделение блока и связи так же, как это делает сам Drawflow
+function dropDrawflowSelection() {
+  if (!editor) return;
+  if (editor.node_selected) {
+    editor.node_selected.classList.remove('selected');
+    editor.node_selected = null;
+    editor.dispatch('nodeUnselected', true);
+  }
+  if (editor.connection_selected) {
+    editor.connection_selected.classList.remove('selected');
+    try { editor.removeReouteConnectionSelected(); } catch (e) {}
+    editor.connection_selected = null;
+  }
+}
+
+// Выделенный блок, если он ещё есть: после удаления Drawflow продолжает
+// держать в node_selected уже убранный элемент
+function liveSelectedNode() {
+  const el = editor && editor.node_selected;
+  if (!el || !el.isConnected) return null;
+  const id = el.id.replace('node-', '');
+  const data = editor.drawflow.drawflow.Home.data[id];
+  return data ? { el, id, data } : null;
+}
+
+function quickEl(id, html) {
+  let el = document.getElementById(id);
+  if (!el || !editor.precanvas.contains(el)) {
+    if (el) el.remove();
+    el = document.createElement('div');
+    el.id = id;
+    el.className = 'df-actions hidden';
+    el.innerHTML = html;
+    // клик по кнопке — не клик по холсту: Drawflow снял бы выделение, а
+    // перетаскивание началось бы прямо с кнопки
+    el.addEventListener('mousedown', e => { e.stopPropagation(); e.preventDefault(); });
+    el.addEventListener('click', e => {
+      e.stopPropagation();
+      const b = e.target.closest('[data-act]');
+      if (b) quickAction(b.dataset.act);
+    });
+    editor.precanvas.appendChild(el);
+  }
+  return el;
+}
+
+function nodeActionsEl() {
+  return quickEl('node-actions', `
+    <button type="button" class="df-act" data-act="dup" title="Копировать (Ctrl/⌘+D)">⧉</button>
+    <button type="button" class="df-act danger" data-act="del" title="Удалить (Delete)">🗑</button>`);
+}
+
+function linkActionsEl() {
+  return quickEl('link-actions', `
+    <button type="button" class="df-act danger" data-act="unlink" title="Удалить связь (Delete)">🗑 связь</button>`);
+}
+
+// Над каким блоком сейчас кнопки и к какой группе они относятся
+function quickTargetIds() {
+  const live = liveSelectedNode();
+  const sel = live ? live.id : null;
+  if (!sel) return [];
+  // блок из выделенной группы — действия на всю группу
+  return multiSelection.size > 1 && multiSelection.has(sel) ? [...multiSelection] : [sel];
+}
+
+function syncQuickActions() {
+  if (!editor || !editor.precanvas) return;
+  const na = nodeActionsEl();
+  const la = linkActionsEl();
+  // холст масштабируется, а кнопки должны оставаться привычного размера:
+  // на отдалённом холсте они иначе становились бы крошечными
+  const k = 1 / (editor.zoom || 1);
+  na.style.transform = `translate(-50%, 0) scale(${k})`;
+  la.style.transform = `translate(-50%, -50%) scale(${k})`;
+
+  // блок
+  const live = liveSelectedNode();
+  const nodeEl = live && live.el;
+  if (live && !editor.drag && live.data.name !== 'start') {
+    const ids = quickTargetIds();
+    na.querySelector('[data-act="dup"]').title =
+      ids.length > 1 ? `Копировать выделенные (${ids.length})` : 'Копировать (Ctrl/⌘+D)';
+    na.querySelector('[data-act="del"]').title =
+      ids.length > 1 ? `Удалить выделенные (${ids.length})` : 'Удалить (Delete)';
+    na.style.left = (nodeEl.offsetLeft + nodeEl.offsetWidth / 2) + 'px';
+    na.style.top = (nodeEl.offsetTop + nodeEl.offsetHeight + 10 * k) + 'px';
+    na.classList.remove('hidden');
+  } else {
+    na.classList.add('hidden');
+  }
+
+  // связь: кнопка — на середине линии
+  const path = editor.connection_selected;
+  if (path && path.isConnected && typeof path.getTotalLength === 'function') {
+    try {
+      const pt = path.getPointAtLength(path.getTotalLength() / 2);
+      la.style.left = pt.x + 'px';
+      la.style.top = pt.y + 'px';
+      la.classList.remove('hidden');
+    } catch (e) { la.classList.add('hidden'); }
+  } else {
+    la.classList.add('hidden');
+  }
+}
+
+function quickAction(act) {
+  if (act === 'dup') {
+    const ids = quickTargetIds();
+    if (ids.length) duplicateNodes(ids);
+  } else if (act === 'del') {
+    const ids = quickTargetIds();
+    if (ids.length > 1) {
+      deleteSelectedNodes();
+    } else if (ids.length) {
+      editor.removeNodeId('node-' + ids[0]);
+      editor.node_selected = null;
+      hideProps();
+      clearMultiSelection();
+    }
+  } else if (act === 'unlink') {
+    if (editor.connection_selected) {
+      try { editor.removeConnection(); flashStatus('Связь удалена'); } catch (e) {}
+    }
+  }
+  syncQuickActions();
+}
+
+function setupQuickActions() {
+  ['nodeSelected', 'nodeUnselected', 'nodeRemoved', 'nodeMoved',
+   'connectionSelected', 'connectionUnselected', 'connectionRemoved']
+    .forEach(ev => editor.on(ev, () => setTimeout(syncQuickActions, 0)));
+  const container = document.getElementById('drawflow');
+  // пока блок тащат — кнопки прячем, иначе отстают от него
+  container.addEventListener('mousedown', e => {
+    if (e.target.closest('.df-actions')) return;
+    if (e.target.closest('.drawflow-node')) nodeActionsEl().classList.add('hidden');
+  });
+  // отпустили — Drawflow уже обновил выделение и позицию
+  document.addEventListener('mouseup', () => setTimeout(syncQuickActions, 0));
+  // клавиатура (Delete, Ctrl+D) тоже меняет состав блоков и связей
+  document.addEventListener('keyup', () => setTimeout(syncQuickActions, 0));
 }

@@ -687,3 +687,16 @@ img.rt-emoji { width: 1.25em; height: 1.25em; vertical-align: -0.25em; object-fi
 .draft-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 0 0 10px;
   padding: 10px 14px; background: #fff8e6; border: 1px solid #f3dca4; border-radius: 10px; font-size: 13px; }
 .draft-bar span { flex: 1; min-width: 240px; }
+
+/* ---------- кнопки под выделенным блоком и на связи ---------- */
+.df-actions { position: absolute; z-index: 20; display: flex; gap: 6px;
+  transform: translate(-50%, 0); transform-origin: top center; pointer-events: auto; }
+#link-actions { transform: translate(-50%, -50%); transform-origin: center center; }
+.df-actions.hidden { display: none; }
+.df-act { height: 30px; min-width: 32px; padding: 0 9px; border: 1px solid #dfe4ee; border-radius: 9px;
+  background: #fff; color: #445; font-size: 14px; cursor: pointer;
+  box-shadow: 0 4px 12px rgba(20, 30, 60, .12); white-space: nowrap; }
+.df-act:hover { background: #eef3ff; border-color: #c9d8ff; color: #2e6bff; }
+.df-act.danger { color: #d33; }
+.df-act.danger:hover { background: #fdecec; border-color: #f5c2c2; color: #c22; }
+#link-actions .df-act { font-size: 12.5px; }
