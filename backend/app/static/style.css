@@ -181,6 +181,10 @@ th { background: #f8fafc; color: #7a8499; font-weight: 600; font-size: 12.5px; t
 .df-btn.df-noact .df-btn-port { background: #e0a100; }
 .drawflow .drawflow-node .output.port-btn.port-noact { border-color: #e0a100; background: #fff7e6; color: #8a5a00; }
 .btn-row .btn-move { padding: 4px 7px; flex: 0 0 auto; }
+.props .noact-row { display: flex; align-items: center; gap: 8px; }
+.props .noact-row span { font-size: 12.5px; color: #556; flex: 0 0 auto; }
+.props .noact-row #p-noact-amount { flex: 0 0 90px; width: 90px; min-width: 0; }
+.props .noact-row #p-noact-unit { flex: 1 1 auto; width: auto; min-width: 0; }
 .props .noact-toggle { display: flex; align-items: center; gap: 6px; margin-top: 14px; cursor: pointer; }
 .noact-toggle input { width: auto; margin: 0; }
 .df-btn-port { position: absolute; left: 6px; top: 50%; transform: translateY(-50%);

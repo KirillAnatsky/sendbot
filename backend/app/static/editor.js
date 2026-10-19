@@ -885,7 +885,8 @@ function showProps(id) {
         Если нет реакции…
       </label>
       <div id="p-noact-box" class="${d.no_action ? '' : 'hidden'}">
-        <div class="btn-row-item">
+        <div class="noact-row">
+          <span>ждать</span>
           <input id="p-noact-amount" type="number" min="1" value="${esc((d.no_action || {}).amount || 1)}">
           <select id="p-noact-unit">
             ${[['minutes', 'минут'], ['hours', 'часов'], ['days', 'дней'], ['seconds', 'секунд']].map(([v, l]) =>
