@@ -49,6 +49,10 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="SendBot", lifespan=lifespan)
 app.include_router(router)
 
+from .links import router as links_router  # noqa: E402
+
+app.include_router(links_router)
+
 static_dir = Path(__file__).parent / "static"
 app.mount("/admin", NoCacheStatic(directory=static_dir, html=True), name="admin")
 

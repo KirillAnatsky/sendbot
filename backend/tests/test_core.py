@@ -2616,3 +2616,294 @@ def test_llm_content_puts_images_before_text():
     o = _openai_content("сделай так", im)
     assert o[0]["image_url"]["url"].startswith("data:image/png;base64,")
     assert _anthropic_content("без картинок", None) == "без картинок"
+
+
+# ---------- кнопки: выход у каждой, таймер бездействия, ссылки со связью ----------
+
+def _msg(nid, data, outs, inputs=True):
+    return {"id": int(nid), "name": "message", "data": data,
+            "inputs": {"input_1": {"connections": []}} if inputs else {},
+            "outputs": {p: {"connections": [{"node": t, "output": "input_1"}] if t else []}
+                        for p, t in outs.items()}}
+
+
+def _start(to="2"):
+    return {"id": 1, "name": "start", "data": {}, "inputs": {},
+            "outputs": {"output_1": {"connections": [{"node": to, "output": "input_1"}]}}}
+
+
+class _KbBot:
+    def __init__(self):
+        self.sent, self.kbs = [], []
+
+    async def send_message(self, cid, text, **kw):
+        self.sent.append(text)
+        self.kbs.append(kw.get("reply_markup"))
+        return type("M", (), {"photo": [], "message_id": len(self.sent)})()
+
+
+async def _setup(session, gui):
+    from app.bot import runner
+    from app.graph import compile_graph
+    from app.models import Bot, Funnel, FunnelBot, Subscriber
+
+    bot = _KbBot()
+    b = Bot(name="B", token="t", is_active=True)
+    session.add(b)
+    await session.flush()
+    runner.manager.bots = {b.id: bot}
+    f = Funnel(name="F", is_active=True, trigger_type="start",
+               graph_ui=gui, graph=compile_graph(gui))
+    session.add(f)
+    await session.flush()
+    session.add(FunnelBot(funnel_id=f.id, bot_id=b.id))
+    sub = Subscriber(bot_id=b.id, tg_id=10, first_name="Ann", is_active=True)
+    session.add(sub)
+    await session.flush()
+    return bot, f, sub
+
+
+def test_old_ports_are_upgraded_with_their_links():
+    """До v2 кнопка после ссылки сидела на output_2, а движок слал её в
+    output_3 — в пустоту. Перевод сохраняет то, что нарисовано на холсте."""
+    from app.graph import compile_graph, upgrade_ports
+
+    gui = _gui({
+        "1": _start(),
+        "2": _msg("2", {"text": "x", "buttons": [{"label": "Сайт", "url": "https://a"},
+                                                  {"label": "Да"}]},
+                  {"output_1": None, "output_2": "3"}),
+        "3": _msg("3", {"text": "после Да"}, {"output_1": None}),
+    })
+    gui["drawflow"]["Home"]["data"]["3"]["inputs"]["input_1"]["connections"] = [
+        {"node": "2", "input": "output_2"}]
+    g = compile_graph(gui)
+    assert g["nodes"]["2"]["outputs"] == {"output_3": ["3"]}
+    n2 = gui["drawflow"]["Home"]["data"]["2"]
+    assert list(n2["outputs"]) == ["output_1", "output_2", "output_3"]
+    assert n2["data"]["ports_v"] == 2
+    assert gui["drawflow"]["Home"]["data"]["3"]["inputs"]["input_1"]["connections"][0]["input"] == "output_3"
+    assert upgrade_ports(gui) is False            # второй раз ничего не делает
+
+
+async def test_old_funnels_upgraded_on_start(session):
+    import copy
+
+    from sqlalchemy import select
+
+    from app.db import _migrate_data
+    from app.models import Funnel
+
+    gui = _gui({
+        "1": _start(),
+        "2": _msg("2", {"text": "x", "buttons": [{"label": "Сайт", "url": "https://a"},
+                                                  {"label": "Да"}]},
+                  {"output_1": None, "output_2": "3"}),
+        "3": _msg("3", {"text": "после Да"}, {"output_1": None}),
+    })
+    old_graph = {"start": "1", "nodes": {
+        "1": {"type": "start", "data": {}, "outputs": {"output_1": ["2"]}},
+        "2": {"type": "message", "data": copy.deepcopy(gui["drawflow"]["Home"]["data"]["2"]["data"]),
+              "outputs": {"output_2": ["3"]}},
+        "3": {"type": "message", "data": {"text": "после Да"}, "outputs": {}}}}
+    session.add(Funnel(name="old", graph_ui=gui, graph=old_graph))
+    await session.commit()
+    await _migrate_data()
+    session.expire_all()
+    f = (await session.execute(select(Funnel))).scalar_one()
+    assert f.graph["nodes"]["2"]["outputs"] == {"output_3": ["3"]}
+    assert f.graph_ui["drawflow"]["Home"]["data"]["2"]["data"]["ports_v"] == 2
+
+
+def test_no_action_validation():
+    from app.graph import GraphError, compile_graph
+
+    def g(na):
+        return _gui({"1": _start(),
+                     "2": _msg("2", {"text": "x", "no_action": na}, {"output_1": None})})
+    compile_graph(g({"amount": 2, "unit": "hours"}))
+    with pytest.raises(GraphError):
+        compile_graph(g({"amount": 0, "unit": "hours"}))
+    with pytest.raises(GraphError):
+        compile_graph(g({"amount": 1, "unit": "weeks"}))
+
+
+def _no_action_gui():
+    # кнопка «Да» -> 3, «нет реакции» (output_3) -> 4
+    return _gui({
+        "1": _start(),
+        "2": _msg("2", {"text": "Вопрос", "buttons": [{"label": "Да"}],
+                        "no_action": {"amount": 1, "unit": "hours"}, "ports_v": 2},
+                  {"output_1": None, "output_2": "3", "output_3": "4"}),
+        "3": _msg("3", {"text": "Нажал"}, {"output_1": None}),
+        "4": _msg("4", {"text": "Напоминание"}, {"output_1": None}),
+    })
+
+
+async def _expire_jobs(session):
+    from sqlalchemy import select
+
+    from app.models import ScheduledJob
+    for j in (await session.execute(select(ScheduledJob))).scalars():
+        j.execute_at = datetime.utcnow() - timedelta(seconds=1)
+    await session.flush()
+
+
+async def test_no_action_fires_when_nothing_happens(session):
+    from sqlalchemy import select
+
+    from app.bot import engine as fx
+    from app.models import FunnelRun, ScheduledJob
+
+    bot, f, sub = await _setup(session, _no_action_gui())
+    await fx.start_funnel(bot, session, f, sub)
+    job = (await session.execute(select(ScheduledJob))).scalar_one()
+    assert (job.kind, job.port, job.status) == ("no_action", "output_3", "pending")
+    run = (await session.execute(select(FunnelRun))).scalar_one()
+    assert run.status == "active"
+
+    await fx.run_due_jobs(session, lambda _: bot)   # ещё рано
+    assert bot.sent == ["Вопрос"]
+    await _expire_jobs(session)
+    await fx.run_due_jobs(session, lambda _: bot)
+    assert bot.sent == ["Вопрос", "Напоминание"]
+
+
+async def test_no_action_cancelled_by_click_or_text(session):
+    from sqlalchemy import select
+
+    from app.bot import engine as fx
+    from app.models import FunnelRun, ScheduledJob
+
+    bot, f, sub = await _setup(session, _no_action_gui())
+    await fx.start_funnel(bot, session, f, sub)
+    run = (await session.execute(select(FunnelRun))).scalar_one()
+    await fx.handle_button(bot, session, run.id, "2", 0)
+    assert bot.sent == ["Вопрос", "Нажал"]
+    job = (await session.execute(select(ScheduledJob))).scalar_one()
+    assert job.status == "cancelled"
+    await _expire_jobs(session)
+    await fx.run_due_jobs(session, lambda _: bot)
+    assert "Напоминание" not in bot.sent
+
+    # перезапуск и ответ текстом — тоже реакция
+    await fx.start_funnel(bot, session, f, sub)
+    await fx.cancel_no_action(session, subscriber_id=sub.id)
+    await _expire_jobs(session)
+    await fx.run_due_jobs(session, lambda _: bot)
+    assert "Напоминание" not in bot.sent
+
+
+async def test_no_action_without_link_does_not_schedule(session):
+    from sqlalchemy import select
+
+    from app.bot import engine as fx
+    from app.models import ScheduledJob
+
+    gui = _gui({"1": _start(),
+                "2": _msg("2", {"text": "x", "no_action": {"amount": 1, "unit": "hours"}},
+                          {"output_1": None, "output_2": None})})
+    bot, f, sub = await _setup(session, gui)
+    await fx.start_funnel(bot, session, f, sub)
+    assert (await session.execute(select(ScheduledJob))).first() is None
+
+
+def _link_gui():
+    # ссылка (output_2) -> 3, обычная кнопка (output_3) -> 4
+    return _gui({
+        "1": _start(),
+        "2": _msg("2", {"text": "Жми", "ports_v": 2, "buttons": [
+                    {"label": "Сайт", "url": "https://site.test/?n={first_name}"},
+                    {"label": "Ок"}]},
+                  {"output_1": None, "output_2": "3", "output_3": "4"}),
+        "3": _msg("3", {"text": "Перешёл"}, {"output_1": None}),
+        "4": _msg("4", {"text": "Ок нажат"}, {"output_1": None}),
+    })
+
+
+async def test_url_button_with_link_goes_through_tracker(session):
+    import asyncio
+    from urllib.parse import urlparse
+
+    from sqlalchemy import func, select
+
+    from app import links
+    from app.bot import engine as fx
+    from app.config import settings
+    from app.models import ButtonClick, FunnelRun
+
+    settings.public_url = "https://bot.test"
+    bot, f, sub = await _setup(session, _link_gui())
+    await fx.start_funnel(bot, session, f, sub)
+    await session.commit()
+    kb = bot.kbs[0].inline_keyboard
+    url = kb[0][0].url
+    assert url.startswith("https://bot.test/go/")
+    assert kb[1][0].callback_data.endswith(":2:1")   # обычная кнопка — индекс 1
+
+    token = urlparse(url).path.rsplit("/", 1)[1]
+    assert (await links.go(token[:-1] + "0")).status_code == 404   # подделка
+    resp = await links.go(token)
+    assert resp.status_code == 302
+    assert resp.headers["location"] == "https://site.test/?n=Ann"
+    await asyncio.gather(*list(links._tasks))
+    assert bot.sent == ["Жми", "Перешёл"]
+
+    # повторный переход открывает сайт, но ветку второй раз не шлёт
+    await links.go(token)
+    await asyncio.gather(*list(links._tasks))
+    assert bot.sent == ["Жми", "Перешёл"]
+    session.expire_all()
+    n = (await session.execute(select(func.count(ButtonClick.id)))).scalar()
+    assert n == 1
+
+    # обычная кнопка после ссылки уходит в свой выход
+    run = (await session.execute(select(FunnelRun))).scalar_one()
+    await fx.handle_button(bot, session, run.id, "2", 1)
+    assert bot.sent[-1] == "Ок нажат"
+
+
+async def test_url_button_plain_without_public_url_or_link(session):
+    from app.bot import engine as fx
+    from app.config import settings
+
+    settings.public_url = ""
+    bot, f, sub = await _setup(session, _link_gui())
+    await fx.start_funnel(bot, session, f, sub)
+    assert bot.kbs[0].inline_keyboard[0][0].url == "https://site.test/?n=Ann"
+
+    settings.public_url = "https://bot.test"
+    gui = _gui({"1": _start(),
+                "2": _msg("2", {"text": "x", "ports_v": 2,
+                                "buttons": [{"label": "Сайт", "url": "https://a.test"}]},
+                          {"output_1": None, "output_2": None})})
+    bot2, f2, sub2 = await _setup(session, gui)
+    await fx.start_funnel(bot2, session, f2, sub2)
+    assert bot2.kbs[0].inline_keyboard[0][0].url == "https://a.test"   # связи нет — как было
+
+
+async def test_ai_spec_url_next_and_no_action(session):
+    from app import ai
+    from app.models import Funnel
+
+    spec = {"name": "T", "trigger_type": "start", "trigger_value": None, "nodes": [
+        {"id": "n1", "type": "message", "text": "Привет",
+         "buttons": [{"label": "Сайт", "url": "https://a.test", "next": "n2"},
+                     {"label": "Дальше", "next": "n3"}],
+         "no_action": {"amount": 2, "unit": "hours", "next": "n4"}, "next": None},
+        {"id": "n2", "type": "message", "text": "после ссылки", "buttons": [], "next": None},
+        {"id": "n3", "type": "message", "text": "после кнопки", "buttons": [], "next": None},
+        {"id": "n4", "type": "message", "text": "напоминание", "buttons": [], "next": None},
+    ]}
+    fields = ai.spec_to_funnel_fields(spec, await ai.ensure_tags(session, spec))
+    g = fields["graph"]
+    first = g["nodes"][g["nodes"][g["start"]]["outputs"]["output_1"][0]]
+    texts = {nid: n["data"].get("text") for nid, n in g["nodes"].items()}
+    assert {p: texts[t[0]] for p, t in first["outputs"].items()} == {
+        "output_2": "после ссылки", "output_3": "после кнопки", "output_4": "напоминание"}
+    f = Funnel(is_active=False, **fields)
+    session.add(f)
+    await session.flush()
+    back = ai.graph_to_spec(f)
+    m = next(n for n in back["nodes"] if n.get("text") == "Привет")
+    assert m["no_action"]["unit"] == "hours" and m["buttons"][0]["next"]

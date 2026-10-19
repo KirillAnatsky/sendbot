@@ -179,9 +179,14 @@ class ScheduledJob(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     run_id: Mapped[int] = mapped_column(ForeignKey("funnel_runs.id", ondelete="CASCADE"), index=True)
-    node_id: Mapped[str] = mapped_column(String(32))  # узел задержки
+    node_id: Mapped[str] = mapped_column(String(32))  # узел задержки (или сообщения — для no_action)
     execute_at: Mapped[datetime] = mapped_column(DateTime, index=True)
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True)  # pending | done | cancelled
+    # delay — пауза блока «Задержка», идём в output_1;
+    # no_action — таймер бездействия «Сообщения»: человек ничего не нажал
+    # и не написал за отведённое время — идём в выход port
+    kind: Mapped[str | None] = mapped_column(String(16), default="delay", nullable=True)
+    port: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
 
 class NodeVisit(Base):

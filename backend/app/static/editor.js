@@ -48,22 +48,29 @@ function nodeHtml(type, data) {
     // кнопки — как в Telegram, с номером выхода
     let btnsHtml = '';
     const buttons = data.buttons || [];
+    // выход есть у каждой кнопки, в том числе у ссылки: её ветка срабатывает,
+    // когда человек перешёл по ссылке
     if (buttons.length) {
-      let port = 2;
-      btnsHtml = `<div class="df-btns">` + buttons.map(b => {
+      btnsHtml = `<div class="df-btns">` + buttons.map((b, i) => {
         const st = b.style ? ` st-${b.style}` : '';
         const off = b.disabled ? ' st-off' : '';
         const icon = b.icon_custom_emoji_id && typeof emojiIconHtml === 'function'
           ? emojiIconHtml(b.icon_custom_emoji_id) + ' ' : '';
-        if (b.url) return `<div class="df-btn url${st}${off}">🔗 ${icon}${esc(b.label || 'ссылка')}</div>`;
-        return `<div class="df-btn${st}${off}"><span class="df-btn-port">${port++}</span>${icon}${esc(b.label || 'кнопка')}</div>`;
+        const port = `<span class="df-btn-port">${i + 2}</span>`;
+        if (b.url) return `<div class="df-btn url${st}${off}">${port}🔗 ${icon}${esc(b.label || 'ссылка')}</div>`;
+        return `<div class="df-btn${st}${off}">${port}${icon}${esc(b.label || 'кнопка')}</div>`;
       }).join('') + `</div>`;
+    }
+    // таймер бездействия — последний выход, под кнопками
+    if (data.no_action) {
+      btnsHtml += `<div class="df-btns"><div class="df-btn df-noact">` +
+        `<span class="df-btn-port">${buttons.length + 2}</span>⏳ нет реакции ${esc(noActionText(data.no_action))}</div></div>`;
     }
     // Номер шага ставим пустым: настоящий проставит refreshStepNumbers, когда
     // карточка окажется на холсте и станет понятен порядок обхода.
     return `<div class="df-title">${NODE_META.message.title}<span class="df-step"></span></div>` +
            `${orderHint}${mediaHtml}${textHtml}${btnsHtml}` +
-           `<div class="df-ports">${buttons.some(b => !b.url) ? '1: далее' : ''}</div>`;
+           `<div class="df-ports">${(buttons.length || data.no_action) ? '1: далее' : ''}</div>`;
   }
   if (type === 'language') {
     const langs = data.languages || [];
@@ -79,6 +86,11 @@ function nodeHtml(type, data) {
   return `<div class="df-title">${NODE_META[type].title}</div>` +
          `<div class="df-sub">${esc(sum)}</div>` + toggle +
          `<div class="df-ports">${esc(portsHint(type, data))}</div>`;
+}
+
+const UNIT_SHORT = { seconds: 'сек', minutes: 'мин', hours: 'ч', days: 'дн' };
+function noActionText(na) {
+  return `${na.amount || '?'} ${UNIT_SHORT[na.unit] || '?'}`;
 }
 
 function toggleNodeExpand(ev, el) {
@@ -242,7 +254,8 @@ function portsHint(type, d) {
   if (type === 'message') {
     const btns = d.buttons || [];
     let s = '1: далее';
-    btns.forEach((b, i) => { if (!b.url) s += `  •  ${i + 2}: ${b.label || 'кнопка'}`; });
+    btns.forEach((b, i) => { s += `  •  ${i + 2}: ${b.url ? '🔗 ' : ''}${b.label || 'кнопка'}`; });
+    if (d.no_action) s += `  •  ${btns.length + 2}: нет реакции`;
     return s;
   }
   return '';
@@ -377,7 +390,7 @@ async function openEditor(id) {
   hideProps();
 
   if (f.graph_ui && f.graph_ui.drawflow) {
-    editor.import(f.graph_ui);
+    editor.import(upgradeGraphPorts(f.graph_ui));
   } else {
     editor.addNode('start', 0, 1, 80, 150, 'start', {}, nodeHtml('start', {}), false);
   }
@@ -604,7 +617,7 @@ function updateTriggerInputs() {
 function blockDefaults(type) {
   return {
     start: {},
-    message: { text: '', photo_url: '', buttons: [] },
+    message: { text: '', photo_url: '', buttons: [], ports_v: PORTS_VERSION },
     delay: { amount: 1, unit: 'hours' },
     condition: { tag: TAGS[0] ? String(TAGS[0].id) : '' },
     language: { languages: ['ru'] },
@@ -772,7 +785,7 @@ function decoratePorts() {
     const zoom = editor.zoom || 1;
     const nodeRect = nodeEl.getBoundingClientRect();
     const nextLine = nodeEl.querySelector('.df-ports');
-    const btnRows = nodeEl.querySelectorAll('.df-btn:not(.url)');
+    const btnRows = nodeEl.querySelectorAll('.df-btn');
 
     outs.forEach((out, idx) => {
       // idx 0 = «далее», idx 1..N = кнопки по порядку
@@ -788,7 +801,16 @@ function decoratePorts() {
         out.textContent = String(idx + 1);
         out.classList.add('port-btn');
         const label = btnRows[idx - 1] ? btnRows[idx - 1].textContent.replace(/^\d+/, '').trim() : '';
-        out.title = (n.name === 'language' ? 'язык «' : 'кнопка «') + label + '»';
+        const row = btnRows[idx - 1];
+        out.classList.remove('port-noact');
+        if (row && row.classList.contains('df-noact')) {
+          out.title = 'нет реакции: человек ничего не нажал и не написал за это время';
+          out.classList.add('port-noact');
+        } else if (row && row.classList.contains('url')) {
+          out.title = 'переход по ссылке «' + label.replace(/^🔗\s*/, '') + '»';
+        } else {
+          out.title = (n.name === 'language' ? 'язык «' : 'кнопка «') + label + '»';
+        }
       }
       if (target) {
         const r = target.getBoundingClientRect();
@@ -851,6 +873,31 @@ function showProps(id) {
       <label>Кнопки</label>
       <div id="p-buttons">${(d.buttons || []).map((b, i) => btnRow(b, i)).join('')}</div>
       <button class="btn" onclick="addBtnRow()">+ кнопка</button>
+      <div class="hint-box" style="margin-top:6px">
+        У каждой кнопки свой выход — и у ссылки тоже. Свяжите выход ссылки с блоком,
+        и он сработает, когда человек по ней перейдёт. Порядок меняется стрелками ↑ ↓,
+        связи переезжают вместе с кнопкой.
+      </div>
+
+      <label class="noact-toggle">
+        <input type="checkbox" id="p-noact" ${d.no_action ? 'checked' : ''}
+          onchange="document.getElementById('p-noact-box').classList.toggle('hidden', !this.checked)">
+        Если нет реакции…
+      </label>
+      <div id="p-noact-box" class="${d.no_action ? '' : 'hidden'}">
+        <div class="btn-row-item">
+          <input id="p-noact-amount" type="number" min="1" value="${esc((d.no_action || {}).amount || 1)}">
+          <select id="p-noact-unit">
+            ${[['minutes', 'минут'], ['hours', 'часов'], ['days', 'дней'], ['seconds', 'секунд']].map(([v, l]) =>
+              `<option value="${v}" ${((d.no_action || {}).unit || 'hours') === v ? 'selected' : ''}>${l}</option>`).join('')}
+          </select>
+        </div>
+        <div class="hint-box" style="margin-top:6px">
+          Появится выход <b>⏳ нет реакции</b>. Если за это время человек не нажал
+          ни одну кнопку (в том числе ссылку) и ничего не написал боту — воронка
+          пойдёт по нему. Любая реакция таймер отменяет.
+        </div>
+      </div>
       <div class="hint-box">
         <b>Подстановки в ссылку и текст кнопки:</b><br>
         <code>{source}</code> — метка последнего перехода: по какой ссылке человек пришёл в <b>последний раз</b>.<br>
@@ -1119,11 +1166,16 @@ const BTN_STYLES = [
   ['success', '🟢 зелёная'], ['danger', '🔴 красная'],
 ];
 
-function btnRow(b, i) {
-  return `<div class="btn-row">
+// data-src — номер кнопки в данных узла на момент последнего «Применить».
+// По нему applyProps понимает, какая кнопка куда переехала, и переносит её
+// связь; у новой кнопки он пустой.
+function btnRow(b, i, isNew) {
+  return `<div class="btn-row" data-src="${isNew ? '' : i}">
     <div class="btn-row-item">
       ${btnIconPicker(b.icon_custom_emoji_id)}
       <input placeholder="Текст кнопки" class="p-btn-label" value="${esc(b.label || '')}">
+      <button class="btn btn-move" title="выше" onclick="moveBtnRow(this,-1)">↑</button>
+      <button class="btn btn-move" title="ниже" onclick="moveBtnRow(this,1)">↓</button>
       <button class="btn danger" title="убрать кнопку"
         onclick="this.closest('.btn-row').remove();scheduleAutoApply()">✕</button>
     </div>
@@ -1140,7 +1192,84 @@ function btnRow(b, i) {
   </div>`;
 }
 function addBtnRow() {
-  document.getElementById('p-buttons').insertAdjacentHTML('beforeend', btnRow({}, 0));
+  document.getElementById('p-buttons').insertAdjacentHTML('beforeend', btnRow({}, 0, true));
+}
+
+function moveBtnRow(el, dir) {
+  const row = el.closest('.btn-row');
+  const sib = dir < 0 ? row.previousElementSibling : row.nextElementSibling;
+  if (!sib) return;
+  if (dir < 0) sib.before(row); else sib.after(row);
+  // применяем сразу: связи на холсте должны переехать вместе с кнопкой
+  flushAutoApply();
+  applyProps();
+}
+
+// Переставить связи выходов узла. portMap: {старый выход: новый | null},
+// выходы, которых в нём нет, остаются на месте. need — сколько выходов
+// должно быть в итоге. У Drawflow нет «переноса» связи, поэтому снимаем все
+// связи с выходов узла, выставляем их число и вешаем заново по карте.
+function remapNodeOutputs(nodeId, portMap, need) {
+  const node = editor.getNodeFromId(nodeId);
+  const cur = Object.keys(node.outputs).length;
+  const identity = Object.entries(portMap).every(([a, b]) => a === b);
+  if (identity && cur === need) return;
+  const saved = [];
+  Object.entries(node.outputs).forEach(([port, pd]) => {
+    (pd.connections || []).forEach(c => saved.push({ port, node: c.node, input: c.output }));
+  });
+  saved.forEach(c => {
+    try { editor.removeSingleConnection(nodeId, c.node, c.port, c.input); } catch (e) {}
+  });
+  for (let i = cur; i < need; i++) editor.addNodeOutput(nodeId);
+  for (let i = cur; i > need; i--) editor.removeNodeOutput(nodeId, 'output_' + i);
+  saved.forEach(c => {
+    const to = c.port in portMap ? portMap[c.port] : c.port;
+    if (!to || +to.split('_')[1] > need) return;
+    try { editor.addConnection(nodeId, c.node, to, c.input); } catch (e) {}
+  });
+}
+
+// Узлы «Сообщение», сохранённые до PORTS_VERSION, нумеровали выходы только
+// у кнопок без ссылки. Переводим на «выход у каждой кнопки» (на месте).
+// Та же логика, что upgrade_ports на сервере.
+const PORTS_VERSION = 2;
+function oldMessagePortMap(buttons) {
+  const map = {};
+  let k = 2;
+  (buttons || []).forEach((b, i) => {
+    if (b && b.url) return;
+    if (k !== i + 2) map['output_' + k] = 'output_' + (i + 2);
+    k++;
+  });
+  return map;
+}
+function upgradeGraphPorts(graphUi) {
+  const data = graphUi && graphUi.drawflow && graphUi.drawflow.Home && graphUi.drawflow.Home.data;
+  if (!data) return graphUi;
+  const remaps = {};
+  Object.entries(data).forEach(([nid, n]) => {
+    if (!n || n.name !== 'message') return;
+    n.data = n.data || {};
+    if (n.data.ports_v === PORTS_VERSION) return;
+    const buttons = n.data.buttons || [];
+    const pm = oldMessagePortMap(buttons);
+    const outs = {};
+    Object.entries(n.outputs || {}).forEach(([port, pd]) => { outs[pm[port] || port] = pd; });
+    for (let k = 1; k <= buttons.length + 1; k++) outs['output_' + k] = outs['output_' + k] || { connections: [] };
+    n.outputs = {};
+    Object.keys(outs).sort((a, b) => +a.split('_')[1] - +b.split('_')[1]).forEach(k => { n.outputs[k] = outs[k]; });
+    n.data.ports_v = PORTS_VERSION;
+    if (Object.keys(pm).length) remaps[String(nid)] = pm;
+  });
+  if (Object.keys(remaps).length) {
+    Object.values(data).forEach(n => Object.values((n && n.inputs) || {}).forEach(inp =>
+      (inp.connections || []).forEach(c => {
+        const pm = remaps[String(c.node)];
+        if (pm && pm[c.input]) c.input = pm[c.input];
+      })));
+  }
+  return graphUi;
 }
 
 function applyProps() {
@@ -1152,7 +1281,9 @@ function applyProps() {
     d.text_first = document.getElementById('p-order').value === '1';
     d.media = MEDIA_ITEMS.map(m => ({ type: m.type, path: m.path, name: m.name || '' }));
     d.photo_url = '';  // старое поле больше не используем (медиа в d.media)
-    d.buttons = [...document.querySelectorAll('#p-buttons .btn-row')].map(row => {
+    const oldN = (node.data.buttons || []).length;
+    const hadNoAct = !!node.data.no_action;
+    const rows = [...document.querySelectorAll('#p-buttons .btn-row')].map(row => {
       const b = {
         label: row.querySelector('.p-btn-label').value,
         url: row.querySelector('.p-btn-url').value || undefined,
@@ -1162,13 +1293,33 @@ function applyProps() {
       const icon = row.querySelector('.btn-icon-pick').dataset.icon;
       if (icon) b.icon_custom_emoji_id = icon;
       if (row.querySelector('.p-btn-disabled').checked) b.disabled = true;
-      return b;
-    }).filter(b => b.label);
-    // выходы: 1 ("далее") + по одному на каждую callback-кнопку
-    const need = 1 + d.buttons.filter(b => !b.url).length;
-    const cur = Object.keys(editor.getNodeFromId(selectedNodeId).outputs).length;
-    for (let i = cur; i < need; i++) editor.addNodeOutput(selectedNodeId);
-    for (let i = cur; i > need; i--) editor.removeNodeOutput(selectedNodeId, 'output_' + i);
+      return { b, row, src: row.dataset.src === '' ? null : +row.dataset.src };
+    });
+    const kept = rows.filter(r => r.b.label);
+    d.buttons = kept.map(r => r.b);
+    const naOn = document.getElementById('p-noact').checked;
+    if (naOn) {
+      d.no_action = {
+        amount: +document.getElementById('p-noact-amount').value || 1,
+        unit: document.getElementById('p-noact-unit').value,
+      };
+    } else {
+      delete d.no_action;
+    }
+    d.ports_v = PORTS_VERSION;
+    // выходы: 1 «далее» + по одному на каждую кнопку (и ссылку) + «нет реакции».
+    // Кнопки могли переставить, удалить или добавить — связи едут за ними.
+    const portMap = {};
+    for (let i = 0; i < oldN; i++) portMap['output_' + (i + 2)] = null;
+    kept.forEach((r, j) => {
+      if (r.src != null && r.src < oldN) portMap['output_' + (r.src + 2)] = 'output_' + (j + 2);
+    });
+    if (hadNoAct) portMap['output_' + (oldN + 2)] = naOn ? 'output_' + (d.buttons.length + 2) : null;
+    const need = 1 + d.buttons.length + (naOn ? 1 : 0);
+    remapNodeOutputs(selectedNodeId, portMap, need);
+    // теперь номера строк совпадают с данными узла
+    rows.forEach(r => { r.row.dataset.src = ''; });
+    kept.forEach((r, j) => { r.row.dataset.src = j; });
   } else if (node.name === 'note') {
     d.text = document.getElementById('p-note').value;
   } else if (node.name === 'delay') {
@@ -1376,7 +1527,7 @@ function applyFunnelToCanvas(f) {
   hideProps();
   editor.clear();
   if (f.graph_ui && f.graph_ui.drawflow) {
-    editor.import(JSON.parse(JSON.stringify(f.graph_ui)));  // import мутирует объект
+    editor.import(upgradeGraphPorts(JSON.parse(JSON.stringify(f.graph_ui))));  // import мутирует объект
   }
   // порты, статистика и связи — после отрисовки узлов
   setTimeout(() => {
@@ -2197,6 +2348,14 @@ function pastePayload(payload) {
 
   const OFF = 60;
   const idRemap = {};
+  // блоки, скопированные до перехода на «выход у каждой кнопки»
+  payload.forEach(p => {
+    if (p.name !== 'message' || !p.data || p.data.ports_v === PORTS_VERSION) return;
+    const pm = oldMessagePortMap(p.data.buttons);
+    (p.conns || []).forEach(c => { c.from_port = pm[c.from_port] || c.from_port; });
+    p.outputs = 1 + (p.data.buttons || []).length;
+    p.data.ports_v = PORTS_VERSION;
+  });
   // 1) создаём ноды
   payload.forEach(p => {
     if (p.name === 'start') return; // старт не копируем — он один

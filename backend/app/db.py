@@ -31,6 +31,37 @@ async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.run_sync(_migrate)
+    await _migrate_data()
+
+
+async def _migrate_data():
+    """Разовые правки данных (идемпотентные — можно гонять при каждом старте)."""
+    import copy
+    import logging
+
+    from sqlalchemy import select
+
+    from .graph import GraphError, compile_graph, upgrade_compiled_ports, upgrade_ports
+    from .models import Funnel
+
+    log = logging.getLogger("sendbot.db")
+    async with SessionLocal() as s:
+        fixed = 0
+        for f in (await s.execute(select(Funnel))).scalars():
+            ui = copy.deepcopy(f.graph_ui or {})
+            if not upgrade_ports(ui):
+                continue
+            f.graph_ui = ui
+            try:
+                f.graph = compile_graph(copy.deepcopy(ui))
+            except GraphError:
+                g = copy.deepcopy(f.graph or {})
+                upgrade_compiled_ports(g)
+                f.graph = g
+            fixed += 1
+        if fixed:
+            await s.commit()
+            log.info("Нумерация кнопок обновлена в воронках: %s", fixed)
 
 
 def _migrate(conn):
@@ -74,6 +105,8 @@ def _migrate(conn):
     add("funnel_runs", "parent_run_id", "parent_run_id INTEGER")
     add("funnel_runs", "return_node", "return_node VARCHAR(32)")
     add("funnel_runs", "depth", "depth INTEGER DEFAULT 0")
+    add("scheduled_jobs", "kind", "kind VARCHAR(16) DEFAULT 'delay'")
+    add("scheduled_jobs", "port", "port VARCHAR(16)")
 
     if "subscribers" not in tables:
         return

@@ -257,6 +257,8 @@ async def on_message(message: Message, db_bot_id: int):
         # пишем входящее в историю переписки
         session.add(Message(subscriber_id=sub.id, direction="in", text=text))
         await session.flush()
+        # человек написал — это реакция: таймеры «нет реакции» больше не ждём
+        await fx.cancel_no_action(session, subscriber_id=sub.id)
 
         # пауза автоматизации (оператор ведёт диалог вручную) — триггеры не запускаем
         paused = sub.automation_paused_until and sub.automation_paused_until > datetime.utcnow()

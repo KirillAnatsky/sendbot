@@ -11,7 +11,9 @@ import aiohttp
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .graph import GraphError, compile_graph
+from .graph import PORTS_VERSION, GraphError, compile_graph
+
+_UNIT_SHORT = {"seconds": "сек", "minutes": "мин", "hours": "ч", "days": "дн"}
 from .models import Setting, Tag
 
 log = logging.getLogger("sendbot.ai")
@@ -96,8 +98,9 @@ SYSTEM_PROMPT = """Ты — конструктор воронок для тел�
      "photo_url": null | "media/файл.png" | "https://...",
      "buttons": [
         {"label": "кнопка-ветвление", "next": "id-узла"},
-        {"label": "кнопка-ссылка", "url": "https://..."}
+        {"label": "кнопка-ссылка", "url": "https://...", "next": "id-узла или null — куда вести после перехода по ссылке"}
      ],
+     "no_action": null | {"amount": 1, "unit": "minutes|hours|days", "next": "id-узла — если человек ничего не нажал и не написал за это время"},
      "next": "id следующего узла или null"},
     {"id": "n2", "type": "delay", "amount": 1, "unit": "seconds|minutes|hours|days", "next": "n3"},
     {"id": "n3", "type": "condition", "tag": "имя-тега", "yes": "id или null", "no": "id или null"},
@@ -415,16 +418,22 @@ def _html(ntype: str, d: dict, tag_names: dict) -> str:
         btns_html = ""
         buttons = d.get("buttons") or []
         if buttons:
-            rows, port = [], 2
-            for b in buttons:
+            rows = []
+            for k, b in enumerate(buttons):
+                port = f'<span class="df-btn-port">{k + 2}</span>'
                 if b.get("url"):
-                    rows.append(f'<div class="df-btn url">🔗 {h.escape(b.get("label", "ссылка"))}</div>')
+                    rows.append(f'<div class="df-btn url">{port}🔗 {h.escape(b.get("label", "ссылка"))}</div>')
                 else:
-                    rows.append(
-                        f'<div class="df-btn"><span class="df-btn-port">{port}</span>{h.escape(b.get("label", "кнопка"))}</div>')
-                    port += 1
+                    rows.append(f'<div class="df-btn">{port}{h.escape(b.get("label", "кнопка"))}</div>')
             btns_html = '<div class="df-btns">' + "".join(rows) + "</div>"
-        ports = "1: далее" if any(not b.get("url") for b in buttons) else ""
+        na = d.get("no_action")
+        if na:
+            btns_html += (
+                f'<div class="df-btns"><div class="df-btn df-noact">'
+                f'<span class="df-btn-port">{len(buttons) + 2}</span>⏳ нет реакции '
+                f'{h.escape(str(na.get("amount", "")))} {h.escape(_UNIT_SHORT.get(na.get("unit"), ""))}'
+                f'</div></div>')
+        ports = "1: далее" if (buttons or na) else ""
         return (
             f'<div class="df-title">{NODE_TITLES["message"]}</div>'
             f"{media_html}{text_html}{btns_html}"
@@ -580,8 +589,13 @@ def build_drawflow(spec: dict, tag_ids: dict, chain_ids: dict | None = None) -> 
                 "photo_url": n.get("photo_url") or "",
                 "buttons": buttons,
                 "text_first": bool(n.get("text_first")),
+                "ports_v": PORTS_VERSION,
             }
-            n_out = 1 + len([b for b in buttons if "url" not in b])
+            na = n.get("no_action")
+            if isinstance(na, dict) and na.get("next"):
+                data["no_action"] = {"amount": na.get("amount", 1),
+                                     "unit": na.get("unit", "hours")}
+            n_out = 1 + len(buttons) + (1 if data.get("no_action") else 0)
         elif ntype == "delay":
             data = {"amount": n.get("amount", 1), "unit": n.get("unit", "hours")}
             n_out = 1
@@ -662,14 +676,16 @@ def build_drawflow(spec: dict, tag_ids: dict, chain_ids: dict | None = None) -> 
             if t:
                 add_conn(nid, "output_1", t)
             if ntype == "message":
-                k = 2
-                for b in n.get("buttons") or []:
-                    if b.get("url"):
-                        continue
+                btns = n.get("buttons") or []
+                for k, b in enumerate(btns):
                     t = tgt(b.get("next"))
                     if t:
-                        add_conn(nid, f"output_{k}", t)
-                    k += 1
+                        add_conn(nid, f"output_{k + 2}", t)
+                na = n.get("no_action")
+                if isinstance(na, dict):
+                    t = tgt(na.get("next"))
+                    if t:
+                        add_conn(nid, f"output_{len(btns) + 2}", t)
 
     _layout(df)
     return {"drawflow": {"Home": {"data": df}}}
@@ -829,10 +845,15 @@ def graph_to_spec(funnel) -> dict:
                     bb["style"] = b["style"]
                 if b.get("url"):
                     bb["url"] = b["url"]
-                else:
-                    bb["next"] = first(n, f"output_{i + 2}")
+                nxt = first(n, f"output_{i + 2}")
+                if nxt or not b.get("url"):
+                    bb["next"] = nxt
                 btns.append(bb)
             item["buttons"] = btns
+            na = d.get("no_action")
+            if na:
+                item["no_action"] = {"amount": na.get("amount"), "unit": na.get("unit"),
+                                     "next": first(n, f"output_{len(btns) + 2}")}
             item["next"] = first(n, "output_1")
         elif t == "delay":
             item.update(amount=d.get("amount"), unit=d.get("unit"), next=first(n, "output_1"))

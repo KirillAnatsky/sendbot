@@ -140,7 +140,11 @@ def build_broadcast_keyboard(buttons: list, broadcast_id: int,
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def build_keyboard(buttons: list, run_id: int, node_id: str, sub: Subscriber | None = None) -> InlineKeyboardMarkup | None:
+def build_keyboard(buttons: list, run_id: int, node_id: str, sub: Subscriber | None = None,
+                   tracked: set | frozenset = frozenset()) -> InlineKeyboardMarkup | None:
+    """tracked — номера кнопок-ссылок, переход по которым надо засчитать
+    (у них есть связь или в блоке идёт таймер бездействия). Такая ссылка
+    ведёт через наш /go/…, а оттуда — на исходный адрес."""
     if not buttons:
         return None
     rows = []
@@ -155,6 +159,10 @@ def build_keyboard(buttons: list, run_id: int, node_id: str, sub: Subscriber | N
         if url:
             if sub is not None:
                 url = personalize(url, sub)  # подставляем {p:...}, {source} в ссылку
+            if i in tracked:
+                from ..links import tracked_url
+
+                url = tracked_url(run_id, node_id, i) or url
             rows.append([_make_button(text=label, url=url, **extra)])
         else:
             rows.append([

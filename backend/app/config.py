@@ -17,6 +17,14 @@ class Settings:
     # автоочистка истории переписки и получателей рассылок старше N дней
     # (0 = хранить вечно). На больших базах помогает держать БД компактной.
     history_retention_days: int = int(os.getenv("HISTORY_RETENTION_DAYS", "0"))
+    # Внешний адрес сервиса — нужен кнопкам-ссылкам со связью: переход идёт
+    # через {public_url}/go/…, мы засчитываем клик и сразу перекидываем на
+    # нужный сайт. Без адреса такие кнопки работают как обычные ссылки.
+    public_url: str = (
+        os.getenv("PUBLIC_URL")
+        or (f"https://{os.getenv('DOMAIN')}"
+            if os.getenv("DOMAIN") and "example.com" not in os.getenv("DOMAIN", "") else "")
+    ).rstrip("/")
 
 
 settings = Settings()

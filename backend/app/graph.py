@@ -3,7 +3,10 @@
 Соглашение по портам:
   start:     output_1 -> дальше
   message:   output_1 -> "далее" (сразу после отправки),
-             output_{i+2} -> кнопка i (0-индекс)
+             output_{i+2} -> кнопка i (0-индекс, считая и кнопки-ссылки:
+                             у ссылки ветка срабатывает, когда по ней перешли),
+             output_{N+2} -> «нет реакции» (N = число кнопок; только если
+                             в блоке включён таймер бездействия no_action)
   delay:     output_1 -> дальше (после паузы)
   condition: output_1 -> да (тег есть), output_2 -> нет
   action:    output_1 -> дальше
@@ -23,8 +26,100 @@ ACTION_OPS = ("add_tag", "remove_tag", "unsubscribe", "check_subscription",
               "delete_message")
 
 
+UNITS = ("seconds", "minutes", "hours", "days")
+
+# Версия нумерации выходов «Сообщения». До v2 порт был только у кнопок без
+# ссылки и шёл подряд (2, 3, …), а движок считал номер по ВСЕМ кнопкам —
+# кнопка после ссылки уходила в пустой выход. С v2 порт есть у каждой кнопки:
+# output_{i+2}, где i — её место в списке.
+PORTS_VERSION = 2
+
+
 class GraphError(Exception):
     pass
+
+
+def no_action_port(data: dict) -> str | None:
+    """Выход «нет реакции» узла «Сообщение», если таймер включён."""
+    if not (data or {}).get("no_action"):
+        return None
+    return f"output_{len(data.get('buttons') or []) + 2}"
+
+
+def _old_message_port_map(buttons: list) -> dict:
+    """Старый номер выхода -> новый для узла, сохранённого до v2."""
+    out, k = {}, 2
+    for i, b in enumerate(buttons or []):
+        if isinstance(b, dict) and b.get("url"):
+            continue
+        if f"output_{k}" != f"output_{i + 2}":
+            out[f"output_{k}"] = f"output_{i + 2}"
+        k += 1
+    return out
+
+
+def _port_no(port: str) -> int:
+    try:
+        return int(str(port).rsplit("_", 1)[1])
+    except (IndexError, ValueError):
+        return 0
+
+
+def upgrade_ports(drawflow_export: dict) -> bool:
+    """Перевести узлы «Сообщение» на нумерацию выходов v2 (на месте).
+
+    Связи переезжают вместе с кнопками, так что воронка ведёт туда же,
+    куда вела на холсте. Узлы, уже помеченные ports_v=2, не трогаем —
+    функцию безопасно звать сколько угодно раз. True — что-то поменялось.
+    """
+    try:
+        data = drawflow_export["drawflow"]["Home"]["data"]
+    except (KeyError, TypeError):
+        return False
+    changed, remaps = False, {}
+    for nid, n in data.items():
+        if not isinstance(n, dict) or n.get("name") != "message":
+            continue
+        d = n.get("data")
+        if not isinstance(d, dict):
+            d = n["data"] = {}
+        if d.get("ports_v") == PORTS_VERSION:
+            continue
+        buttons = d.get("buttons") or []
+        pm = _old_message_port_map(buttons)
+        outs = {pm.get(port, port): pdata for port, pdata in (n.get("outputs") or {}).items()}
+        for k in range(1, len(buttons) + 2):
+            outs.setdefault(f"output_{k}", {"connections": []})
+        n["outputs"] = dict(sorted(outs.items(), key=lambda kv: _port_no(kv[0])))
+        d["ports_v"] = PORTS_VERSION
+        if pm:
+            remaps[str(nid)] = pm
+        changed = True
+    if remaps:
+        # Drawflow хранит связь с двух концов: у входа цели тоже записан порт
+        for n in data.values():
+            for inp in ((n or {}).get("inputs") or {}).values():
+                for c in inp.get("connections", []):
+                    pm = remaps.get(str(c.get("node")))
+                    if pm and c.get("input") in pm:
+                        c["input"] = pm[c["input"]]
+    return changed
+
+
+def upgrade_compiled_ports(graph: dict) -> bool:
+    """То же для уже скомпилированного графа движка."""
+    changed = False
+    for n in ((graph or {}).get("nodes") or {}).values():
+        if n.get("type") != "message":
+            continue
+        d = n.setdefault("data", {})
+        if d.get("ports_v") == PORTS_VERSION:
+            continue
+        pm = _old_message_port_map(d.get("buttons") or [])
+        n["outputs"] = {pm.get(p, p): t for p, t in (n.get("outputs") or {}).items()}
+        d["ports_v"] = PORTS_VERSION
+        changed = True
+    return changed
 
 
 def compile_graph(drawflow_export: dict) -> dict:
@@ -32,6 +127,8 @@ def compile_graph(drawflow_export: dict) -> dict:
         raw = drawflow_export["drawflow"]["Home"]["data"]
     except (KeyError, TypeError):
         raise GraphError("Пустой или некорректный граф")
+    # воронки и черновики, сохранённые до v2, переводим на новую нумерацию
+    upgrade_ports(drawflow_export)
 
     nodes = {}
     start_id = None
@@ -72,6 +169,18 @@ def _validate(nodes: dict):
             has_buttons = bool(d.get("buttons"))
             if not (has_text or has_media or has_buttons):
                 raise GraphError(f"Блок «Сообщение» ({nid}): добавьте текст, вложение или кнопку")
+            na = d.get("no_action")
+            if na:
+                try:
+                    amount = float((na or {}).get("amount", 0))
+                except (TypeError, ValueError, AttributeError):
+                    amount = 0
+                if amount <= 0:
+                    raise GraphError(
+                        f"Блок «Сообщение» ({nid}): укажите, сколько ждать реакции (> 0)")
+                if na.get("unit") not in UNITS:
+                    raise GraphError(
+                        f"Блок «Сообщение» ({nid}): некорректная единица времени ожидания")
         elif n["type"] == "delay":
             try:
                 amount = float(d.get("amount", 0))
@@ -79,7 +188,7 @@ def _validate(nodes: dict):
                 amount = 0
             if amount <= 0:
                 raise GraphError(f"Блок «Задержка» ({nid}): укажите время > 0")
-            if d.get("unit") not in ("seconds", "minutes", "hours", "days"):
+            if d.get("unit") not in UNITS:
                 raise GraphError(f"Блок «Задержка» ({nid}): некорректная единица времени")
         elif n["type"] == "condition":
             if not d.get("tag"):

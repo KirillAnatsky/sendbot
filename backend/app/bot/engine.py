@@ -6,7 +6,7 @@ from aiogram import Bot
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..graph import next_node
+from ..graph import next_node, no_action_port
 from ..models import (
     ButtonClick,
     Funnel,
@@ -86,7 +86,18 @@ async def advance(
 
         if ntype == "message":
             buttons = data.get("buttons") or []
-            kb = build_keyboard(buttons, run.id, node_id, sub)
+            # таймер бездействия: только если выход «нет реакции» куда-то ведёт
+            na_port = no_action_port(data)
+            if na_port and not node["outputs"].get(na_port):
+                na_port = None
+            # ссылки, переход по которым надо засчитать: у кнопки есть своя
+            # ветка, или переход должен погасить таймер бездействия
+            tracked = {
+                i for i, b in enumerate(buttons)
+                if isinstance(b, dict) and b.get("url")
+                and (na_port or node["outputs"].get(f"output_{i + 2}"))
+            }
+            kb = build_keyboard(buttons, run.id, node_id, sub, tracked=tracked)
             media = list(data.get("media") or [])
             if not media and data.get("photo_url"):  # обратная совместимость
                 media = [{"type": "photo", "path": data["photo_url"]}]
@@ -97,6 +108,14 @@ async def advance(
                 node["outputs"].get(f"output_{i + 2}") for i in range(len(buttons))
             )
             waiting_buttons = waiting_buttons or has_branchy_buttons
+            if na_port:
+                na = data.get("no_action") or {}
+                seconds = float(na["amount"]) * UNIT_SECONDS[na["unit"]]
+                session.add(ScheduledJob(
+                    run_id=run.id, node_id=node_id, kind="no_action", port=na_port,
+                    execute_at=datetime.utcnow() + timedelta(seconds=seconds),
+                ))
+                await session.flush()
             node_id = next_node(graph, node_id, "output_1")
 
         elif ntype == "delay":
@@ -281,8 +300,78 @@ async def handle_button(bot: Bot, session: AsyncSession, run_id: int, node_id: s
             funnel_id=funnel.id, node_id=node_id, button_index=btn, subscriber_id=sub.id
         )
     )
+    # человек отреагировал — ветки «нет реакции» этого запуска больше не нужны
+    await cancel_no_action(session, run_id=run.id)
     run.status = "active"
     await advance(bot, session, run, funnel, sub, node_id, f"output_{btn + 2}")
+
+
+_link_clicks_in_flight: set = set()
+
+
+async def handle_link_click(bot: Bot | None, session: AsyncSession, run_id: int,
+                            node_id: str, btn: int):
+    """Переход по кнопке-ссылке (через /go/). Засчитываем только первый.
+
+    Ссылку открывают повторно — вернуться на сайт, поделиться, — и каждый
+    раз заново слать ветку воронки было бы спамом. Поэтому ветка идёт один
+    раз за запуск, а клик в статистике — один на человека и запуск.
+    """
+    key = (run_id, node_id, btn)
+    if key in _link_clicks_in_flight:   # двойной тап: второй запрос ждать не будет
+        return
+    _link_clicks_in_flight.add(key)
+    try:
+        run = await session.get(FunnelRun, run_id)
+        if run is None or run.status == "cancelled":
+            return
+        funnel = await session.get(Funnel, run.funnel_id)
+        sub = await session.get(Subscriber, run.subscriber_id)
+        if funnel is None or sub is None:
+            return
+        sub.last_active_at = datetime.utcnow()
+        seen = await session.execute(
+            select(ButtonClick.id).where(
+                ButtonClick.funnel_id == funnel.id, ButtonClick.node_id == node_id,
+                ButtonClick.button_index == btn, ButtonClick.subscriber_id == sub.id,
+                ButtonClick.created_at >= run.started_at,
+            ).limit(1)
+        )
+        if seen.first() is not None:
+            return
+        session.add(ButtonClick(
+            funnel_id=funnel.id, node_id=node_id, button_index=btn, subscriber_id=sub.id))
+        await cancel_no_action(session, run_id=run.id)
+        await session.flush()
+        node = (funnel.graph or {}).get("nodes", {}).get(str(node_id))
+        if bot is None or node is None or not node["outputs"].get(f"output_{btn + 2}"):
+            return
+        run.status = "active"
+        await advance(bot, session, run, funnel, sub, node_id, f"output_{btn + 2}")
+    finally:
+        _link_clicks_in_flight.discard(key)
+
+
+async def cancel_no_action(session: AsyncSession, *, run_id: int | None = None,
+                           subscriber_id: int | None = None):
+    """Погасить таймеры бездействия: человек что-то сделал.
+
+    run_id — в одном запуске (нажал кнопку его сообщения); subscriber_id —
+    во всех активных запусках человека (написал боту).
+    """
+    q = select(ScheduledJob).where(
+        ScheduledJob.status == "pending", ScheduledJob.kind == "no_action")
+    if run_id is not None:
+        q = q.where(ScheduledJob.run_id == run_id)
+    elif subscriber_id is not None:
+        q = q.where(ScheduledJob.run_id.in_(
+            select(FunnelRun.id).where(
+                FunnelRun.subscriber_id == subscriber_id, FunnelRun.status == "active")))
+    else:
+        return
+    for j in (await session.execute(q)).scalars():
+        j.status = "cancelled"
+    await session.flush()
 
 
 async def run_due_jobs(session: AsyncSession, get_bot):
@@ -313,8 +402,15 @@ async def run_due_jobs(session: AsyncSession, get_bot):
         bot = get_bot(sub.bot_id)
         if bot is None:
             continue
+        port = "output_1"
+        if job.kind == "no_action":
+            # человек так ничего и не сделал — уводим в ветку «нет реакции»
+            port = job.port or "output_1"
+            run.status = "active"
+            log.info("Подписчик #%s не отреагировал на блок %s воронки #%s — ветка «нет реакции»",
+                     sub.id, job.node_id, funnel.id)
         try:
-            await advance(bot, session, run, funnel, sub, job.node_id, "output_1")
+            await advance(bot, session, run, funnel, sub, job.node_id, port)
         except Exception:  # noqa: BLE001
             log.exception("Ошибка выполнения отложенного шага job=%s", job.id)
 

@@ -177,6 +177,12 @@ th { background: #f8fafc; color: #7a8499; font-weight: 600; font-size: 12.5px; t
   padding: 5px 26px; font-size: 12px; text-align: center; position: relative;
   min-height: 15px; }
 .df-btn.url { color: #556; background: #f4f6fa; border-color: #e0e5ee; }
+.df-btn.df-noact { color: #8a5a00; background: #fff7e6; border: 1px dashed #f0c36d; }
+.df-btn.df-noact .df-btn-port { background: #e0a100; }
+.drawflow .drawflow-node .output.port-btn.port-noact { border-color: #e0a100; background: #fff7e6; color: #8a5a00; }
+.btn-row .btn-move { padding: 4px 7px; flex: 0 0 auto; }
+.props .noact-toggle { display: flex; align-items: center; gap: 6px; margin-top: 14px; cursor: pointer; }
+.noact-toggle input { width: auto; margin: 0; }
 .df-btn-port { position: absolute; left: 6px; top: 50%; transform: translateY(-50%);
   background: #2e6bff; color: #fff; border-radius: 50%; width: 15px; height: 15px;
   font-size: 9.5px; line-height: 15px; font-weight: 700; }

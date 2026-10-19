@@ -841,10 +841,11 @@ async def analysis_options(user=Depends(current_user), session=Depends(get_sessi
                     label = f"Шаг {steps[nid]} — {label}"
                 item = {"id": nid, "label": label}
                 if n["type"] == "message":
+                    # индекс в списке = button_index клика, поэтому ссылки не
+                    # выкидываем (переходы по ним теперь тоже засчитываются)
                     item["buttons"] = [
-                        b.get("label", f"кнопка {i+1}")
+                        ("🔗 " if b.get("url") else "") + b.get("label", f"кнопка {i+1}")
                         for i, b in enumerate(n.get("data", {}).get("buttons") or [])
-                        if not b.get("url")
                     ]
                 nodes.append(item)
         fl.append({"id": f.id, "name": f.name, "nodes": nodes})
