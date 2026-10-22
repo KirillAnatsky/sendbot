@@ -532,15 +532,96 @@ def _filter_data(n: dict, tag_ids: dict) -> dict:
                        "conditions": conds}}
 
 
+MEDIA_TYPES = ("photo", "video", "audio", "voice", "video_note", "document")
+_EXT_TYPE = {"jpg": "photo", "jpeg": "photo", "png": "photo", "webp": "photo", "gif": "photo",
+             "mp4": "video", "mov": "video", "mp3": "audio", "m4a": "audio", "ogg": "voice"}
+
+
+def clean_media(raw) -> list:
+    """Вложения узла из спеки: только известные типы и непустые пути."""
+    out = []
+    for m in raw or []:
+        if isinstance(m, str):
+            m = {"path": m, "type": _EXT_TYPE.get(m.rsplit(".", 1)[-1].lower(), "document")}
+        if not isinstance(m, dict):
+            continue
+        path = str(m.get("path") or "").strip()
+        mtype = m.get("type") if m.get("type") in MEDIA_TYPES else None
+        if not path or not mtype:
+            continue
+        out.append({"type": mtype, "path": path, "name": str(m.get("name") or "")})
+    return out
+
+
+def media_count(nodes: list) -> int:
+    """Сколько вложений во всех сообщениях спеки."""
+    return sum(len(clean_media(n.get("media"))) + (1 if n.get("photo_url") else 0)
+               for n in nodes or [] if n.get("type") == "message")
+
+
+_MEDIA_WORDS = re.compile(r"картин|фото|изображ|медиа|вложен|видео|файл|аудио|кружк|гиф|gif", re.I)
+_REMOVE_WORDS = re.compile(r"убер|удал|без\s|сним|очист|замен|выкин|не нужн", re.I)
+
+
+def wants_media_change(text: str) -> bool:
+    """Пользователь сам просит убрать или заменить вложения."""
+    return bool(_MEDIA_WORDS.search(text or "") and _REMOVE_WORDS.search(text or ""))
+
+
+def keep_lost_media(old_spec: dict, new_spec: dict) -> int:
+    """Вернуть узлам вложения и оформление кнопок, которые модель потеряла.
+
+    Сверяем по id: узел, оставшийся тем же, должен остаться с теми же
+    картинками, иконками кнопок и «выкл». -> сколько узлов поправлено.
+    """
+    old = {str(n.get("id")): n for n in old_spec.get("nodes") or [] if n.get("type") == "message"}
+    fixed = 0
+    for n in new_spec.get("nodes") or []:
+        o = old.get(str(n.get("id")))
+        if n.get("type") != "message" or o is None:
+            continue
+        touched = False
+        if clean_media(o.get("media")) and not clean_media(n.get("media")):
+            n["media"] = o["media"]
+            touched = True
+        if o.get("photo_url") and not n.get("photo_url") and not n.get("media"):
+            n["photo_url"] = o["photo_url"]
+            touched = True
+        old_btns = {b.get("label"): b for b in o.get("buttons") or []}
+        for b in n.get("buttons") or []:
+            ob = old_btns.get(b.get("label"))
+            if not ob:
+                continue
+            for k in ("icon_custom_emoji_id", "disabled", "disabled_reason"):
+                if ob.get(k) and not b.get(k):
+                    b[k] = ob[k]
+        fixed += touched
+    return fixed
+
+
 def build_drawflow(spec: dict, tag_ids: dict, chain_ids: dict | None = None) -> dict:
     """Конвертирует спеку в экспорт Drawflow (+ авторасстановка)."""
     nodes_spec = spec.get("nodes") or []
     if not nodes_spec:
         raise AIError("В спеке нет узлов")
 
-    id_map = {}  # spec id -> numeric str
-    for i, n in enumerate(nodes_spec):
-        id_map[str(n["id"])] = str(i + 2)  # 1 занят под start
+    # spec id -> numeric str. Числовые id — это узлы уже существующей
+    # воронки (их отдаёт graph_to_spec): оставляем их как есть. Иначе после
+    # каждой правки AI все блоки получали новые номера — и у людей посреди
+    # воронки ломались кнопки и задержки, а статистика шагов обнулялась.
+    id_map = {}
+    used = {"1"}  # 1 занят под start
+    for n in nodes_spec:
+        sid = str(n["id"])
+        if sid.isdigit() and sid not in used and sid not in id_map:
+            id_map[sid] = sid
+            used.add(sid)
+    next_id = max(int(x) for x in used) + 1
+    for n in nodes_spec:
+        sid = str(n["id"])
+        if sid not in id_map:
+            id_map[sid] = str(next_id)
+            next_id += 1
     tag_names = {str(v): k for k, v in tag_ids.items()}
     # имена цепочек кладём в тот же словарь под префиксом, чтобы не тащить
     # ещё один аргумент через все функции отрисовки карточек
@@ -583,6 +664,13 @@ def build_drawflow(spec: dict, tag_ids: dict, chain_ids: dict | None = None) -> 
                     btn["url"] = b["url"]
                 if b.get("style") in BUTTON_STYLES:
                     btn["style"] = b["style"]
+                icon = str(b.get("icon_custom_emoji_id") or "").strip()
+                if icon.isdigit():
+                    btn["icon_custom_emoji_id"] = icon
+                if b.get("disabled"):
+                    btn["disabled"] = True
+                    if b.get("disabled_reason"):
+                        btn["disabled_reason"] = str(b["disabled_reason"])
                 buttons.append(btn)
             data = {
                 "text": n.get("text") or "",
@@ -591,6 +679,11 @@ def build_drawflow(spec: dict, tag_ids: dict, chain_ids: dict | None = None) -> 
                 "text_first": bool(n.get("text_first")),
                 "ports_v": PORTS_VERSION,
             }
+            # вложения: раньше это поле при пересборке молча выбрасывалось,
+            # и любая правка через AI-чат стирала все картинки воронки
+            media = clean_media(n.get("media"))
+            if media:
+                data["media"] = media
             na = n.get("no_action")
             if isinstance(na, dict) and na.get("next"):
                 data["no_action"] = {"amount": na.get("amount", 1),
@@ -843,6 +936,9 @@ def graph_to_spec(funnel) -> dict:
                 bb = {"label": b.get("label", "")}
                 if b.get("style"):
                     bb["style"] = b["style"]
+                for k in ("icon_custom_emoji_id", "disabled", "disabled_reason"):
+                    if b.get(k):
+                        bb[k] = b[k]
                 if b.get("url"):
                     bb["url"] = b["url"]
                 nxt = first(n, f"output_{i + 2}")
@@ -931,8 +1027,8 @@ EDIT_SYSTEM_PROMPT = """Ты — AI-помощник внутри редакто
 Пользователь может приложить картинки: пример желаемого вида, текущий холст, чужую воронку, макет сообщения. Используй их как образец. Чего не видно или не разобрать — не выдумывай, скажи об этом в reply.
 
 ПРАВКА СОДЕРЖИМОГО (spec)
-Схема узлов — та же, что у конструктора: message (text, buttons, photo_url,
-text_first), delay, condition, action (add_tag, remove_tag, unsubscribe,
+Схема узлов — та же, что у конструктора: message (text, media, buttons,
+photo_url, text_first, no_action), delay, condition, action (add_tag, remove_tag, unsubscribe,
 check_subscription, delete_message), filter (conditions, yes, no), chain
 (chain — название существующей цепочки), language, note. Блоки, которых
 пользователь не просил трогать, возвращай как есть — вместе со всеми их
@@ -940,7 +1036,9 @@ check_subscription, delete_message), filter (conditions, yes, no), chain
 
 Если меняешь — верни ПОЛНУЮ новую спеку всех узлов (формат узлов тот же, что во входных данных; поле "entry" не возвращай — первый узел списка станет входом).
 
-- Сохраняй существующие id узлов, которые не менял; новым давай id вида "n1","n2".
+- Сохраняй существующие id узлов (и тех, у которых меняешь текст); новым давай id вида "n1","n2".
+- ВЛОЖЕНИЯ (media — картинки, видео, файлы): это файлы, которые пользователь загрузил руками. Переноси массив media ДОСЛОВНО (type, path, name) — у каждого узла, который возвращаешь. Когда делаешь копию узла (перевод на другой язык, дубль ветки, вариант дожима) — копируй в неё тот же media. Убирай или меняй media, только если пользователь прямо об этом попросил. Пропавшая картинка = час ручной работы.
+- Оформление кнопок (style, icon_custom_emoji_id, disabled) переноси как есть, в том числе в переведённые копии.
 - Тексты, которые не просили менять, переноси ДОСЛОВНО.
 - В условиях/действиях поле tag — ИМЯ тега (латинский slug). Несуществующие теги создадутся автоматически.
 - МУЛЬТИЯЗЫЧНОСТЬ: если просят перевод на другие языки — поставь первым узлом language (авто-определение языка Telegram-профиля, юзера не спрашиваем): {"type": "language", "languages": [{"code": "ru", "next": ...}, ...], "other": ...}. Каждая ветка — полная копия воронки на своём языке (переведи все тексты и кнопки, ссылки не меняй), существующая ветка становится одной из языковых, "other" веди в ветку английского (или основного) языка. Кнопочный выбор языка делай, только если это просят явно.
@@ -999,7 +1097,7 @@ async def chat_edit_funnel(session, funnel, tags_list, user_messages: list, prov
             n["chain"] = chain_names.get(str(n.pop("chain_id", "")), "")
 
     convo = "ТЕКУЩАЯ ВОРОНКА:\n" + _json.dumps(spec, ensure_ascii=False) + "\n\nДИАЛОГ:\n"
-    for m in user_messages[-12:]:
+    for m in user_messages[-30:]:
         role = "Пользователь" if m.get("role") == "user" else "Ассистент"
         shots = " [приложены скриншоты]" if m.get("images") else ""
         convo += f"{role}: {m.get('content','')}{shots}\n"
@@ -1014,6 +1112,14 @@ async def chat_edit_funnel(session, funnel, tags_list, user_messages: list, prov
     new_spec = data.get("spec")
     fields = None
     if new_spec:
+        last_user = next((m.get("content", "") for m in reversed(user_messages)
+                          if m.get("role") == "user"), "")
+        if not wants_media_change(last_user):
+            keep_lost_media(spec, new_spec)
+        before, after = media_count(spec["nodes"]), media_count(new_spec.get("nodes"))
+        if after < before:
+            reply += (f"\n\n⚠️ Вложений стало меньше: было {before}, стало {after}. "
+                      "Если это не то, что нужно, — нажмите «↶ Отменить эту правку».")
         tag_ids = await ensure_tags(session, new_spec)
         chain_ids = await resolve_chains(session, new_spec)
         fields = spec_to_funnel_fields(new_spec, tag_ids, chain_ids)

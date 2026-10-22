@@ -4,7 +4,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
-COPY loadtest.py apitest.py ./
+COPY loadtest.py apitest.py restore_from_backup.py ./
 COPY tests ./tests
 COPY pytest.ini ./
 

@@ -1376,16 +1376,36 @@ function hideProps() {
 }
 
 // ---------- AI-чат воронки ----------
-const AI_CHAT_HISTORY = {};  // funnelId -> [{role, content}]
+// История чата хранится на сервере (по воронке) — здесь только кэш.
+const AI_CHAT_HISTORY = {};  // funnelId -> [{role, content, images, version_id}]
 
-function toggleAiChat() {
+async function loadAiChat(fid) {
+  if (AI_CHAT_HISTORY[fid]) return;
+  try {
+    AI_CHAT_HISTORY[fid] = await api('/ai/chat/' + fid);
+  } catch (e) {
+    AI_CHAT_HISTORY[fid] = [];
+  }
+}
+
+async function toggleAiChat() {
   const el = document.getElementById('ai-chat');
   el.classList.toggle('hidden');
   if (!el.classList.contains('hidden')) {
     setupAiChatShots();
+    const fid = currentFunnelId;
     renderAiChat();
+    await loadAiChat(fid);
+    if (fid === currentFunnelId) renderAiChat();
     document.getElementById('ai-chat-text').focus();
   }
+}
+
+async function clearAiChat() {
+  if (!confirm('Очистить историю чата с AI для этой воронки? Сама воронка и её версии не пострадают.')) return;
+  await api('/ai/chat/' + currentFunnelId, { method: 'DELETE' });
+  AI_CHAT_HISTORY[currentFunnelId] = [];
+  renderAiChat();
 }
 
 function renderAiChat() {
@@ -1394,9 +1414,57 @@ function renderAiChat() {
   if (!box._intro) box._intro = box.children[0]?.outerHTML || '';
   box.innerHTML = box._intro + hist.map(m =>
     `<div class="aim ${m.role}">${(m.images || []).length ? `<div class="aim-shots">${
-      m.images.map(im => `<img src="/${esc(im.path)}" alt="">`).join('')}</div>` : ''}${esc(m.content)}</div>`).join('');
+      m.images.map(im => `<img src="/${esc(im.path)}" alt="">`).join('')}</div>` : ''}${esc(m.content)}${
+      m.version_id ? `<div class="aim-undo"><button class="btn" type="button"
+        onclick="restoreVersion(${+m.version_id}, true)">↶ Отменить эту правку</button></div>` : ''}</div>`).join('');
   box.scrollTop = box.scrollHeight;
   renderAiChatShots();
+}
+
+// ---------- версии воронки ----------
+const VERSION_SOURCE = { save: '💾 сохранение', ai: '🤖 до правки AI', restore: '↶ до отката',
+                         backup: '🗄 из бэкапа' };
+
+async function toggleVersions() {
+  let panel = document.getElementById('versions-panel');
+  if (panel) { panel.remove(); return; }
+  panel = document.createElement('div');
+  panel.id = 'versions-panel';
+  panel.className = 'versions-panel';
+  panel.innerHTML = `<div class="ai-chat-head"><b>🕘 История версий</b>
+    <button class="btn" onclick="toggleVersions()">✕</button></div>
+    <div class="versions-hint">Снимок делается перед каждой правкой AI, перед откатом и при сохранении
+    (не чаще раза в 10 минут). Хранятся последние 60.</div>
+    <div id="versions-list" class="versions-list">загрузка…</div>`;
+  document.getElementById('page-editor').appendChild(panel);
+  try {
+    const rows = await api('/funnels/' + currentFunnelId + '/versions');
+    document.getElementById('versions-list').innerHTML = rows.length ? rows.map(v => `
+      <div class="version-row">
+        <div><b>${esc(new Date(v.created_at).toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }))}</b> · ${VERSION_SOURCE[v.source] || esc(v.source)}
+          <div class="version-meta">блоков: ${v.blocks} · вложений: ${v.media}${v.note ? ' · «' + esc(v.note.slice(0, 80)) + '»' : ''}</div></div>
+        <button class="btn" onclick="restoreVersion(${v.id})">Вернуть</button>
+      </div>`).join('') : '<div class="version-meta">Пока пусто — версии появятся после первого сохранения или правки AI.</div>';
+  } catch (e) {
+    document.getElementById('versions-list').textContent = e.message;
+  }
+}
+
+async function restoreVersion(vid, fromChat) {
+  const msg = fromChat
+    ? 'Вернуть воронку к состоянию до этой правки AI? Текущее состояние тоже сохранится в истории.'
+    : 'Вернуть воронку к этой версии? Текущее состояние сохранится в истории — к нему тоже можно будет вернуться.';
+  if (!confirm(msg)) return;
+  flushAutoApply();
+  // несохранённое на холсте сначала сохраняем — иначе откат его бы стёр
+  if (editorStateJson() !== EDITOR_SNAPSHOT) await saveFunnel(true);
+  const f = await api(`/funnels/${currentFunnelId}/versions/${vid}/restore`, { method: 'POST' });
+  applyFunnelToCanvas(f);
+  setTimeout(() => { EDITOR_SNAPSHOT = editorStateJson(); }, 120);
+  dropDraft(currentFunnelId);
+  flashStatus('Версия восстановлена ✅');
+  const panel = document.getElementById('versions-panel');
+  if (panel) { panel.remove(); toggleVersions(); }
 }
 
 // ---------- скриншоты в AI-чате ----------
@@ -1469,7 +1537,9 @@ async function aiChatSend() {
   ta.value = '';
   AI_CHAT_SHOTS = [];
   flushAutoApply();
-  const hist = (AI_CHAT_HISTORY[currentFunnelId] = AI_CHAT_HISTORY[currentFunnelId] || []);
+  const fid = currentFunnelId;
+  await loadAiChat(fid);
+  const hist = AI_CHAT_HISTORY[fid];
   hist.push({ role: 'user', content: text, images: shots });
   renderAiChat();
   const box = document.getElementById('ai-chat-msgs');
@@ -1478,16 +1548,16 @@ async function aiChatSend() {
   document.getElementById('ai-chat-send').disabled = true;
   try {
     const r = await api('/ai/edit', { method: 'POST', body: {
-      funnel_id: currentFunnelId,
-      // картинки модель получает только к последнему сообщению — в истории
-      // остаётся пометка, что они были
-      messages: hist.map(m => ({ role: m.role, content: m.content, images: (m.images || []).length })),
+      funnel_id: fid,
+      // прежние реплики сервер берёт из своей истории — шлём только новую
+      messages: [{ role: 'user', content: text }],
       image_paths: shots.map(im => im.path),
       // то, что на холсте сейчас, с несохранёнными правками
       graph_ui: editor.export(),
     } });
-    hist.push({ role: 'assistant', content: r.reply });
+    hist.push(r.message || { role: 'assistant', content: r.reply });
     renderAiChat();
+    if (fid !== currentFunnelId) return;   // пока думал, открыли другую воронку
     if (r.updated) {
       // граф приходит прямо в ответе — рисуем сразу, без второго запроса
       const f = r.funnel || await api('/funnels/' + currentFunnelId);

@@ -305,6 +305,40 @@ class AIRequest(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
+class FunnelVersion(Base):
+    """Снимок воронки до правки — чтобы любую правку можно было откатить.
+
+    Снимается перед каждой правкой AI-помощника, перед откатом и при
+    сохранении (не чаще раза в 10 минут, иначе автосохранение заполнило бы
+    историю одинаковыми копиями).
+    """
+    __tablename__ = "funnel_versions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    funnel_id: Mapped[int] = mapped_column(ForeignKey("funnels.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(128))
+    trigger_type: Mapped[str] = mapped_column(String(32), default="start")
+    trigger_value: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    graph_ui: Mapped[dict] = mapped_column(JSON, default=dict)
+    graph: Mapped[dict] = mapped_column(JSON, default=dict)
+    source: Mapped[str] = mapped_column(String(16), default="save")  # save | ai | restore
+    note: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+
+
+class AIChatMessage(Base):
+    """История AI-чата воронки: переживает перезагрузку страницы."""
+    __tablename__ = "ai_chat_messages"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    funnel_id: Mapped[int] = mapped_column(ForeignKey("funnels.id", ondelete="CASCADE"), index=True)
+    role: Mapped[str] = mapped_column(String(16))  # user | assistant
+    content: Mapped[str] = mapped_column(Text, default="")
+    images: Mapped[list | None] = mapped_column(JSON, nullable=True)  # пути скриншотов
+    version_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # что откатывать
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
 class Broadcast(Base):
     __tablename__ = "broadcasts"
 

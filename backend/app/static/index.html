@@ -228,6 +228,7 @@
         <button class="btn" onclick="toggleArrangeMenu(this)">🧹 Разложить ▾</button>
         <button class="btn" onclick="toggleStepsDrawer()">📊 Шаги</button>
         <button class="btn" onclick="toggleAiChat()">🤖 AI</button>
+        <button class="btn" onclick="toggleVersions()" title="Версии воронки: откатить любую правку">🕘 История</button>
         <span id="autosave-status" class="autosave-status"></span>
         <button class="btn primary" onclick="saveFunnel()">💾 Сохранить</button>
       </div>
@@ -236,7 +237,10 @@
       <div id="ai-chat" class="ai-chat hidden">
         <div class="ai-chat-head">
           <b>🤖 AI-помощник воронки</b>
-          <button class="btn" onclick="toggleAiChat()">✕</button>
+          <span>
+            <button class="btn" onclick="clearAiChat()" title="Очистить историю чата">🗑</button>
+            <button class="btn" onclick="toggleAiChat()">✕</button>
+          </span>
         </div>
         <div id="ai-chat-msgs" class="ai-chat-msgs">
           <div class="aim assistant">Могу менять воронку и её вид на холсте:

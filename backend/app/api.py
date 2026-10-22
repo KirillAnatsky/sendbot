@@ -18,6 +18,7 @@ from .auth import (
 from .db import SessionLocal
 from .graph import GraphError, chain_ids, check_no_cycles, compile_graph
 from .models import (
+    AIChatMessage,
     AIRequest,
     Bot,
     Broadcast,
@@ -27,6 +28,7 @@ from .models import (
     Funnel,
     FunnelBot,
     FunnelRun,
+    FunnelVersion,
     Message,
     NodeVisit,
     ScheduledJob,
@@ -1579,6 +1581,76 @@ async def create_funnel(body: FunnelIn, user=Depends(current_user),
     return {"id": funnel.id}
 
 
+# ---------- версии воронки ----------
+
+VERSIONS_KEEP = 60
+
+
+async def _snapshot(session, f: Funnel, source: str, note: str = "",
+                    min_gap: timedelta | None = None) -> FunnelVersion | None:
+    """Сохранить текущее состояние воронки в историю (перед её изменением)."""
+    if not (f.graph_ui or {}).get("drawflow"):
+        return None
+    if min_gap is not None:
+        last = (await session.execute(
+            select(FunnelVersion.created_at).where(FunnelVersion.funnel_id == f.id)
+            .order_by(FunnelVersion.id.desc()).limit(1))).scalar()
+        if last and datetime.utcnow() - last < min_gap:
+            return None
+    v = FunnelVersion(funnel_id=f.id, name=f.name, trigger_type=f.trigger_type,
+                      trigger_value=f.trigger_value, graph_ui=f.graph_ui, graph=f.graph,
+                      source=source, note=(note or "")[:200])
+    session.add(v)
+    await session.flush()
+    old_ids = (await session.execute(
+        select(FunnelVersion.id).where(FunnelVersion.funnel_id == f.id)
+        .order_by(FunnelVersion.id.desc()).offset(VERSIONS_KEEP))).scalars().all()
+    if old_ids:
+        await session.execute(delete(FunnelVersion).where(FunnelVersion.id.in_(old_ids)))
+    return v
+
+
+def _media_total(graph: dict) -> int:
+    n = 0
+    for node in ((graph or {}).get("nodes") or {}).values():
+        if node.get("type") == "message":
+            d = node.get("data") or {}
+            n += len(d.get("media") or []) + (1 if d.get("photo_url") else 0)
+    return n
+
+
+@router.get("/funnels/{funnel_id}/versions", dependencies=[Depends(require("funnels", "view"))])
+async def list_versions(funnel_id: int, user=Depends(current_user), session=Depends(get_session)):
+    await _my_funnel(user, session, funnel_id)
+    rows = (await session.execute(
+        select(FunnelVersion).where(FunnelVersion.funnel_id == funnel_id)
+        .order_by(FunnelVersion.id.desc()))).scalars().all()
+    return [{
+        "id": v.id, "source": v.source, "note": v.note or "",
+        "created_at": v.created_at.isoformat() + "Z",
+        "blocks": len(((v.graph or {}).get("nodes") or {})) - 1,
+        "media": _media_total(v.graph),
+    } for v in rows]
+
+
+@router.post("/funnels/{funnel_id}/versions/{version_id}/restore",
+             dependencies=[Depends(require("funnels", "edit"))])
+async def restore_version(funnel_id: int, version_id: int, user=Depends(current_user),
+                          session=Depends(get_session)):
+    f = await _my_funnel(user, session, funnel_id)
+    v = await session.get(FunnelVersion, version_id)
+    if v is None or v.funnel_id != funnel_id:
+        raise HTTPException(404, "Версия не найдена")
+    # откат тоже правка: текущее состояние сохраняем, чтобы можно было вернуться
+    await _snapshot(session, f, "restore", note=f"до отката к версии от {v.created_at:%d.%m %H:%M}")
+    f.name, f.trigger_type, f.trigger_value = v.name, v.trigger_type, v.trigger_value
+    f.graph_ui, f.graph = v.graph_ui, v.graph
+    f.updated_at = datetime.utcnow()
+    await session.commit()
+    return {"id": f.id, "name": f.name, "trigger_type": f.trigger_type,
+            "trigger_value": f.trigger_value, "graph_ui": f.graph_ui}
+
+
 @router.get("/funnels/{funnel_id}", dependencies=[Depends(require("funnels", "view"))])
 async def get_funnel(funnel_id: int, user=Depends(current_user),
                      session=Depends(get_session)):
@@ -1616,6 +1688,9 @@ async def update_funnel(funnel_id: int, body: FunnelIn, user=Depends(current_use
         check_no_cycles(funnel_id, body.name, compiled, graphs.get)
     except GraphError as e:
         raise HTTPException(400, str(e))
+    # снимок прежнего состояния: автосохранение пишет часто, поэтому не
+    # чаще раза в 10 минут — этого хватает, чтобы откатиться на час назад
+    await _snapshot(session, f, "save", min_gap=timedelta(minutes=10))
     f.name = body.name
     f.trigger_type = body.trigger_type
     f.trigger_value = body.trigger_value
@@ -2273,16 +2348,55 @@ class AIEditIn(BaseModel):
     graph_ui: dict | None = None
 
 
+AI_CHAT_CONTEXT = 30   # сколько последних реплик видит модель
+
+
+def _chat_item(m: AIChatMessage) -> dict:
+    return {"id": m.id, "role": m.role, "content": m.content,
+            "images": [{"path": p} for p in (m.images or [])],
+            "version_id": m.version_id,
+            "created_at": m.created_at.isoformat() + "Z"}
+
+
+@router.get("/ai/chat/{funnel_id}", dependencies=[Depends(require("ai", "edit"))])
+async def ai_chat_history(funnel_id: int, user=Depends(current_user),
+                          session=Depends(get_session)):
+    await _my_funnel(user, session, funnel_id)
+    rows = (await session.execute(
+        select(AIChatMessage).where(AIChatMessage.funnel_id == funnel_id)
+        .order_by(AIChatMessage.id.desc()).limit(200))).scalars().all()
+    return [_chat_item(m) for m in reversed(rows)]
+
+
+@router.delete("/ai/chat/{funnel_id}", dependencies=[Depends(require("ai", "edit"))])
+async def ai_chat_clear(funnel_id: int, user=Depends(current_user),
+                        session=Depends(get_session)):
+    await _my_funnel(user, session, funnel_id)
+    await session.execute(delete(AIChatMessage).where(AIChatMessage.funnel_id == funnel_id))
+    await session.commit()
+    return {"ok": True}
+
+
 @router.post("/ai/edit", dependencies=[Depends(require("ai", "edit"))])
-async def ai_edit(body: AIEditIn, session=Depends(get_session)):
+async def ai_edit(body: AIEditIn, user=Depends(current_user), session=Depends(get_session)):
     s = await ai.get_ai_settings(session)
     if not s.get("api_key"):
         raise HTTPException(400, "Сначала укажите API-ключ в разделе «AI-сборка»")
-    funnel = await session.get(Funnel, body.funnel_id)
-    if funnel is None:
-        raise HTTPException(404, "Воронка не найдена")
+    funnel = await _my_funnel(user, session, body.funnel_id)
     if not body.messages:
         raise HTTPException(400, "Пустой запрос")
+    # История живёт в базе: переживает перезагрузку страницы и видна с
+    # любого устройства. С клиента берём только новую реплику.
+    new_msg = body.messages[-1] if isinstance(body.messages[-1], dict) else {}
+    user_text = str(new_msg.get("content") or "").strip() or "Сделай как на скриншоте"
+    prev = (await session.execute(
+        select(AIChatMessage).where(AIChatMessage.funnel_id == funnel.id)
+        .order_by(AIChatMessage.id.desc()).limit(AI_CHAT_CONTEXT - 1))).scalars().all()
+    history = [{"role": m.role, "content": m.content, "images": len(m.images or [])}
+               for m in reversed(prev)]
+    history.append({"role": "user", "content": user_text, "images": len(body.image_paths)})
+    session.add(AIChatMessage(funnel_id=funnel.id, role="user", content=user_text,
+                              images=list(body.image_paths) or None))
     provider = s.get("provider", "anthropic")
     model = s.get("model") or ai.DEFAULT_MODELS[provider]
     tags_list = (await session.execute(select(Tag))).scalars().all()
@@ -2299,22 +2413,36 @@ async def ai_edit(body: AIEditIn, session=Depends(get_session)):
             graph = None   # на холсте недоделанная воронка — берём сохранённую
     try:
         reply, fields, layout, tin, tout = await ai.chat_edit_funnel(
-            session, funnel, tags_list, body.messages, provider, s["api_key"], model,
+            session, funnel, tags_list, history, provider, s["api_key"], model,
             images=images, graph=graph,
         )
         req.input_tokens, req.output_tokens = tin, tout
         req.funnel_id = funnel.id
     except ai.AIError as e:
         req.status, req.error = "error", str(e)
+        session.add(AIChatMessage(funnel_id=funnel.id, role="assistant", content="⚠️ " + str(e)))
         await session.commit()
         raise HTTPException(400, str(e))
     except Exception as e:  # noqa: BLE001
         req.status, req.error = "error", str(e)
+        session.add(AIChatMessage(funnel_id=funnel.id, role="assistant",
+                                  content=f"⚠️ Ошибка AI: {e}"))
         await session.commit()
         raise HTTPException(500, f"Ошибка AI: {e}")
 
     updated = False
+    version = None
     if fields:
+        # Правка AI перезаписывает воронку целиком — сначала снимок того, что
+        # было на холсте (с несохранёнными правками), чтобы откат вернул всё
+        if graph is not None and body.graph_ui:
+            from types import SimpleNamespace
+            cur = SimpleNamespace(id=funnel.id, name=funnel.name, trigger_type=funnel.trigger_type,
+                                  trigger_value=funnel.trigger_value,
+                                  graph_ui=body.graph_ui, graph=graph)
+        else:
+            cur = funnel
+        version = await _snapshot(session, cur, "ai", note=user_text)
         funnel.name = fields["name"]
         funnel.trigger_type = fields["trigger_type"]
         funnel.trigger_value = fields["trigger_value"]
@@ -2322,10 +2450,15 @@ async def ai_edit(body: AIEditIn, session=Depends(get_session)):
         funnel.graph = fields["graph"]
         funnel.updated_at = datetime.utcnow()
         updated = True
+    answer = AIChatMessage(funnel_id=funnel.id, role="assistant", content=reply,
+                           version_id=version.id if version else None)
+    session.add(answer)
     # фиксируем сразу и отдаём готовый граф — редактор рисует его без второго запроса
     await session.commit()
     return {
         "reply": reply,
+        "message": _chat_item(answer),
+        "version_id": version.id if version else None,
         "updated": updated,
         "layout": layout,
         "tokens": req.input_tokens + req.output_tokens,
