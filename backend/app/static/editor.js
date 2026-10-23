@@ -17,6 +17,13 @@ const NODE_META = {
 
 const MEDIA_ICON = { video: '🎬', audio: '🎵', voice: '🎤', video_note: '⭕️', document: '📎' };
 
+// Превью картинки из media/ (сервер уменьшает и кэширует); внешние ссылки — как есть
+function thumbUrl(path, w) {
+  path = String(path || '');
+  if (/^https?:\/\//.test(path)) return path;
+  return `/thumb/${w}/` + path.replace(/^\/+/, '').replace(/^media\//, '');
+}
+
 function nodeHtml(type, data) {
   data = data || {};
   // «Сообщение» рендерим как превью реального сообщения: вложения + текст + кнопки
@@ -29,10 +36,12 @@ function nodeHtml(type, data) {
       const grid = media.length === 1 ? 'one' : (media.length === 2 ? 'two' : 'many');
       mediaHtml = `<div class="df-media ${grid}">` + media.slice(0, 6).map(m => {
         if (m.type === 'photo') {
-          const src = m.path.startsWith('http') ? m.path : '/' + m.path;
+          // на плитке — уменьшенная копия и только когда плитка на экране:
+          // оригиналы большой воронки весят сотни мегабайт
+          const src = thumbUrl(m.path, media.length === 1 ? 480 : 240);
           // draggable=false — иначе браузер начинает своё перетаскивание
           // картинки, и блок остаётся на месте
-          return `<img class="df-media-thumb" draggable="false" src="${esc(src)}" alt="">`;
+          return `<img class="df-media-thumb" draggable="false" loading="lazy" decoding="async" src="${esc(src)}" alt="">`;
         }
         return `<span class="df-media-thumb icon" title="${esc(m.type)}">${MEDIA_ICON[m.type] || '📎'}</span>`;
       }).join('') + (media.length > 6 ? `<span class="df-media-more">+${media.length - 6}</span>` : '') + `</div>`;
@@ -100,7 +109,7 @@ function toggleNodeExpand(ev, el) {
   el.textContent = expanded ? 'свернуть ▴' : 'развернуть ▾';
   // перерисовать линии связей и порты под новый размер карточки
   if (editor) editor.updateConnectionNodes(nodeEl.id);
-  decoratePorts();
+  decoratePorts([nodeEl.id.replace('node-', '')]);
 }
 
 // Список тегов для селекта плюс пункт «создать». Создавать тег, не выходя
@@ -741,7 +750,10 @@ function setupPaletteDnD() {
   });
 }
 
-function refreshNodeHtml(id) {
+// batch — перерисовка многих карточек подряд (redrawAllNodes): общую работу
+// (бейджи, номера шагов, порты) тогда делаем один раз в конце, а не на
+// каждой карточке.
+function refreshNodeHtml(id, batch) {
   const node = editor.getNodeFromId(id);
   const html = nodeHtml(node.name, node.data);
   const el = document.querySelector(`#node-${id} .drawflow_content_node`);
@@ -751,12 +763,12 @@ function refreshNodeHtml(id) {
   // текст новый, а после перезагрузки — снова прежний.
   const stored = editor.drawflow.drawflow.Home.data[id];
   if (stored) stored.html = html;
+  if (batch) return;
   // вернуть бейджи статистики и номер шага после перерисовки
   if (typeof applyStatsBadges === 'function') applyStatsBadges();
   refreshStepNumbers();
-  decoratePorts();
-  // связи могли сместиться из-за изменившейся высоты карточки
-  try { editor.updateConnectionNodes('node-' + id); } catch (e) {}
+  // порты и связи только этого блока: соседние карточки он не двигает
+  decoratePorts([String(id)]);
   syncQuickActions();   // кнопки под блоком — под новой высотой
 }
 
@@ -764,10 +776,21 @@ function refreshNodeHtml(id) {
 // У «Сообщения» порт каждой кнопки встаёт напротив её строки и подписан её
 // номером; порт «далее» — со стрелкой напротив строки «1: далее».
 // У «Условия» порты подписаны ✓ (да) и ✕ (нет).
-function decoratePorts() {
+// ids — только эти узлы (после правки одного блока); без ids — все.
+//
+// Работает в три прохода: подписи → замеры → расстановка. Раньше замеры
+// и записи стилей шли вперемешку по каждому порту, и браузер пересчитывал
+// раскладку всего холста на каждом порту. Плюс функцию звали для каждого
+// узла при открытии воронки — на 240 блоках открытие занимало ~50 секунд.
+function decoratePorts(ids) {
   if (!editor) return;
-  const data = editor.export().drawflow.Home.data;
-  Object.values(data).forEach(n => {
+  const data = editor.drawflow.drawflow.Home.data;
+  const list = ids ? ids.map(id => data[id]).filter(Boolean) : Object.values(data);
+  const zoom = editor.zoom || 1;
+  const jobs = [];
+
+  // 1) подписи и классы — без чтения раскладки
+  list.forEach(n => {
     const nodeEl = document.getElementById('node-' + n.id);
     if (!nodeEl) return;
     const outs = nodeEl.querySelectorAll('.outputs .output');
@@ -782,11 +805,9 @@ function decoratePorts() {
     }
     if (n.name !== 'message' && n.name !== 'language') return;
 
-    const zoom = editor.zoom || 1;
-    const nodeRect = nodeEl.getBoundingClientRect();
     const nextLine = nodeEl.querySelector('.df-ports');
     const btnRows = nodeEl.querySelectorAll('.df-btn');
-
+    const pairs = [];
     outs.forEach((out, idx) => {
       // idx 0 = «далее», idx 1..N = кнопки по порядку
       const target = idx === 0 ? nextLine : btnRows[idx - 1];
@@ -800,8 +821,8 @@ function decoratePorts() {
       } else {
         out.textContent = String(idx + 1);
         out.classList.add('port-btn');
-        const label = btnRows[idx - 1] ? btnRows[idx - 1].textContent.replace(/^\d+/, '').trim() : '';
         const row = btnRows[idx - 1];
+        const label = row ? row.textContent.replace(/^\d+/, '').trim() : '';
         out.classList.remove('port-noact');
         if (row && row.classList.contains('df-noact')) {
           out.title = 'нет реакции: человек ничего не нажал и не написал за это время';
@@ -812,15 +833,30 @@ function decoratePorts() {
           out.title = (n.name === 'language' ? 'язык «' : 'кнопка «') + label + '»';
         }
       }
-      if (target) {
-        const r = target.getBoundingClientRect();
-        const top = (r.top + r.height / 2 - nodeRect.top) / zoom - out.offsetHeight / 2;
-        out.style.position = 'absolute';
-        out.style.top = top + 'px';
-        out.style.right = '-9px';
-      }
+      if (target) pairs.push({ out, target });
     });
-    try { editor.updateConnectionNodes('node-' + n.id); } catch (e) {}
+    jobs.push({ id: n.id, nodeEl, pairs });
+  });
+
+  // 2) замеры — один пересчёт раскладки на всех
+  jobs.forEach(j => {
+    const nodeTop = j.nodeEl.getBoundingClientRect().top;
+    j.pairs.forEach(pr => {
+      const r = pr.target.getBoundingClientRect();
+      pr.top = (r.top + r.height / 2 - nodeTop) / zoom - pr.out.offsetHeight / 2;
+    });
+  });
+
+  // 3) расстановка и перерисовка линий
+  jobs.forEach(j => {
+    j.pairs.forEach(pr => {
+      pr.out.style.position = 'absolute';
+      pr.out.style.top = pr.top + 'px';
+      pr.out.style.right = '-9px';
+    });
+  });
+  jobs.forEach(j => {
+    try { editor.updateConnectionNodes('node-' + j.id); } catch (e) {}
   });
 }
 
@@ -830,8 +866,12 @@ function decoratePorts() {
 function redrawAllNodes() {
   const df = editor.drawflow.drawflow.Home.data;
   Object.keys(df).forEach(id => {
-    try { refreshNodeHtml(id); } catch (e) { /* узел мог исчезнуть */ }
+    try { refreshNodeHtml(id, true); } catch (e) { /* узел мог исчезнуть */ }
   });
+  if (typeof applyStatsBadges === 'function') applyStatsBadges();
+  refreshStepNumbers();
+  decoratePorts();
+  syncQuickActions();
 }
 
 // ---------- панель свойств ----------
@@ -1049,7 +1089,7 @@ const MEDIA_TYPES = [
 
 function mediaThumb(m) {
   const src = m.path.startsWith('http') ? m.path : '/' + m.path;
-  if (m.type === 'photo') return `<img class="media-thumb" src="${esc(src)}" alt="">`;
+  if (m.type === 'photo') return `<img class="media-thumb" loading="lazy" src="${esc(thumbUrl(m.path, 240))}" alt="">`;
   const icon = { video: '🎬', audio: '🎵', voice: '🎤', video_note: '⭕️', document: '📎' }[m.type] || '📎';
   return `<div class="media-thumb icon">${icon}</div>`;
 }
@@ -1401,6 +1441,25 @@ async function toggleAiChat() {
   }
 }
 
+// Ответ AI, появившийся в истории после lastSeenId (до 20 минут ожидания)
+async function waitAiAnswer(fid, lastSeenId) {
+  const started = Date.now();
+  while (Date.now() - started < 20 * 60 * 1000) {
+    await new Promise(r => setTimeout(r, 5000));
+    try {
+      const r = await fetch('/api/ai/chat/' + fid, { headers: { 'Authorization': 'Bearer ' + TOKEN } });
+      if (!r.ok) continue;
+      const history = await r.json();
+      const fresh = history.filter(m => (m.id || 0) > lastSeenId);
+      const answer = fresh.find(m => m.role === 'assistant');
+      if (answer) return { history, answer };
+      // запрос до сервера так и не дошёл — ждать нечего
+      if (!fresh.length && Date.now() - started > 30000) return null;
+    } catch (e) { /* связи всё ещё нет — пробуем дальше */ }
+  }
+  return null;
+}
+
 async function clearAiChat() {
   if (!confirm('Очистить историю чата с AI для этой воронки? Сама воронка и её версии не пострадают.')) return;
   await api('/ai/chat/' + currentFunnelId, { method: 'DELETE' });
@@ -1434,7 +1493,7 @@ async function toggleVersions() {
   panel.innerHTML = `<div class="ai-chat-head"><b>🕘 История версий</b>
     <button class="btn" onclick="toggleVersions()">✕</button></div>
     <div class="versions-hint">Снимок делается перед каждой правкой AI, перед откатом и при сохранении
-    (не чаще раза в 10 минут). Хранятся последние 60.</div>
+    (не чаще раза в 10 минут). Хранятся последние 40.</div>
     <div id="versions-list" class="versions-list">загрузка…</div>`;
   document.getElementById('page-editor').appendChild(panel);
   try {
@@ -1540,6 +1599,7 @@ async function aiChatSend() {
   const fid = currentFunnelId;
   await loadAiChat(fid);
   const hist = AI_CHAT_HISTORY[fid];
+  const lastSeenId = Math.max(0, ...hist.map(m => m.id || 0));
   hist.push({ role: 'user', content: text, images: shots });
   renderAiChat();
   const box = document.getElementById('ai-chat-msgs');
@@ -1573,6 +1633,25 @@ async function aiChatSend() {
       arrangeFunnel(r.layout);
     }
   } catch (e) {
+    // «Failed to fetch» — оборвалась связь, а не упал запрос: сервер
+    // доделывает правку и пишет ответ в историю. Ждём его там, а не
+    // показываем ошибку (иначе человек жмёт ещё раз и правка идёт дважды)
+    if (e instanceof TypeError || /fetch|network|load failed/i.test(e.message || '')) {
+      const box2 = document.getElementById('ai-chat-msgs');
+      box2.insertAdjacentHTML('beforeend',
+        '<div class="aim assistant typing">связь прервалась — сервер продолжает работу, жду ответ…</div>');
+      const got = await waitAiAnswer(fid, lastSeenId);
+      if (got) {
+        AI_CHAT_HISTORY[fid] = got.history;
+        renderAiChat();
+        if (got.answer.version_id && fid === currentFunnelId) {
+          applyFunnelToCanvas(await api('/funnels/' + fid));
+          setTimeout(() => { EDITOR_SNAPSHOT = editorStateJson(); }, 120);
+          flashStatus('Воронка обновлена ✅');
+        }
+        return;
+      }
+    }
     // картинки не пропадают: можно поправить запрос и отправить снова
     if (!AI_CHAT_SHOTS.length) AI_CHAT_SHOTS = shots;
     hist.push({ role: 'assistant', content: '⚠️ ' + (e.message || 'ошибка') });
@@ -1790,6 +1869,14 @@ function arrangeFunnel(opts) {
   Object.keys(df).forEach(id => {
     try { editor.updateConnectionNodes('node-' + id); } catch (e) {}
   });
+  // Запоминаем выбранную раскладку в «Старте» (уходит в базу с воронкой):
+  // по ней AI-помощник понимает, как плитки стоят на холсте, и после его
+  // правки с новыми блоками воронка раскладывается так же, а не по-своему
+  const stored = startId && editor.drawflow.drawflow.Home.data[startId];
+  if (stored) {
+    stored.data = { ...(stored.data || {}),
+                    layout: { direction, spacing: LAYOUT_SPACING[opts.spacing] ? opts.spacing : 'normal' } };
+  }
   decoratePorts();
   refreshStepNumbers();
   if (typeof syncQuickActions === 'function') syncQuickActions();

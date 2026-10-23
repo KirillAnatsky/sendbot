@@ -1583,7 +1583,7 @@ async def create_funnel(body: FunnelIn, user=Depends(current_user),
 
 # ---------- версии воронки ----------
 
-VERSIONS_KEEP = 60
+VERSIONS_KEEP = 40
 
 
 async def _snapshot(session, f: Funnel, source: str, note: str = "",
@@ -1597,8 +1597,14 @@ async def _snapshot(session, f: Funnel, source: str, note: str = "",
             .order_by(FunnelVersion.id.desc()).limit(1))).scalar()
         if last and datetime.utcnow() - last < min_gap:
             return None
+    # разметку карточек не храним: редактор перерисовывает их из данных при
+    # открытии, а это больше половины веса воронки — история раздувала бы базу
+    ui = json.loads(json.dumps(f.graph_ui or {}))
+    for n in ((ui.get("drawflow") or {}).get("Home") or {}).get("data", {}).values():
+        if isinstance(n, dict):
+            n["html"] = ""
     v = FunnelVersion(funnel_id=f.id, name=f.name, trigger_type=f.trigger_type,
-                      trigger_value=f.trigger_value, graph_ui=f.graph_ui, graph=f.graph,
+                      trigger_value=f.trigger_value, graph_ui=ui, graph=f.graph,
                       source=source, note=(note or "")[:200])
     session.add(v)
     await session.flush()
@@ -2414,7 +2420,7 @@ async def ai_edit(body: AIEditIn, user=Depends(current_user), session=Depends(ge
     try:
         reply, fields, layout, tin, tout = await ai.chat_edit_funnel(
             session, funnel, tags_list, history, provider, s["api_key"], model,
-            images=images, graph=graph,
+            images=images, graph=graph, graph_ui=body.graph_ui if graph is not None else None,
         )
         req.input_tokens, req.output_tokens = tin, tout
         req.funnel_id = funnel.id
@@ -2443,6 +2449,10 @@ async def ai_edit(body: AIEditIn, user=Depends(current_user), session=Depends(ge
         else:
             cur = funnel
         version = await _snapshot(session, cur, "ai", note=user_text)
+        # появились новые блоки — раскладываем заново тем способом, что
+        # пользователь выбрал в «Разложить» (иначе плитки остаются на местах)
+        if fields.pop("relayout", False) and not layout:
+            layout = ai.canvas_layout_pref(fields["graph_ui"])
         funnel.name = fields["name"]
         funnel.trigger_type = fields["trigger_type"]
         funnel.trigger_value = fields["trigger_value"]

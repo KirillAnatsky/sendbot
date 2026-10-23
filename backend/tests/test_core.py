@@ -3210,3 +3210,131 @@ async def test_ai_edit_question_changes_nothing(session, monkeypatch):
     reply, fields, *_ = await ai.chat_edit_funnel(
         session, f, [], [{"role": "user", "content": "что тут?"}], "anthropic", "k", "m")
     assert fields is None and reply == "Тут один шаг"
+
+
+# ---------- AI-чат после «Разложить»: видит холст, не сбивает раскладку ----------
+
+def _arranged_gui(direction="horizontal"):
+    """start -> 2 (Шаг 1) -> 3 (Шаг 2); плитки стоят строкой, как после «Разложить»."""
+    return {"drawflow": {"Home": {"data": {
+        "1": {"id": 1, "name": "start", "data": {"layout": {"direction": direction, "spacing": "wide"}},
+              "inputs": {}, "pos_x": 60, "pos_y": 60,
+              "outputs": {"output_1": {"connections": [{"node": "2", "output": "input_1"}]}}},
+        "2": {"id": 2, "name": "message", "data": {"text": "Первое", "ports_v": 2},
+              "pos_x": 900, "pos_y": 60,
+              "inputs": {"input_1": {"connections": [{"node": "1", "input": "output_1"}]}},
+              "outputs": {"output_1": {"connections": [{"node": "3", "output": "input_1"}]}}},
+        "3": {"id": 3, "name": "message", "data": {"text": "Второе", "ports_v": 2},
+              "pos_x": 1700, "pos_y": 60,
+              "inputs": {"input_1": {"connections": [{"node": "2", "input": "output_1"}]}},
+              "outputs": {"output_1": {"connections": []}}},
+    }}}}
+
+
+async def _arranged_funnel(session):
+    from app.graph import compile_graph
+    from app.models import Funnel
+
+    gui = _arranged_gui()
+    f = Funnel(name="F", trigger_type="start", graph_ui=gui, graph=compile_graph(_arranged_gui()))
+    session.add(f)
+    await session.commit()
+    return f
+
+
+async def test_ai_sees_step_numbers_and_canvas(session, monkeypatch):
+    import json
+
+    from app import ai
+
+    f = await _arranged_funnel(session)
+    seen = []
+
+    async def fake_llm(provider, key, model, system, text, images=None):
+        seen.append(text)
+        return json.dumps({"reply": "ок", "ops": None}), 1, 1
+
+    monkeypatch.setattr(ai, "call_llm_system", fake_llm)
+    await ai.chat_edit_funnel(session, f, [], [{"role": "user", "content": "что в шаге 2?"}],
+                              "anthropic", "k", "m")
+    spec = json.loads(seen[0].split("ТЕКУЩАЯ ВОРОНКА:\n", 1)[1].split("\n\nХОЛСТ", 1)[0])
+    n3 = next(n for n in spec["nodes"] if n["id"] == "3")
+    assert n3["step"] == 2 and n3["pos"] == [1700, 60]
+    assert "СТРОКАМИ" in seen[0]
+
+
+async def test_ai_patch_keeps_arranged_positions(session, monkeypatch):
+    import json
+
+    from app import ai, api
+
+    f = await _arranged_funnel(session)
+    replies = [{"reply": "Поправил", "more": False, "ops": [
+        {"op": "patch", "id": "3", "fields": {"text": "Второе!"}}]}]
+
+    async def fake_llm(*a, **kw):
+        return json.dumps(replies.pop(0), ensure_ascii=False), 1, 1
+
+    async def fake_settings(_s):
+        return {"api_key": "k", "provider": "anthropic", "model": "m"}
+
+    monkeypatch.setattr(ai, "call_llm_system", fake_llm)
+    monkeypatch.setattr(ai, "get_ai_settings", fake_settings)
+    r = await api.ai_edit(api.AIEditIn(funnel_id=f.id, messages=[
+        {"role": "user", "content": "поправь шаг 2"}], graph_ui=_arranged_gui()),
+        user=_user("owner"), session=session)
+    assert r["layout"] is None                       # раскладывать заново не нужно
+    data = r["funnel"]["graph_ui"]["drawflow"]["Home"]["data"]
+    assert (data["2"]["pos_x"], data["3"]["pos_x"]) == (900, 1700)
+    start = next(n for n in data.values() if n["name"] == "start")
+    assert start["data"]["layout"]["direction"] == "horizontal"
+    assert data["3"]["data"]["text"] == "Второе!"
+
+
+async def test_ai_new_blocks_relayout_like_user_chose(session, monkeypatch):
+    import json
+
+    from app import ai, api
+
+    f = await _arranged_funnel(session)
+    replies = [{"reply": "Добавил", "more": False, "ops": [
+        {"op": "set", "node": {"id": "n1", "type": "message", "text": "Третье", "next": None}},
+        {"op": "patch", "id": "3", "fields": {"next": "n1"}}]}]
+
+    async def fake_llm(*a, **kw):
+        return json.dumps(replies.pop(0), ensure_ascii=False), 1, 1
+
+    async def fake_settings(_s):
+        return {"api_key": "k", "provider": "anthropic", "model": "m"}
+
+    monkeypatch.setattr(ai, "call_llm_system", fake_llm)
+    monkeypatch.setattr(ai, "get_ai_settings", fake_settings)
+    r = await api.ai_edit(api.AIEditIn(funnel_id=f.id, messages=[
+        {"role": "user", "content": "добавь шаг в конец"}], graph_ui=_arranged_gui()),
+        user=_user("owner"), session=session)
+    assert r["layout"] == {"direction": "horizontal", "spacing": "wide"}
+
+
+# ---------- превью картинок для холста ----------
+
+async def test_thumbs_are_small_cached_and_safe(tmp_path, monkeypatch):
+    from PIL import Image
+
+    from app import thumbs
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "media_dir", str(tmp_path))
+    Image.new("RGB", (2000, 1500), (200, 10, 10)).save(tmp_path / "big.png")
+    (tmp_path / "anim.gif").write_bytes(b"GIF89a")
+    (tmp_path.parent / "secret.txt").write_text("x")
+
+    r = await thumbs.thumb(500, "big.png")
+    assert r.media_type == "image/jpeg"
+    with Image.open(r.path) as im:
+        assert im.size == (480, 360)               # ближайший размер из SIZES
+    assert ".thumbs" in str(r.path)
+    again = await thumbs.thumb(480, "media/big.png")
+    assert str(again.path) == str(r.path)          # второй раз — из кэша
+    assert str((await thumbs.thumb(240, "anim.gif")).path).endswith("anim.gif")   # как есть
+    assert (await thumbs.thumb(240, "../secret.txt")).status_code == 404
+    assert (await thumbs.thumb(240, "nope.png")).status_code == 404

@@ -1056,6 +1056,12 @@ EDIT_SYSTEM_PROMPT = """Ты — AI-помощник внутри редакто
 СКРИНШОТЫ
 Используй как образец. Чего не видно — не выдумывай, скажи в reply.
 
+ЧТО ВИДИТ ПОЛЬЗОВАТЕЛЬ
+- "step": N у сообщения — это номер «Шаг N» на плитке. Когда пользователь говорит «шаг 7», ищи узел со step 7.
+- "pos": [x, y] — где плитка стоит на холсте (x — слева направо, y — сверху вниз). По нему понимай «верхний», «справа», «последний в строке», сопоставляй со скриншотом холста. Строка ХОЛСТ говорит, как пользователь разложил плитки.
+- step и pos только для ориентира: в операциях их не присылай, раскладку сервер сохранит сам.
+- id блоков, упомянутые в прошлых репликах, могли смениться (новые блоки после применения получают числовые номера) — опирайся на id из текущего JSON.
+
 ФОРМАТ УЗЛОВ (как во входных данных)
 message (text, media, buttons [{label, url?, next?, style?, icon_custom_emoji_id?}], text_first, no_action {amount, unit, next}, next), delay (amount, unit seconds|minutes|hours|days, next), condition (tag, yes, no), action (op: add_tag|remove_tag|unsubscribe|check_subscription|delete_message, tag, channel, target, next / yes, no), filter (match, conditions, yes, no), chain (chain — название существующей цепочки, next), language (languages [{code, next}], other), note (text, about). next: null — конец ветки.
 - tag — ИМЯ тега (латинский slug); несуществующие создадутся сами.
@@ -1063,6 +1069,60 @@ message (text, media, buttons [{label, url?, next?, style?, icon_custom_emoji_id
 - Тексты, которые не просили менять, — не трогай.
 - МУЛЬТИЯЗЫЧНОСТЬ: язык определяется автоматически узлом language по профилю Telegram (юзера не спрашиваем); "other" — в ветку английского (или основного) языка. Кнопочный выбор языка — только если просят явно.
 """
+
+def _ui_nodes(graph_ui: dict | None) -> dict:
+    try:
+        return {str(k): v for k, v in graph_ui["drawflow"]["Home"]["data"].items()}
+    except (KeyError, TypeError, AttributeError):
+        return {}
+
+
+def _canvas_layout(ui_nodes: dict) -> str:
+    """Как пользователь разложил плитки — одной фразой для модели."""
+    start = next((n for n in ui_nodes.values() if n.get("name") == "start"), None)
+    lay = ((start or {}).get("data") or {}).get("layout") or {}
+    if lay.get("direction") == "horizontal":
+        return ("разложено СТРОКАМИ: шаги идут слева направо (pos[0] растёт), "
+                "ветки — строками друг под другом (pos[1]).")
+    if lay.get("direction") == "vertical":
+        return ("разложено СТОЛБЦАМИ: шаги идут сверху вниз (pos[1] растёт), "
+                "ветки — столбцами рядом (pos[0]).")
+    return ""
+
+
+def keep_positions(new_ui: dict, old_ui_nodes: dict) -> bool:
+    """После правки AI оставить плитки там, где их разложил пользователь.
+
+    Блоки сохраняют свои номера, поэтому позицию переносим по id. Если
+    появились новые блоки, им места нет — тогда раскладываем всё заново
+    (тем способом, что выбран в «Разложить»). -> нужна ли новая раскладка.
+    Выбранная раскладка живёт в данных «Старта» и переезжает туда же.
+    """
+    data = _ui_nodes(new_ui)
+    old_start = next((n for n in old_ui_nodes.values() if n.get("name") == "start"), None)
+    new_start = next((n for n in data.values() if n.get("name") == "start"), None)
+    if old_start and new_start:
+        lay = (old_start.get("data") or {}).get("layout")
+        if lay:
+            new_start.setdefault("data", {})["layout"] = lay
+    if not old_ui_nodes:
+        return False
+    fresh = [nid for nid, n in data.items()
+             if n.get("name") != "start" and nid not in old_ui_nodes]
+    if fresh:
+        return True
+    for nid, n in data.items():
+        old = old_start if n.get("name") == "start" else old_ui_nodes.get(nid)
+        if old is not None:
+            n["pos_x"], n["pos_y"] = old.get("pos_x", n["pos_x"]), old.get("pos_y", n["pos_y"])
+    return False
+
+
+def canvas_layout_pref(graph_ui: dict | None) -> dict | None:
+    start = next((n for n in _ui_nodes(graph_ui).values() if n.get("name") == "start"), None)
+    lay = ((start or {}).get("data") or {}).get("layout")
+    return clean_layout(lay) if lay else None
+
 
 # сколько порций может уйти на одну просьбу (перевод большой воронки на
 # несколько языков — это 5–8 порций)
@@ -1086,7 +1146,8 @@ def clean_layout(raw) -> dict | None:
 
 
 async def chat_edit_funnel(session, funnel, tags_list, user_messages: list, provider, api_key, model,
-                           images: list | None = None, graph: dict | None = None):
+                           images: list | None = None, graph: dict | None = None,
+                           graph_ui: dict | None = None):
     """-> (reply_text, new_fields | None, layout | None, in_tokens, out_tokens)
 
     images — скриншоты к последнему сообщению; graph — скомпилированный граф
@@ -1118,6 +1179,23 @@ async def chat_edit_funnel(session, funnel, tags_list, user_messages: list, prov
         if n.get("type") == "chain":
             n["chain"] = chain_names.get(str(n.pop("chain_id", "")), "")
 
+    # Что пользователь видит на холсте: номер шага на плитке и где плитка
+    # стоит. Без этого «шаг 7», «верхний ряд», «блок справа» и скриншот холста
+    # модели не с чем сопоставить — особенно после «Разложить», когда плитки
+    # стоят уже не в порядке обхода воронки.
+    from .exports import step_numbers
+
+    ui_nodes = _ui_nodes(graph_ui if graph else funnel.graph_ui)
+    steps = step_numbers(src.graph or {})
+    for n in spec["nodes"]:
+        nid = str(n.get("id"))
+        if nid in steps:
+            n["step"] = steps[nid]
+        u = ui_nodes.get(nid)
+        if u is not None:
+            n["pos"] = [round(float(u.get("pos_x") or 0)), round(float(u.get("pos_y") or 0))]
+    view = _canvas_layout(ui_nodes)
+
     dialog = ""
     for m in user_messages[-30:]:
         role = "Пользователь" if m.get("role") == "user" else "Ассистент"
@@ -1140,6 +1218,7 @@ async def chat_edit_funnel(session, funnel, tags_list, user_messages: list, prov
     retries = 0
     for _round in range(EDIT_MAX_ROUNDS):
         prompt = ("ТЕКУЩАЯ ВОРОНКА:\n" + _json.dumps(work, ensure_ascii=False)
+                  + (f"\n\nХОЛСТ: {view}" if view else "")
                   + "\n\nДИАЛОГ:\n" + dialog + note)
         try:
             text, a, b = await call_llm_system(provider, api_key, model, EDIT_SYSTEM_PROMPT, prompt,
@@ -1219,6 +1298,7 @@ async def chat_edit_funnel(session, funnel, tags_list, user_messages: list, prov
         if not new_spec.get("trigger_type"):
             fields["trigger_type"] = funnel.trigger_type
             fields["trigger_value"] = funnel.trigger_value
+        fields["relayout"] = keep_positions(fields["graph_ui"], ui_nodes)
     elif total["errors"]:
         reply += "\n\n⚠️ Изменения не применились: " + "; ".join(dict.fromkeys(total["errors"]))
     return reply, fields, layout, tin, tout

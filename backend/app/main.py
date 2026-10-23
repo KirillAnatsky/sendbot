@@ -53,6 +53,10 @@ from .links import router as links_router  # noqa: E402
 
 app.include_router(links_router)
 
+from .thumbs import router as thumbs_router  # noqa: E402
+
+app.include_router(thumbs_router)
+
 static_dir = Path(__file__).parent / "static"
 app.mount("/admin", NoCacheStatic(directory=static_dir, html=True), name="admin")
 

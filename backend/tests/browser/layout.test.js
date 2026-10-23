@@ -297,5 +297,15 @@ check('строками: заметка висит под своим блоко�
   eq(p['7'].y > p['2'].y, true, 'и под ним:');
 });
 
+// выбранная раскладка запоминается в «Старте» — по ней AI-помощник знает,
+// как стоят плитки, и после правки раскладывает новые блоки так же
+check('раскладка запоминается в данных «Старта»', () => {
+  const d = langFunnel(2, 3);
+  ctx.__api.arrangeFunnel({ direction: 'horizontal', spacing: 'wide' });
+  eq(JSON.stringify(d['1'].data.layout), JSON.stringify({ direction: 'horizontal', spacing: 'wide' }), 'строками:');
+  ctx.__api.arrangeFunnel({ direction: 'vertical' });
+  eq(d['1'].data.layout.direction, 'vertical', 'столбцами:');
+});
+
 console.log(failed ? `\n${failed} проверок упало` : '\nвсе проверки прошли');
 process.exit(failed ? 1 : 0);

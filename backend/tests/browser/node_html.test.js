@@ -91,7 +91,7 @@ check('export() отдаёт уже новую разметку — именно
 check('картинка в карточке тоже обновляется', () => {
   A.refreshNodeHtml('3');
   const stored = ed().drawflow.drawflow.Home.data[3].html;
-  has(stored, 'media/new.png');
+  has(stored, '/thumb/480/new.png');   // на холсте — уменьшенная копия
   hasNot(stored, 'media/old.png');
 });
 
@@ -100,7 +100,7 @@ check('redrawAllNodes чинит воронку, где старая разме�
   A.redrawAllNodes();
   const d = ed().drawflow.drawflow.Home.data;
   has(d[2].html, 'НОВЫЙ текст');
-  has(d[3].html, 'media/new.png');
+  has(d[3].html, '/thumb/480/new.png');
   hasNot(d[2].html, 'СТАРЫЙ');
   hasNot(d[3].html, 'old.png');
 });
