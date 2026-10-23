@@ -186,6 +186,12 @@ async def save_ai_settings(session: AsyncSession, data: dict):
 
 # ---------- вызов LLM ----------
 
+def _truncated(tin: int, tout: int) -> "AIError":
+    e = AIError("Ответ модели оборвался по длине")
+    e.truncated, e.tin, e.tout = True, tin, tout
+    return e
+
+
 class AIError(Exception):
     pass
 
@@ -1000,51 +1006,67 @@ def graph_to_spec(funnel) -> dict:
 EDIT_SYSTEM_PROMPT = """Ты — AI-помощник внутри редактора воронки телеграм-бота. Тебе дают ТЕКУЩУЮ воронку в JSON, диалог с пользователем и иногда скриншоты.
 
 Что ты умеешь:
-1. Менять содержимое: переводить на другие языки, править и сокращать тексты, добавлять, убирать и переставлять шаги, кнопки, задержки, условия, теги, дожимы.
-2. Менять РАСПОЛОЖЕНИЕ блоков на холсте — «разложи удобно», «слишком близко», «куча перепутанных связей», «сделай как на скрине», «в строку», «столбиками». Это не правка воронки: тексты и связи не трогаются, двигаются только карточки.
-3. Отвечать на вопросы о воронке: что где происходит, куда ведёт кнопка, сколько шагов в ветке.
+1. Менять содержимое: переводить на другие языки, переносить ветку одного языка на другие, править тексты, добавлять, убирать и переставлять шаги, кнопки, задержки, условия, теги, дожимы.
+2. Менять РАСПОЛОЖЕНИЕ блоков на холсте — «разложи удобно», «связи путаются», «сделай как на скрине», «в строку», «столбиками».
+3. Отвечать на вопросы о воронке.
 
 Отвечай ТОЛЬКО JSON без markdown-ограждений:
-{"reply": "короткий ответ пользователю по-русски: что сделал или что уточнить",
- "spec": null | {"name": ..., "trigger_type": ..., "trigger_value": ..., "nodes": [...]},
+{"reply": "короткий ответ пользователю по-русски",
+ "ops": null | [операции, см. ниже],
+ "more": false | true,
  "layout": null | {"direction": "vertical" | "horizontal", "spacing": "compact" | "normal" | "wide"}}
 
+ПРАВКА ВОРОНКИ = ОПЕРАЦИИ (ops)
+Всю воронку заново НЕ возвращай. Присылай только операции — сервер применит их к текущей воронке, всё остальное останется как было (тексты, картинки, связи, оформление).
+  {"op": "patch", "id": "12", "fields": {"text": "новый текст", "buttons": [{"label": "Новая подпись"}]}}
+      — поменять поля узла. buttons сливаются ПО ПОРЯДКУ: можно прислать только label — переход, ссылка, стиль и иконка кнопки сохранятся. media, next и прочее не трогаются, если их не прислать.
+  {"op": "set", "node": {полный узел в формате входных данных}}
+      — новый узел (id вида "n1", "n2") или полная замена существующего.
+  {"op": "delete", "ids": ["12", "13"]}
+  {"op": "delete_branch", "root": "40"}
+      — удалить ветку: узел root и всё, что достижимо только через него.
+  {"op": "copy_branch", "root": "20", "prefix": "es", "tag_map": {"en_lead": "es_lead"}, "tag_prefix": "es_", "stop_at": ["99"]}
+      — скопировать ветку от root целиком: все блоки, связи, задержки, условия, картинки, кнопки. Копии получают id "<prefix>_<старый id>" (тут: "es_20", "es_21", …), связи внутри ветки ведут на копии. Теги в копиях переименовываются: сначала по tag_map, остальные получают tag_prefix (новые теги создадутся сами). stop_at — необязательно: на этих узлах копирование останавливается, ссылки на них остаются на оригинал.
+  {"op": "retag", "root": "es_20", "map": {"lead": "es_lead"}, "prefix": "es_"}
+      — переименовать теги в ветке root (или во всей воронке, если root/ids нет).
+  {"op": "entry", "id": "n1"} — сделать узел входом воронки.
+  {"op": "meta", "name": "...", "trigger_type": "...", "trigger_value": "..."}
+
+Операции применяются по порядку: после copy_branch в следующих операциях можно сразу ссылаться на "es_20" и т.п.
+
+БОЛЬШИЕ ПРАВКИ — ЧАСТЯМИ, САМ
+- НИКОГДА не отказывайся из-за размера воронки и не проси пользователя «добавить режим» — он уже есть: это ops и "more". Если раньше в диалоге ты отвечал, что не можешь из-за размера или что нужен «режим точечной правки», — это устарело: теперь просто делай.
+- Если операций много (например, перевести 40 блоков), пришли первую порцию (примерно до 25 операций) и "more": true. Сервер применит её и сразу вызовет тебя снова с обновлённой воронкой — продолжай с того места, где остановился. Последняя порция — "more": false. Пользователю ничего нажимать не надо.
+- Перенести ветку одного языка на другие: для каждого языка — delete_branch старой ветки (если она есть), copy_branch из образцовой ветки с prefix языка и нужными тегами, patch узла language, чтобы ветка языка вела на копию ("languages": [{"code": "es", "next": "es_20"}, …] — пришли весь список языков с next), потом patch каждого скопированного сообщения с переведённым text и подписями buttons. Ссылки (url) не переводи.
+- В reply пиши правду: что сделано в ЭТОЙ порции и что будет дальше. Не пиши «сделано», если не прислал операций. Итог (сколько блоков добавлено/изменено) сервер допишет сам.
+
 КОГДА ЧТО ЗАПОЛНЯТЬ
-- Просят только расположение — spec: null, layout заполнен. НЕ пересобирай воронку ради раскладки: любая пересборка рискует потерять текст.
-- Просят изменить содержимое — spec заполнен. Можно вместе с layout, если просят и то и другое.
-- Просто вопрос — spec: null, layout: null.
-- Не понял, чего хотят, — спроси одним коротким вопросом и предложи варианты (spec и layout — null). Но если просьба похожа на «разложи/упорядочь/сделай аккуратно/связи путаются» — это раскладка, действуй, не переспрашивай.
+- Только расположение — ops: null, layout заполнен.
+- Изменить содержимое — ops. Можно вместе с layout.
+- Просто вопрос — ops: null, layout: null.
+- Не понял, чего хотят, — один короткий вопрос с вариантами. Но если просьба понятна — делай, не переспрашивай и не предлагай «начать с одного языка», если просили все.
 
 РАСКЛАДКА
-- "vertical" — шаги идут сверху вниз, параллельные ветки (языки, варианты кнопок) стоят столбцами рядом друг с другом.
-- "horizontal" — шаги идут слева направо, ветки лежат строками друг под другом. Удобно для длинных цепочек сообщений и для нескольких языковых веток.
-- spacing: "compact" — плотнее, "normal" — как обычно, "wide" — просторнее (если жалуются, что всё слишком близко или связи сливаются).
-- Если направление не названо: длинные ветки (больше 6–7 шагов подряд) — "horizontal", иначе — "vertical".
-- Если приложен скриншот-пример — смотри, куда на нём идут шаги (вниз или вправо) и где стоят ветки, и выбирай то же направление. Если на скриншоте сама эта воронка в беспорядке — выбери раскладку, которая его исправит.
-- В reply скажи, как разложено, одной-двумя фразами, и что сохранить можно кнопкой «Сохранить».
+- "vertical" — шаги сверху вниз, параллельные ветки (языки, кнопки) — столбцами рядом.
+- "horizontal" — шаги слева направо, ветки — строками друг под другом. Удобно для длинных цепочек и нескольких языковых веток.
+- spacing: "compact" | "normal" | "wide" (если жалуются, что тесно).
+- Направление не названо: длинные ветки (больше 6–7 шагов подряд) — "horizontal", иначе — "vertical".
+- Есть скриншот-пример — выбирай направление как на нём.
 
 СКРИНШОТЫ
-Пользователь может приложить картинки: пример желаемого вида, текущий холст, чужую воронку, макет сообщения. Используй их как образец. Чего не видно или не разобрать — не выдумывай, скажи об этом в reply.
+Используй как образец. Чего не видно — не выдумывай, скажи в reply.
 
-ПРАВКА СОДЕРЖИМОГО (spec)
-Схема узлов — та же, что у конструктора: message (text, media, buttons,
-photo_url, text_first, no_action), delay, condition, action (add_tag, remove_tag, unsubscribe,
-check_subscription, delete_message), filter (conditions, yes, no), chain
-(chain — название существующей цепочки), language, note. Блоки, которых
-пользователь не просил трогать, возвращай как есть — вместе со всеми их
-полями. Потерянный блок — это пропавший кусок сценария у живых людей.
-
-Если меняешь — верни ПОЛНУЮ новую спеку всех узлов (формат узлов тот же, что во входных данных; поле "entry" не возвращай — первый узел списка станет входом).
-
-- Сохраняй существующие id узлов (и тех, у которых меняешь текст); новым давай id вида "n1","n2".
-- ВЛОЖЕНИЯ (media — картинки, видео, файлы): это файлы, которые пользователь загрузил руками. Переноси массив media ДОСЛОВНО (type, path, name) — у каждого узла, который возвращаешь. Когда делаешь копию узла (перевод на другой язык, дубль ветки, вариант дожима) — копируй в неё тот же media. Убирай или меняй media, только если пользователь прямо об этом попросил. Пропавшая картинка = час ручной работы.
-- Оформление кнопок (style, icon_custom_emoji_id, disabled) переноси как есть, в том числе в переведённые копии.
-- Тексты, которые не просили менять, переноси ДОСЛОВНО.
-- В условиях/действиях поле tag — ИМЯ тега (латинский slug). Несуществующие теги создадутся автоматически.
-- МУЛЬТИЯЗЫЧНОСТЬ: если просят перевод на другие языки — поставь первым узлом language (авто-определение языка Telegram-профиля, юзера не спрашиваем): {"type": "language", "languages": [{"code": "ru", "next": ...}, ...], "other": ...}. Каждая ветка — полная копия воронки на своём языке (переведи все тексты и кнопки, ссылки не меняй), существующая ветка становится одной из языковых, "other" веди в ветку английского (или основного) языка. Кнопочный выбор языка делай, только если это просят явно.
-- Задержки: unit seconds|minutes|hours|days.
-- next: null — конец ветки.
+ФОРМАТ УЗЛОВ (как во входных данных)
+message (text, media, buttons [{label, url?, next?, style?, icon_custom_emoji_id?}], text_first, no_action {amount, unit, next}, next), delay (amount, unit seconds|minutes|hours|days, next), condition (tag, yes, no), action (op: add_tag|remove_tag|unsubscribe|check_subscription|delete_message, tag, channel, target, next / yes, no), filter (match, conditions, yes, no), chain (chain — название существующей цепочки, next), language (languages [{code, next}], other), note (text, about). next: null — конец ветки.
+- tag — ИМЯ тега (латинский slug); несуществующие создадутся сами.
+- media — файлы, которые пользователь загрузил руками: в set переноси дословно, при копировании узла — копируй. Убирай, только если прямо попросили.
+- Тексты, которые не просили менять, — не трогай.
+- МУЛЬТИЯЗЫЧНОСТЬ: язык определяется автоматически узлом language по профилю Telegram (юзера не спрашиваем); "other" — в ветку английского (или основного) языка. Кнопочный выбор языка — только если просят явно.
 """
+
+# сколько порций может уйти на одну просьбу (перевод большой воронки на
+# несколько языков — это 5–8 порций)
+EDIT_MAX_ROUNDS = 12
 
 LAYOUT_DIRECTIONS = {"vertical", "horizontal"}
 LAYOUT_SPACINGS = {"compact", "normal", "wide"}
@@ -1096,27 +1118,96 @@ async def chat_edit_funnel(session, funnel, tags_list, user_messages: list, prov
         if n.get("type") == "chain":
             n["chain"] = chain_names.get(str(n.pop("chain_id", "")), "")
 
-    convo = "ТЕКУЩАЯ ВОРОНКА:\n" + _json.dumps(spec, ensure_ascii=False) + "\n\nДИАЛОГ:\n"
+    dialog = ""
     for m in user_messages[-30:]:
         role = "Пользователь" if m.get("role") == "user" else "Ассистент"
         shots = " [приложены скриншоты]" if m.get("images") else ""
-        convo += f"{role}: {m.get('content','')}{shots}\n"
+        dialog += f"{role}: {m.get('content','')}{shots}\n"
     if images:
-        convo += f"\n(К последнему сообщению приложено скриншотов: {len(images)} — они выше.)\n"
+        dialog += f"\n(К последнему сообщению приложено скриншотов: {len(images)} — они выше.)\n"
 
-    text, tin, tout = await call_llm_system(provider, api_key, model, EDIT_SYSTEM_PROMPT, convo,
-                                            images=images)
-    data = parse_llm_json(text)
-    reply = data.get("reply") or "Готово."
-    layout = clean_layout(data.get("layout"))
-    new_spec = data.get("spec")
+    from . import ai_ops
+
+    # Правка идёт порциями: модель шлёт операции, мы применяем их к рабочей
+    # копии и, если она сказала "more", зовём её снова — уже с обновлённой
+    # воронкой. Так большая правка не упирается в длину одного ответа.
+    work = _json.loads(_json.dumps(spec))
+    work.pop("entry", None)
+    tin = tout = 0
+    layout, reply, changed = None, "", False
+    total = {"created": [], "changed": [], "deleted": [], "errors": []}
+    note = ""
+    retries = 0
+    for _round in range(EDIT_MAX_ROUNDS):
+        prompt = ("ТЕКУЩАЯ ВОРОНКА:\n" + _json.dumps(work, ensure_ascii=False)
+                  + "\n\nДИАЛОГ:\n" + dialog + note)
+        try:
+            text, a, b = await call_llm_system(provider, api_key, model, EDIT_SYSTEM_PROMPT, prompt,
+                                               images=images if _round == 0 else None)
+            tin, tout = tin + a, tout + b
+            data = parse_llm_json(text)
+        except AIError as e:
+            tin += getattr(e, "tin", 0)
+            tout += getattr(e, "tout", 0)
+            # обрезанный/битый ответ — просим порцию поменьше, а не сдаёмся
+            if retries >= 2:
+                if changed:
+                    reply += "\n\n⚠️ Дальше не получилось: ответ модели обрывается. Применил то, что успел."
+                    break
+                raise
+            retries += 1
+            note = ("\n\nПРОШЛЫЙ ОТВЕТ ОБОРВАЛСЯ ПО ДЛИНЕ — он не применён. Пришли МЕНЬШЕ операций "
+                    "(до 10) и \"more\": true, остальное — следующими порциями.")
+            continue
+        retries = 0
+        reply = data.get("reply") or reply or "Готово."
+        layout = clean_layout(data.get("layout")) or layout
+        ops = data.get("ops") or []
+        if data.get("spec") and not ops:
+            # старый формат: целая воронка — принимаем как «заменить всё»
+            new_nodes = (data["spec"] or {}).get("nodes") or []
+            if new_nodes:
+                ids_before = {str(n.get("id")) for n in work["nodes"]}
+                ids_after = {str(n.get("id")) for n in new_nodes}
+                work = {k: v for k, v in data["spec"].items() if k != "entry"}
+                total["created"] += sorted(ids_after - ids_before)
+                total["deleted"] += sorted(ids_before - ids_after)
+                total["changed"] += sorted(ids_after & ids_before)
+                changed = True
+        if ops:
+            log = ai_ops.apply_ops(work, ops)
+            for k in total:
+                total[k] += log[k]
+            changed = changed or bool(log["created"] or log["changed"] or log["deleted"])
+        if not data.get("more") or not (ops or data.get("spec")):
+            break
+        done = ai_ops.summary(total) or "пока ничего"
+        note = ("\n\nПРОДОЛЖЕНИЕ. Предыдущие порции уже применены — воронка выше уже с ними "
+                f"(итого: {done}). Последняя порция: {len(ops)} операций. Продолжай с того места, "
+                "где остановился; когда всё готово — \"more\": false.")
+        if total["errors"]:
+            note += " Не применились: " + "; ".join(total["errors"][-5:])
+
     fields = None
-    if new_spec:
+    if changed:
+        new_spec = work
         last_user = next((m.get("content", "") for m in reversed(user_messages)
                           if m.get("role") == "user"), "")
         if not wants_media_change(last_user):
             keep_lost_media(spec, new_spec)
+        broken = ai_ops.drop_dangling(new_spec)
         before, after = media_count(spec["nodes"]), media_count(new_spec.get("nodes"))
+        for k in ("created", "changed", "deleted"):
+            total[k] = list(dict.fromkeys(total[k]))
+        total["changed"] = [c for c in total["changed"] if c not in total["created"]]
+        done = ai_ops.summary(total)
+        if done:
+            reply += f"\n\n✅ Применено: {done}."
+        if total["errors"]:
+            reply += "\n⚠️ Не применилось: " + "; ".join(dict.fromkeys(total["errors"]))
+        if broken:
+            reply += (f"\n⚠️ Ссылок на несуществующие блоки: {len(broken)} — "
+                      "эти переходы оборваны, проверьте на холсте.")
         if after < before:
             reply += (f"\n\n⚠️ Вложений стало меньше: было {before}, стало {after}. "
                       "Если это не то, что нужно, — нажмите «↶ Отменить эту правку».")
@@ -1128,20 +1219,26 @@ async def chat_edit_funnel(session, funnel, tags_list, user_messages: list, prov
         if not new_spec.get("trigger_type"):
             fields["trigger_type"] = funnel.trigger_type
             fields["trigger_value"] = funnel.trigger_value
+    elif total["errors"]:
+        reply += "\n\n⚠️ Изменения не применились: " + "; ".join(dict.fromkeys(total["errors"]))
     return reply, fields, layout, tin, tout
 
 
 async def call_llm_system(provider, api_key, model, system, user_text, images=None):
     """Как call_llm, но с произвольным системным промптом. images — картинки
-    перед текстом, как в сборке по скриншотам."""
-    timeout = aiohttp.ClientTimeout(total=300)
+    перед текстом, как в сборке по скриншотам.
+
+    Ответ, оборванный по лимиту длины, — AIError с пометкой truncated:
+    недописанный JSON всё равно не разобрать, а правка порциями умеет
+    попросить порцию поменьше."""
+    timeout = aiohttp.ClientTimeout(total=600)
     async with aiohttp.ClientSession(timeout=timeout) as http:
         if provider == "anthropic":
             r = await http.post(
                 "https://api.anthropic.com/v1/messages",
                 headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
                          "content-type": "application/json"},
-                json={"model": model, "max_tokens": 16000, "system": system,
+                json={"model": model, "max_tokens": 32000, "system": system,
                       "messages": [{"role": "user",
                                     "content": _anthropic_content(user_text, images)}]},
             )
@@ -1150,6 +1247,8 @@ async def call_llm_system(provider, api_key, model, system, user_text, images=No
                 raise AIError(data.get("error", {}).get("message", f"HTTP {r.status}"))
             text = "".join(b.get("text", "") for b in data.get("content", []))
             u = data.get("usage", {})
+            if data.get("stop_reason") == "max_tokens":
+                raise _truncated(u.get("input_tokens", 0), u.get("output_tokens", 0))
             return text, u.get("input_tokens", 0), u.get("output_tokens", 0)
         elif provider == "openai":
             r = await http.post(
@@ -1163,5 +1262,8 @@ async def call_llm_system(provider, api_key, model, system, user_text, images=No
             if r.status != 200:
                 raise AIError(data.get("error", {}).get("message", f"HTTP {r.status}"))
             u = data.get("usage", {})
-            return data["choices"][0]["message"]["content"], u.get("prompt_tokens", 0), u.get("completion_tokens", 0)
+            choice = data["choices"][0]
+            if choice.get("finish_reason") == "length":
+                raise _truncated(u.get("prompt_tokens", 0), u.get("completion_tokens", 0))
+            return choice["message"]["content"], u.get("prompt_tokens", 0), u.get("completion_tokens", 0)
         raise AIError(f"Неизвестный провайдер: {provider}")

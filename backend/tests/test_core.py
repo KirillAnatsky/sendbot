@@ -2907,3 +2907,306 @@ async def test_ai_spec_url_next_and_no_action(session):
     back = ai.graph_to_spec(f)
     m = next(n for n in back["nodes"] if n.get("text") == "Привет")
     assert m["no_action"]["unit"] == "hours" and m["buttons"][0]["next"]
+
+
+# ---------- AI-чат: история в базе, вложения не теряются, откат правки ----------
+
+def _media_gui():
+    return {"drawflow": {"Home": {"data": {
+        "1": {"id": 1, "name": "start", "data": {}, "inputs": {},
+              "outputs": {"output_1": {"connections": [{"node": "5", "output": "input_1"}]}}},
+        "5": {"id": 5, "name": "message", "data": {
+                  "text": "Привет", "ports_v": 2,
+                  "media": [{"type": "photo", "path": "media/hello.png", "name": "hello.png"}],
+                  "buttons": [{"label": "Далее", "icon_custom_emoji_id": "777"}]},
+              "inputs": {"input_1": {"connections": [{"node": "1", "input": "output_1"}]}},
+              "outputs": {"output_1": {"connections": []}, "output_2": {"connections": []}}},
+    }}}}
+
+
+async def _ai_setup(session, monkeypatch, replies):
+    import json
+
+    from app import ai
+    from app.graph import compile_graph
+    from app.models import Funnel
+
+    f = Funnel(name="F", trigger_type="start", graph_ui=_media_gui(), graph=compile_graph(_media_gui()))
+    session.add(f)
+    await session.commit()
+    seen = []
+
+    async def fake_llm(provider, key, model, system, text, images=None):
+        seen.append(text)
+        return json.dumps(replies.pop(0), ensure_ascii=False), 1, 1
+
+    async def fake_settings(_s):
+        return {"api_key": "k", "provider": "anthropic", "model": "m"}
+
+    monkeypatch.setattr(ai, "call_llm_system", fake_llm)
+    monkeypatch.setattr(ai, "get_ai_settings", fake_settings)
+    return f, seen
+
+
+def _translate_spec(drop_media_on_original=True):
+    orig = {"id": "5", "type": "message", "text": "Привет",
+            "buttons": [{"label": "Далее", "next": None}], "next": None}
+    if not drop_media_on_original:
+        orig["media"] = [{"type": "photo", "path": "media/hello.png", "name": "hello.png"}]
+    return {"nodes": [
+        {"id": "n1", "type": "language", "languages": [{"code": "ru", "next": "5"},
+                                                        {"code": "en", "next": "n2"}], "other": "n2"},
+        orig,
+        {"id": "n2", "type": "message", "text": "Hello",
+         "media": [{"type": "photo", "path": "media/hello.png", "name": "hello.png"}],
+         "buttons": [{"label": "Next", "next": None}], "next": None},
+    ]}
+
+
+async def test_ai_edit_keeps_media_ids_and_button_icons(session, monkeypatch):
+    from app import api
+    from app.models import Funnel
+
+    f, _ = await _ai_setup(session, monkeypatch,
+                           [{"reply": "Перевёл", "spec": _translate_spec(), "layout": None}])
+    r = await api.ai_edit(api.AIEditIn(funnel_id=f.id, messages=[{"role": "user", "content": "переведи на en"}]),
+                          user=_user("owner"), session=session)
+    assert r["updated"] and r["version_id"]
+    assert "Вложений стало меньше" not in r["reply"]
+    await session.refresh(f)
+    nodes = f.graph["nodes"]
+    assert "5" in nodes                                 # старый блок сохранил свой номер
+    assert nodes["5"]["data"]["media"][0]["path"] == "media/hello.png"   # модель потеряла — вернули
+    assert nodes["5"]["data"]["buttons"][0]["icon_custom_emoji_id"] == "777"
+    en = next(n for n in nodes.values() if n["data"].get("text") == "Hello")
+    assert en["data"]["media"][0]["path"] == "media/hello.png"   # копия с картинкой
+    assert isinstance(f, Funnel)
+
+
+async def test_ai_edit_warns_when_media_removed_on_request(session, monkeypatch):
+    from app import api
+
+    spec = {"nodes": [{"id": "5", "type": "message", "text": "Привет",
+                       "buttons": [{"label": "Далее", "next": None}], "next": None}]}
+    f, _ = await _ai_setup(session, monkeypatch, [{"reply": "Убрал", "spec": spec, "layout": None}])
+    r = await api.ai_edit(api.AIEditIn(funnel_id=f.id, messages=[
+        {"role": "user", "content": "убери картинки"}]), user=_user("owner"), session=session)
+    await session.refresh(f)
+    assert not f.graph["nodes"]["5"]["data"].get("media")     # просили — убрали
+    assert "Вложений стало меньше: было 1, стало 0" in r["reply"]
+
+
+async def test_ai_chat_history_lives_in_db_and_edit_can_be_undone(session, monkeypatch):
+    from app import api
+
+    f, seen = await _ai_setup(session, monkeypatch, [
+        {"reply": "Перевёл", "spec": _translate_spec(), "layout": None},
+        {"reply": "Да, две ветки", "spec": None, "layout": None},
+    ])
+    owner = _user("owner")
+    r1 = await api.ai_edit(api.AIEditIn(funnel_id=f.id, messages=[
+        {"role": "user", "content": "переведи на английский"}]), user=owner, session=session)
+    # вторая реплика — с «чистого» клиента: прежней истории он не присылает
+    await api.ai_edit(api.AIEditIn(funnel_id=f.id, messages=[
+        {"role": "user", "content": "сколько веток?"}]), user=owner, session=session)
+    assert "переведи на английский" in seen[1] and "Перевёл" in seen[1]
+
+    hist = await api.ai_chat_history(f.id, user=owner, session=session)
+    assert [m["role"] for m in hist] == ["user", "assistant", "user", "assistant"]
+    assert hist[1]["version_id"] == r1["version_id"]
+
+    restored = await api.restore_version(f.id, r1["version_id"], user=owner, session=session)
+    nodes = restored["graph_ui"]["drawflow"]["Home"]["data"]
+    assert sorted(n["name"] for n in nodes.values()) == ["message", "start"]   # до перевода
+    vers = await api.list_versions(f.id, user=owner, session=session)
+    assert [v["source"] for v in vers][:2] == ["restore", "ai"]
+    assert vers[0]["media"] >= 2                     # снимок до отката — с переводом
+
+    await api.ai_chat_clear(f.id, user=owner, session=session)
+    assert await api.ai_chat_history(f.id, user=owner, session=session) == []
+
+
+async def test_save_snapshots_are_throttled(session):
+    from app import api
+    from app.models import Funnel, FunnelVersion
+    from sqlalchemy import func, select
+
+    from app.graph import compile_graph
+    f = Funnel(name="F", trigger_type="start", graph_ui=_media_gui(), graph=compile_graph(_media_gui()))
+    session.add(f)
+    await session.commit()
+    body = api.FunnelIn(name="F", graph_ui=_media_gui())
+    await api.update_funnel(f.id, body, user=_user("owner"), session=session)
+    await api.update_funnel(f.id, api.FunnelIn(name="F", graph_ui=_media_gui()),
+                            user=_user("owner"), session=session)
+    n = (await session.execute(select(func.count(FunnelVersion.id)))).scalar()
+    assert n == 1        # автосохранение не плодит одинаковые копии
+
+
+async def test_restore_from_backup_reads_pg_dump(session, tmp_path):
+    import gzip
+    import json
+    import sys as _sys
+
+    _sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import restore_from_backup as rb
+    from app.graph import compile_graph
+    from app.models import Funnel
+
+    graph = compile_graph(_media_gui())
+    gui_txt = json.dumps(_media_gui(), ensure_ascii=False).replace("\\", "\\\\")
+    g_txt = json.dumps(graph, ensure_ascii=False).replace("\\", "\\\\")
+    dump = ("SET x;\nCOPY public.funnels (id, name, is_active, trigger_type, trigger_value, "
+            "graph_ui, graph, updated_at) FROM stdin;\n"
+            f"7\tВоронка\\tс табом\tf\tstart\t\\N\t{gui_txt}\t{g_txt}\t2026-10-21 10:00:00\n\\.\n")
+    p = tmp_path / "d.sql.gz"
+    with gzip.open(p, "wt", encoding="utf-8") as fh:
+        fh.write(dump)
+    with rb._open(str(p)) as fh:
+        rows = rb.read_funnels(fh)
+    assert rows[0]["name"] == "Воронка\tс табом" and rows[0]["trigger_value"] is None
+    assert rb.media_total(rows[0]["graph"]) == 1
+
+    session.add(Funnel(id=7, name="Воронка", graph_ui={}, graph={}))
+    await session.commit()
+    vid = await rb.add_version(rows[0], "из бэкапа")
+    from app.models import FunnelVersion
+    v = await session.get(FunnelVersion, vid)
+    assert v.funnel_id == 7 and v.source == "backup" and rb.media_total(v.graph) == 1
+
+
+# ---------- AI-чат: правка операциями и порциями ----------
+
+def _lang_spec():
+    """language -> en (20 -> 21 -> 22), es (40 -> 41) — старая испанская ветка."""
+    return {"nodes": [
+        {"id": "10", "type": "language", "languages": [{"code": "en", "next": "20"},
+                                                        {"code": "es", "next": "40"}], "other": "20"},
+        {"id": "20", "type": "message", "text": "Hello",
+         "media": [{"type": "photo", "path": "media/a.png", "name": "a.png"}],
+         "buttons": [{"label": "Go", "next": "21", "icon_custom_emoji_id": "5"},
+                     {"label": "Site", "url": "https://x.test"}], "next": None},
+        {"id": "21", "type": "action", "op": "add_tag", "tag": "en_lead", "next": "22"},
+        {"id": "22", "type": "condition", "tag": "en_lead", "yes": "99", "no": None},
+        {"id": "40", "type": "message", "text": "Hola viejo", "buttons": [], "next": "99"},
+        {"id": "41", "type": "note", "text": "старое", "about": "40"},
+        {"id": "99", "type": "message", "text": "общий хвост", "buttons": [], "next": None},
+    ]}
+
+
+def test_ai_ops_copy_delete_patch():
+    from app import ai_ops
+
+    spec = _lang_spec()
+    log = ai_ops.apply_ops(spec, [
+        {"op": "delete_branch", "root": "40"},
+        {"op": "copy_branch", "root": "20", "prefix": "es", "tag_map": {"en_lead": "es_lead"},
+         "stop_at": ["99"]},
+        {"op": "patch", "id": "10", "fields": {"languages": [{"code": "en", "next": "20"},
+                                                             {"code": "es", "next": "es_20"}]}},
+        {"op": "patch", "id": "es_20", "fields": {"text": "Hola", "buttons": [{"label": "Vamos"}]}},
+        {"op": "patch", "id": "nope", "fields": {}},
+    ])
+    idx = {n["id"]: n for n in spec["nodes"]}
+    assert "40" not in idx and "41" not in idx and "99" in idx    # общий хвост цел
+    assert set(log["created"]) == {"es_20", "es_21", "es_22"}
+    es = idx["es_20"]
+    assert es["text"] == "Hola" and es["media"][0]["path"] == "media/a.png"
+    assert es["buttons"][0] == {"label": "Vamos", "next": "es_21", "icon_custom_emoji_id": "5"}
+    assert es["buttons"][1]["url"] == "https://x.test"
+    assert idx["es_21"]["tag"] == "es_lead" and idx["es_22"]["tag"] == "es_lead"
+    assert idx["es_22"]["yes"] == "99"                 # стоп-узел — ссылка на оригинал
+    assert idx["21"]["tag"] == "en_lead"                # оригинал не тронут
+    assert log["errors"] and "nope" in log["errors"][0]
+    assert ai_ops.drop_dangling(spec) == []
+
+
+async def test_ai_edit_in_portions_translates_big_funnel(session, monkeypatch):
+    """Модель шлёт операции порциями ("more"), сервер сам зовёт её дальше."""
+    import json
+
+    from app import ai, api
+    from app.graph import compile_graph
+    from app.models import Funnel
+
+    spec = _lang_spec()
+    tag_ids = await ai.ensure_tags(session, spec)
+    fields = ai.spec_to_funnel_fields(spec, tag_ids)
+    f = Funnel(is_active=False, **fields)
+    session.add(f)
+    await session.commit()
+
+    prompts = []
+    replies = [
+        {"reply": "Скопировал ветку, перевожу", "more": True, "ops": [
+            {"op": "delete_branch", "root": "40"},
+            {"op": "copy_branch", "root": "20", "prefix": "es", "tag_prefix": "es_",
+             "tag_map": {"en_lead": "es_lead"}, "stop_at": ["99"]},
+            {"op": "patch", "id": "10", "fields": {"languages": [
+                {"code": "en", "next": "20"}, {"code": "es", "next": "es_20"}]}}]},
+        {"reply": "Перевёл", "more": False, "ops": [
+            {"op": "patch", "id": "es_20", "fields": {"text": "Hola", "buttons": [{"label": "Vamos"}]}}]},
+    ]
+
+    async def fake_llm(provider, key, model, system, text, images=None):
+        prompts.append(text)
+        return json.dumps(replies.pop(0), ensure_ascii=False), 10, 10
+
+    async def fake_settings(_s):
+        return {"api_key": "k", "provider": "anthropic", "model": "m"}
+
+    monkeypatch.setattr(ai, "call_llm_system", fake_llm)
+    monkeypatch.setattr(ai, "get_ai_settings", fake_settings)
+    r = await api.ai_edit(api.AIEditIn(funnel_id=f.id, messages=[
+        {"role": "user", "content": "перенеси английскую ветку на испанский"}]),
+        user=_user("owner"), session=session)
+
+    assert len(prompts) == 2 and "ПРОДОЛЖЕНИЕ" in prompts[1] and '"es_20"' in prompts[1]
+    assert "✅ Применено: добавлено блоков: 3" in r["reply"]
+    await session.refresh(f)
+    g = f.graph
+    texts = {n["data"].get("text"): nid for nid, n in g["nodes"].items()}
+    assert "Hola viejo" not in texts and "Hola" in texts and "Hello" in texts
+    lang = next(n for n in g["nodes"].values() if n["type"] == "language")
+    es_root = lang["outputs"]["output_3"][0]
+    assert g["nodes"][es_root]["data"]["text"] == "Hola"
+    assert g["nodes"][es_root]["data"]["media"][0]["path"] == "media/a.png"
+    assert "20" in g["nodes"] and "99" in g["nodes"]     # старые блоки — со старыми номерами
+    from app.models import Tag
+    from sqlalchemy import select
+    names = set((await session.execute(select(Tag.name))).scalars())
+    assert "es_lead" in names
+    compile_graph(f.graph_ui)
+
+
+async def test_ai_edit_asks_for_smaller_portion_when_cut(session, monkeypatch):
+    import json
+
+    from app import ai
+
+    f, _ = await _ai_setup(session, monkeypatch, [])
+    calls = []
+
+    async def fake_llm(provider, key, model, system, text, images=None):
+        calls.append(text)
+        if len(calls) == 1:
+            raise ai._truncated(5, 32000)
+        return json.dumps({"reply": "ок", "more": False, "ops": [
+            {"op": "patch", "id": "5", "fields": {"text": "Привет!"}}]}), 1, 1
+
+    monkeypatch.setattr(ai, "call_llm_system", fake_llm)
+    reply, fields, _, tin, tout = await ai.chat_edit_funnel(
+        session, f, [], [{"role": "user", "content": "поправь"}], "anthropic", "k", "m")
+    assert "ОБОРВАЛСЯ" in calls[1] and tout == 32001
+    assert fields["graph"]["nodes"]["5"]["data"]["text"] == "Привет!"
+    assert fields["graph"]["nodes"]["5"]["data"]["media"]      # картинка на месте
+
+
+async def test_ai_edit_question_changes_nothing(session, monkeypatch):
+    from app import ai
+
+    f, _ = await _ai_setup(session, monkeypatch, [
+        {"reply": "Тут один шаг", "ops": None, "more": True}])
+    reply, fields, *_ = await ai.chat_edit_funnel(
+        session, f, [], [{"role": "user", "content": "что тут?"}], "anthropic", "k", "m")
+    assert fields is None and reply == "Тут один шаг"

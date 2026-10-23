@@ -1543,7 +1543,7 @@ async function aiChatSend() {
   hist.push({ role: 'user', content: text, images: shots });
   renderAiChat();
   const box = document.getElementById('ai-chat-msgs');
-  box.insertAdjacentHTML('beforeend', '<div class="aim assistant typing">думаю…</div>');
+  box.insertAdjacentHTML('beforeend', '<div class="aim assistant typing">думаю… большая правка (перевод на несколько языков) идёт порциями и может занять несколько минут</div>');
   box.scrollTop = box.scrollHeight;
   document.getElementById('ai-chat-send').disabled = true;
   try {
