@@ -1052,6 +1052,7 @@ function funnelsTable(list, isChain) {
       <td>${f.runs}</td>
       <td>
         ${!isChain && can('funnels', 'edit') ? `<button class="btn" onclick="toggleFunnel(${f.id})">${f.is_active ? 'Выключить' : 'Включить'}</button>` : ''}
+        ${can('funnels', 'edit') ? `<button class="btn" title="Создать такую же копию (выключенной)" onclick="duplicateFunnel(${f.id})">⧉ Копия</button>` : ''}
         ${can('funnels', 'edit') && canDelete() ? `<button class="btn danger" onclick="deleteFunnel(${f.id})">Удалить</button>` : ''}
       </td>
     </tr>`).join('') + '</table>';
@@ -1064,6 +1065,14 @@ async function createFunnel() {
 async function createChain() {
   const r = await api('/funnels', { method: 'POST', body: { name: 'Новая цепочка', graph_ui: {}, is_chain: true } });
   openEditor(r.id);
+}
+// Копия всей воронки. Создаётся выключенной — иначе она отвечала бы на тот
+// же триггер вместе с оригиналом
+async function duplicateFunnel(id, open) {
+  const r = await api(`/funnels/${id}/duplicate`, { method: 'POST' });
+  if (open) { openEditor(r.id); return; }
+  await loadFunnels();
+  flashStatus(`Создана копия «${r.name}» — она выключена, включите, когда будет готова`);
 }
 async function toggleFunnel(id) { await api(`/funnels/${id}/toggle`, { method: 'POST' }); loadFunnels(); }
 async function deleteFunnel(id) {

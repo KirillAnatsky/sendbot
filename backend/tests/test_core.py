@@ -3338,3 +3338,45 @@ async def test_thumbs_are_small_cached_and_safe(tmp_path, monkeypatch):
     assert str((await thumbs.thumb(240, "anim.gif")).path).endswith("anim.gif")   # как есть
     assert (await thumbs.thumb(240, "../secret.txt")).status_code == 404
     assert (await thumbs.thumb(240, "nope.png")).status_code == 404
+
+
+# ---------- копия воронки ----------
+
+async def test_duplicate_funnel_is_full_and_off(session):
+    from sqlalchemy import select
+
+    from app import api
+    from app.graph import compile_graph
+    from app.models import Bot, Funnel, FunnelBot, User
+
+    b = Bot(name="B", token="t", is_active=True)
+    session.add(b)
+    await session.flush()
+    gui = _media_gui()
+    f = Funnel(name="Прогрев", is_active=True, trigger_type="keyword", trigger_value="go",
+               graph_ui=gui, graph=compile_graph(_media_gui()))
+    session.add(f)
+    await session.flush()
+    session.add(FunnelBot(funnel_id=f.id, bot_id=b.id))
+    staff = User(login="s", name="S", password_hash="x", role="staff", bot_ids=[],
+                 funnel_ids=[f.id], permissions={"funnels": "edit"})
+    session.add(staff)
+    await session.commit()
+
+    r1 = await api.duplicate_funnel(f.id, user=_user("owner"), session=session)
+    r2 = await api.duplicate_funnel(f.id, user=staff, session=session)
+    assert (r1["name"], r2["name"]) == ("Прогрев (копия)", "Прогрев (копия 2)")
+
+    c = await session.get(Funnel, r1["id"])
+    assert c.is_active is False                       # не отвечает вместе с оригиналом
+    assert (c.trigger_type, c.trigger_value) == ("keyword", "go")
+    assert c.graph == f.graph and c.graph_ui == f.graph_ui
+    assert c.graph["nodes"]["5"]["data"]["media"][0]["path"] == "media/hello.png"
+    c.graph_ui["drawflow"]["Home"]["data"]["5"]["data"]["text"] = "правка копии"
+    await session.refresh(f)
+    assert f.graph_ui["drawflow"]["Home"]["data"]["5"]["data"]["text"] == "Привет"   # не общий объект
+    bots = (await session.execute(select(FunnelBot.bot_id).where(
+        FunnelBot.funnel_id == c.id))).scalars().all()
+    assert bots == [b.id]
+    await session.refresh(staff)
+    assert r2["id"] in staff.funnel_ids              # сотрудник видит свою копию

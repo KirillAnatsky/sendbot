@@ -1581,6 +1581,43 @@ async def create_funnel(body: FunnelIn, user=Depends(current_user),
     return {"id": funnel.id}
 
 
+@router.post("/funnels/{funnel_id}/duplicate", dependencies=[Depends(require("funnels", "edit"))])
+async def duplicate_funnel(funnel_id: int, user=Depends(current_user),
+                           session=Depends(get_session)):
+    """Полная копия воронки: блоки, связи, тексты, картинки, триггер, боты.
+
+    Копия создаётся ВЫКЛЮЧЕННОЙ: у неё тот же триггер и те же боты, и
+    включённая сразу копия отвечала бы на /start вместе с оригиналом —
+    люди получали бы каждое сообщение дважды. Статистика, история версий
+    и чат с AI не копируются: у новой воронки они начинаются с нуля.
+    """
+    src = await _my_funnel(user, session, funnel_id)
+    base = re.sub(r"\s*\(копия(?: \d+)?\)$", "", src.name or "Воронка")
+    names = set((await session.execute(select(Funnel.name))).scalars())
+    name, k = f"{base} (копия)", 2
+    while name in names:
+        name, k = f"{base} (копия {k})", k + 1
+    copy_ = Funnel(
+        name=name[:128], is_active=False, is_chain=src.is_chain,
+        trigger_type=src.trigger_type, trigger_value=src.trigger_value,
+        graph_ui=json.loads(json.dumps(src.graph_ui or {})),
+        graph=json.loads(json.dumps(src.graph or {})),
+    )
+    session.add(copy_)
+    await session.flush()
+    bot_ids = await _bot_ids_for_funnel(session, funnel_id)
+    if bot_ids:
+        await _set_funnel_bots(session, copy_.id, bot_ids)
+    # сотрудник с явным списком воронок иначе не увидел бы свою же копию
+    if user_funnel_ids(user) is not None and getattr(user, "id", None):
+        u = await session.get(User, user.id)
+        if u is not None:
+            u.funnel_ids = list(u.funnel_ids or []) + [copy_.id]
+    await session.commit()
+    log.info("Воронка #%s скопирована в #%s «%s»", funnel_id, copy_.id, copy_.name)
+    return {"id": copy_.id, "name": copy_.name}
+
+
 # ---------- версии воронки ----------
 
 VERSIONS_KEEP = 40

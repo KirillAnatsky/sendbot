@@ -1484,6 +1484,17 @@ function renderAiChat() {
 const VERSION_SOURCE = { save: '💾 сохранение', ai: '🤖 до правки AI', restore: '↶ до отката',
                          backup: '🗄 из бэкапа' };
 
+// Копия открытой воронки: сначала сохраняем правки, иначе в копию попала
+// бы версия с сервера без них
+async function duplicateCurrentFunnel() {
+  flushAutoApply();
+  if (editorDirty()) await saveFunnel(true);
+  if (editorDirty()) { alert('Не удалось сохранить изменения — копию не создаю.'); return; }
+  const r = await api(`/funnels/${currentFunnelId}/duplicate`, { method: 'POST' });
+  await openEditor(r.id);
+  flashStatus(`Это копия «${r.name}». Она выключена — включите, когда будет готова`);
+}
+
 async function toggleVersions() {
   let panel = document.getElementById('versions-panel');
   if (panel) { panel.remove(); return; }
